@@ -42,6 +42,7 @@ const MIN_RUNUP = 1.3;    // peak must be >= 30% above the earliest price we can
 const MIN_DRAWDOWN = 0.25; // then must have pulled back >= 25% off that peak (the "bottom")
 const MIN_RECOVERY = 0.05; // and now be >= 5% back up off that bottom (recovery underway)
 const GT = 'https://api.geckoterminal.com/api/v2';
+const sleep = ms => new Promise(res => setTimeout(res, ms));
 
 // ---------- indicator math ----------
 function ema(values, period) {
@@ -205,6 +206,7 @@ export default async () => {
   for (const [label, network] of Object.entries(CHAINS)) {
     // Discovery: walk a few pages of newest pools looking for ones that just entered the age window
     for (let page = 1; page <= 4; page++) {
+      if (page > 1) await sleep(600); // stay under GeckoTerminal's rate limit
       let pools;
       try { pools = await fetchNewPools(network, page); } catch (e) { console.log(e.message); break; }
       if (!pools.length) break;
