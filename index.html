@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MemeScan Tracker — Surge Watch</title>
+<style>
+  :root { --bg:#0b0e14; --card:#131824; --line:#232a3a; --text:#e6e9f0; --dim:#8b93a7; --green:#3ddc84; --amber:#f2c94c; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: -apple-system, system-ui, sans-serif; padding: 16px; }
+  h1 { font-size: 1.1rem; margin: 0 0 4px; }
+  .sub { color: var(--dim); font-size: 0.85rem; margin-bottom: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; }
+  .row { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .name { font-weight: 600; }
+  .tag { font-size: 0.72rem; padding: 2px 7px; border-radius: 999px; background: #1c2333; color: var(--dim); }
+  .alerted { border-color: var(--green); }
+  .alerted .tag.status { background: rgba(61,220,132,.15); color: var(--green); }
+  .watching .tag.status { background: rgba(242,201,76,.15); color: var(--amber); }
+  .meta { color: var(--dim); font-size: 0.8rem; margin-top: 4px; }
+  a { color: inherit; }
+  .empty { color: var(--dim); text-align:center; padding: 40px 0; }
+</style>
+</head>
+<body>
+  <h1>Surge Watch</h1>
+  <div class="sub">Solana + Ethereum, 30k–120k mcap, 4h–48h post-graduation. Auto-refreshes every 30s.</div>
+  <div id="list"><div class="empty">Loading…</div></div>
+<script>
+async function load() {
+  const r = await fetch('/.netlify/functions/status');
+  const rows = await r.json();
+  const el = document.getElementById('list');
+  if (!rows.length) { el.innerHTML = '<div class="empty">Nothing on the watchlist yet. The scanner runs every 5 minutes.</div>'; return; }
+  el.innerHTML = rows.map(t => {
+    const ageH = ((Date.now() - (t.firstSeen||0)) / 3600000).toFixed(1);
+    const chainTag = t.chain === 'solana' ? 'SOL' : 'ETH';
+    const link = \`https://www.geckoterminal.com/\${t.chain === 'solana' ? 'solana' : 'eth'}/pools/\${t.addr}\`;
+    return \`<a href="\${link}" target="_blank" style="text-decoration:none">
+      <div class="card \${t.status}">
+        <div class="row">
+          <span class="name">\${t.name || t.addr.slice(0,8)+'…'}</span>
+          <span class="tag">\${chainTag}</span>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <span class="tag status">\${t.status === 'alerted' ? '🚀 Surge alerted' : 'Watching'}</span>
+          <span class="meta">\${ageH}h old</span>
+        </div>
+      </div>
+    </a>\`;
+  }).join('');
+}
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>
