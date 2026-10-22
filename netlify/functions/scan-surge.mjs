@@ -28,10 +28,19 @@ const AGE_MIN_MS = 4 * 3600 * 1000;    // start watching at 4h old
 const AGE_MAX_MS = 48 * 3600 * 1000;   // stop watching at 48h old
 const MIN_LIQUIDITY_USD = 25_000;      // "performing" floor - below this we never alert
 const REALERT_COOLDOWN_MS = 2 * 3600 * 1000; // don't re-alert the same token sooner than this
-const TIER_SPLIT_MS = 20 * 3600 * 1000;      // 4h-20h vs 20h-48h, different buy-rate bar
-const BUY_RATE_EARLY = 5;  // min buys/min required when age <= 20h
-const BUY_RATE_LATE = 3;   // min buys/min required when age > 20h
+// Three age tiers: younger tokens need to buy faster to count as "surging";
+// older ones get credit for a slower-but-real pace.
+const TIER_1_MAX_MS = 12 * 3600 * 1000; // 4h-12h
+const TIER_2_MAX_MS = 20 * 3600 * 1000; // 12h-20h (TIER_2_MAX_MS to AGE_MAX_MS = "after a day")
+const BUY_RATE_TIER1 = 5;  // 4h-12h
+const BUY_RATE_TIER2 = 4;  // 12h-20h
+const BUY_RATE_TIER3 = 3;  // 20h-48h
 const BUY_RATE_WINDOW_MIN = 5; // average buys/min over this many trailing minutes
+
+// What counts as a real prior pump before the bottom (not just flat chop):
+const MIN_RUNUP = 1.3;    // peak must be >= 30% above the earliest price we can see
+const MIN_DRAWDOWN = 0.25; // then must have pulled back >= 25% off that peak (the "bottom")
+const MIN_RECOVERY = 0.05; // and now be >= 5% back up off that bottom (recovery underway)
 const GT = 'https://api.geckoterminal.com/api/v2';
 
 // ---------- indicator math ----------
@@ -78,7 +87,7 @@ async function fetchNewPools(network, page) {
 }
 async function fetchOhlcv(network, poolAddr) {
   // 15-minute candles, enough history for MACD(26) + signal(9) + Bollinger(20)
-  const r = await fetch(`${GT}/networks/${network}/pools/${poolAddr}/ohlcv/minute?aggregate=15&limit=60`, { headers: { Accept: 'application/json' } });
+  const r = await fetch(`${GT}/networks/${network}/pools/${poolAddr}/ohlcv/minute?aggregate=15&limit=200`, { headers: { Accept: 'application/json' } }); // 200 x 15min ~= 50h, enough to see the full post-graduation life
   if (!r.ok) return null;
   const j = await r.json();
   const list = j?.data?.attributes?.ohlcv_list || []; // [ts, open, high, low, close, volume], oldest first after reverse
@@ -107,14 +116,37 @@ function buysPerMinute(trades, now = Date.now()) {
 }
 
 // ---------- trigger logic ----------
-// Bottomed-and-turning-up, confirmed by indicators, PLUS an age-tiered buy-rate bar.
-// 4h-20h old tokens must be buying faster (>=5/min) to count as "surging" than
-// 20h-48h old tokens (>=3/min) - a slower pace is still meaningful once a token
-// has had longer to season.
+// A token only counts as "surging" if it (1) had a real prior pump on real volume,
+// (2) pulled back meaningfully off that peak - the actual bottom, (3) is now
+// recovering off that bottom, confirmed by indicators, and (4) is buying fast
+// enough for its age tier. Flat/noisy tokens that never ran never qualify,
+// no matter what the indicators say in isolation.
 function evaluateSetup(candles, trades, ageMs) {
   if (!candles || candles.length < 35) return { fire: false, reason: 'not enough candle history yet' };
   const closes = candles.map(c => c.c);
   const last = candles.at(-1);
+
+  // 0. Did this token actually pump, then correct, on real volume? Find the
+  //    highest close so far, then the lowest close after that peak (the bottom).
+  let peakIdx = 0;
+  for (let i = 1; i < closes.length; i++) if (closes[i] > closes[peakIdx]) peakIdx = i;
+  const peak = closes[peakIdx];
+  const earliest = closes[0];
+  let troughIdx = peakIdx, trough = peak;
+  for (let i = peakIdx; i < closes.length; i++) if (closes[i] < trough) { trough = closes[i]; troughIdx = i; }
+
+  const runUp = peak / earliest;
+  const drawdown = (peak - trough) / peak;
+  const recoveryFromTrough = (last.c - trough) / trough;
+  // real volume during the pump leg (not a price wick on zero volume)
+  const pumpLegVol = candles.slice(0, peakIdx + 1).reduce((s, c) => s + c.v, 0);
+
+  const hadRealRun =
+    runUp >= MIN_RUNUP &&
+    drawdown >= MIN_DRAWDOWN &&
+    troughIdx < closes.length - 1 &&      // the bottom isn't literally right now, i.e. it has started recovering
+    recoveryFromTrough >= MIN_RECOVERY &&
+    pumpLegVol > 0;
 
   const bb = bollinger(closes);
   const r = rsi(closes);
@@ -122,7 +154,7 @@ function evaluateSetup(candles, trades, ageMs) {
   const e9 = ema(closes, 9).at(-1);
   if (!bb || r === null || !m) return { fire: false, reason: 'indicators not ready' };
 
-  // 1. bottomed: band squeeze (width below its own recent average) or two higher lows
+  // bottomed (micro-confirmation): band squeeze or two higher lows right now
   const widths = [];
   for (let i = 20; i < closes.length; i++) {
     const bbi = bollinger(closes.slice(0, i + 1));
@@ -134,21 +166,25 @@ function evaluateSetup(candles, trades, ageMs) {
   const higherLows = lows[lows.length - 1] > lows[0] && lows[lows.length - 3] > lows[0];
   const bottomed = squeeze || higherLows;
 
-  // 2. RSI recovering from weakness, not already overbought
+  // RSI recovering from weakness, not already overbought
   const rsiTurning = r > 40 && r < 70;
 
-  // 3. MACD bullish cross (histogram flips negative -> positive) + price reclaiming short EMA
+  // MACD bullish cross + price reclaiming short EMA
   const macdCross = m.prevHist <= 0 && m.hist > 0;
   const aboveEma = last.c > e9;
   const turningUp = macdCross && aboveEma;
 
-  // 4. age-tiered buy pace
+  // age-tiered buy pace
   const bpm = buysPerMinute(trades);
-  const minBpm = ageMs <= TIER_SPLIT_MS ? BUY_RATE_EARLY : BUY_RATE_LATE;
+  const minBpm = ageMs <= TIER_1_MAX_MS ? BUY_RATE_TIER1 : ageMs <= TIER_2_MAX_MS ? BUY_RATE_TIER2 : BUY_RATE_TIER3;
   const buyRateOk = bpm >= minBpm;
 
-  const fire = bottomed && rsiTurning && turningUp && buyRateOk;
-  return { fire, rsi: r.toFixed(1), bottomed, turningUp, buysPerMin: bpm.toFixed(1), minBpm };
+  const fire = hadRealRun && bottomed && rsiTurning && turningUp && buyRateOk;
+  return {
+    fire, rsi: r.toFixed(1), hadRealRun, bottomed, turningUp,
+    runUp: runUp.toFixed(2), drawdown: (drawdown * 100).toFixed(0),
+    buysPerMin: bpm.toFixed(1), minBpm,
+  };
 }
 
 async function sendTelegram(text) {
@@ -217,8 +253,8 @@ export default async () => {
         await sendTelegram(
           `🚀 <b>Surge setup — ${t.name || t.addr}</b> (${chainTag})\n` +
           `Age: ${ageH}h post-graduation\n` +
-          `Bottomed and turning up — RSI ${setup.rsi}, MACD bullish cross\n` +
-          `Buys: ${setup.buysPerMin}/min (needed >= ${setup.minBpm}/min at this age)\n` +
+          `Ran up ${setup.runUp}x, pulled back ${setup.drawdown}%, now recovering off that bottom\n` +
+          `RSI ${setup.rsi}, MACD bullish cross, buys ${setup.buysPerMin}/min (needed >= ${setup.minBpm}/min at this age)\n` +
           `${link}`
         );
       }
