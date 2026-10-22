@@ -7,9 +7,13 @@
 //     once they graduate off the bonding curve, so new_pools already excludes
 //     pre-graduation tokens automatically.
 //  2. Keeps a watchlist (Netlify Blobs) of tokens aged 4h-48h with mcap 30k-120k.
-//  3. Pulls recent candles for each watched token and computes RSI/MACD/EMA/Bollinger.
-//  4. Fires a Telegram alert ONLY when a bottom-forming + momentum-turning setup
-//     appears. Dead/non-performing tokens are never surfaced.
+//  3. Pulls recent candles (RSI/MACD/EMA/Bollinger) AND recent individual trades
+//     (to count real buys-per-minute) for each watched token.
+//  4. Fires a Telegram alert ONLY when the token has bottomed and is turning up
+//     AND buy pace clears an age-tiered bar:
+//       4h-20h old  -> >= 5 buys/min
+//       20h-48h old -> >= 3 buys/min
+//     Dead/non-performing tokens are never surfaced.
 //
 // Env vars needed (Netlify site settings -> Environment variables):
 //   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   (reuse the ones your existing alerts use)
@@ -24,6 +28,10 @@ const AGE_MIN_MS = 4 * 3600 * 1000;    // start watching at 4h old
 const AGE_MAX_MS = 48 * 3600 * 1000;   // stop watching at 48h old
 const MIN_LIQUIDITY_USD = 25_000;      // "performing" floor - below this we never alert
 const REALERT_COOLDOWN_MS = 2 * 3600 * 1000; // don't re-alert the same token sooner than this
+const TIER_SPLIT_MS = 20 * 3600 * 1000;      // 4h-20h vs 20h-48h, different buy-rate bar
+const BUY_RATE_EARLY = 5;  // min buys/min required when age <= 20h
+const BUY_RATE_LATE = 3;   // min buys/min required when age > 20h
+const BUY_RATE_WINDOW_MIN = 5; // average buys/min over this many trailing minutes
 const GT = 'https://api.geckoterminal.com/api/v2';
 
 // ---------- indicator math ----------
@@ -77,9 +85,33 @@ async function fetchOhlcv(network, poolAddr) {
   return list.reverse().map(c => ({ t: c[0] * 1000, o: c[1], h: c[2], l: c[3], c: c[4], v: c[5] }));
 }
 
+// Recent individual trades (not candles) - needed to count real buys/minute.
+// GeckoTerminal returns up to the last ~300 trades for the pool.
+async function fetchTrades(network, poolAddr) {
+  const r = await fetch(`${GT}/networks/${network}/pools/${poolAddr}/trades`, { headers: { Accept: 'application/json' } });
+  if (!r.ok) return [];
+  const j = await r.json();
+  const rows = j?.data || [];
+  return rows.map(t => ({
+    t: new Date(t.attributes.block_timestamp).getTime(),
+    kind: t.attributes.kind, // "buy" | "sell"
+  }));
+}
+
+// Average buys/min over the trailing BUY_RATE_WINDOW_MIN minutes.
+function buysPerMinute(trades, now = Date.now()) {
+  const windowMs = BUY_RATE_WINDOW_MIN * 60 * 1000;
+  const since = now - windowMs;
+  const buys = trades.filter(t => t.t >= since && t.kind === 'buy').length;
+  return buys / BUY_RATE_WINDOW_MIN;
+}
+
 // ---------- trigger logic ----------
-// Bottom forming + momentum turning, all four must agree in the same scan.
-function evaluateSetup(candles) {
+// Bottomed-and-turning-up, confirmed by indicators, PLUS an age-tiered buy-rate bar.
+// 4h-20h old tokens must be buying faster (>=5/min) to count as "surging" than
+// 20h-48h old tokens (>=3/min) - a slower pace is still meaningful once a token
+// has had longer to season.
+function evaluateSetup(candles, trades, ageMs) {
   if (!candles || candles.length < 35) return { fire: false, reason: 'not enough candle history yet' };
   const closes = candles.map(c => c.c);
   const last = candles.at(-1);
@@ -90,7 +122,7 @@ function evaluateSetup(candles) {
   const e9 = ema(closes, 9).at(-1);
   if (!bb || r === null || !m) return { fire: false, reason: 'indicators not ready' };
 
-  // 1. bottom forming: band squeeze (width below its own recent average) or two higher lows
+  // 1. bottomed: band squeeze (width below its own recent average) or two higher lows
   const widths = [];
   for (let i = 20; i < closes.length; i++) {
     const bbi = bollinger(closes.slice(0, i + 1));
@@ -100,22 +132,23 @@ function evaluateSetup(candles) {
   const squeeze = bb.width < avgWidth * 0.85;
   const lows = candles.slice(-6).map(c => c.l);
   const higherLows = lows[lows.length - 1] > lows[0] && lows[lows.length - 3] > lows[0];
-  const bottomForming = squeeze || higherLows;
+  const bottomed = squeeze || higherLows;
 
   // 2. RSI recovering from weakness, not already overbought
   const rsiTurning = r > 40 && r < 70;
 
-  // 3. MACD bullish cross (histogram flips negative -> positive)
+  // 3. MACD bullish cross (histogram flips negative -> positive) + price reclaiming short EMA
   const macdCross = m.prevHist <= 0 && m.hist > 0;
-
-  // 4. volume/participation confirming, price reclaiming short EMA
-  const recentVol = candles.slice(-4).reduce((s, c) => s + c.v, 0);
-  const priorVol = candles.slice(-8, -4).reduce((s, c) => s + c.v, 0) || 1;
-  const volPicking = recentVol > priorVol * 1.15;
   const aboveEma = last.c > e9;
+  const turningUp = macdCross && aboveEma;
 
-  const fire = bottomForming && rsiTurning && macdCross && volPicking && aboveEma;
-  return { fire, rsi: r.toFixed(1), macdHist: m.hist, squeeze, higherLows, volPicking, aboveEma };
+  // 4. age-tiered buy pace
+  const bpm = buysPerMinute(trades);
+  const minBpm = ageMs <= TIER_SPLIT_MS ? BUY_RATE_EARLY : BUY_RATE_LATE;
+  const buyRateOk = bpm >= minBpm;
+
+  const fire = bottomed && rsiTurning && turningUp && buyRateOk;
+  return { fire, rsi: r.toFixed(1), bottomed, turningUp, buysPerMin: bpm.toFixed(1), minBpm };
 }
 
 async function sendTelegram(text) {
@@ -167,9 +200,11 @@ export default async () => {
       if (age > AGE_MAX_MS) { state[key].status = 'dropped'; continue; }
       watching++;
 
-      const candles = await fetchOhlcv(network, t.addr);
-      const setup = evaluateSetup(candles);
-      const lastClose = candles?.at(-1)?.c;
+      const [candles, trades] = await Promise.all([
+        fetchOhlcv(network, t.addr),
+        fetchTrades(network, t.addr),
+      ]);
+      const setup = evaluateSetup(candles, trades, age);
       const liqOk = candles && candles.slice(-4).some(c => c.v > 0); // some recent trade activity = still "performing"
 
       if (setup.fire && liqOk && now - t.lastAlert > REALERT_COOLDOWN_MS) {
@@ -178,10 +213,12 @@ export default async () => {
         state[key].status = 'alerted';
         const chainTag = label === 'solana' ? 'SOL' : 'ETH';
         const link = `https://www.geckoterminal.com/${network}/pools/${t.addr}`;
+        const ageH = (age / 3600000).toFixed(1);
         await sendTelegram(
           `🚀 <b>Surge setup — ${t.name || t.addr}</b> (${chainTag})\n` +
-          `Age: ${(age / 3600000).toFixed(1)}h post-graduation\n` +
-          `RSI ${setup.rsi} turning up, MACD bullish cross, volume picking up\n` +
+          `Age: ${ageH}h post-graduation\n` +
+          `Bottomed and turning up — RSI ${setup.rsi}, MACD bullish cross\n` +
+          `Buys: ${setup.buysPerMin}/min (needed >= ${setup.minBpm}/min at this age)\n` +
           `${link}`
         );
       }
