@@ -303,7 +303,9 @@ async function fsQuery(cfg, coll, field, value) {
   if (field) {
     q.structuredQuery.where = { fieldFilter: { field: { fieldPath: field }, op: 'EQUAL', value: { stringValue: value } } };
   }
-  q.structuredQuery.orderBy = [{ field: { fieldPath: 'enteredAt' }, direction: 'DESCENDING' }];
+  if (!field) {
+    q.structuredQuery.orderBy = [{ field: { fieldPath: 'enteredAt' }, direction: 'DESCENDING' }];
+  }
   const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(q) });
   if (!r.ok) { const t = await r.text(); throw new Error(`Firestore ${r.status}: ${t.slice(0,120)}`); }
   const rows = await r.json();
