@@ -369,21 +369,36 @@ async function getDailyStats() {
   const today = new Date().toISOString().slice(0,10);
   const doc   = await db.collection('paper_stats').doc(today).get();
   if (!doc.exists) {
-    const init = { date: today, startBalance: POSITION_SIZE * MAX_POSITIONS, realizedPnL: 0, trades: 0, wins: 0, losses: 0 };
+    const init = {
+      date: today, startBalance: POSITION_SIZE * MAX_POSITIONS,
+      realizedPnL: 0, trades: 0, wins: 0, losses: 0,
+      autoPnL: 0, autoTrades: 0, autoWins: 0,
+      manualPnL: 0, manualTrades: 0, manualWins: 0,
+    };
     await db.collection('paper_stats').doc(today).set(init);
     return init;
   }
   return doc.data();
 }
 
-async function updateDailyStats(pnl, isWin) {
+async function updateDailyStats(pnl, isWin, isManual = false) {
   const today = new Date().toISOString().slice(0,10);
-  await db.collection('paper_stats').doc(today).update({
+  const base = {
     realizedPnL: FieldValue.increment(pnl),
     trades:      FieldValue.increment(1),
     wins:        FieldValue.increment(isWin ? 1 : 0),
     losses:      FieldValue.increment(isWin ? 0 : 1),
-  });
+  };
+  if (isManual) {
+    base.manualPnL    = FieldValue.increment(pnl);
+    base.manualTrades = FieldValue.increment(1);
+    base.manualWins   = FieldValue.increment(isWin ? 1 : 0);
+  } else {
+    base.autoPnL    = FieldValue.increment(pnl);
+    base.autoTrades = FieldValue.increment(1);
+    base.autoWins   = FieldValue.increment(isWin ? 1 : 0);
+  }
+  await db.collection('paper_stats').doc(today).update(base);
 }
 
 // ─── PRICE FETCHER ────────────────────────────────────────────────────────────
@@ -428,12 +443,28 @@ async function monitorPositions() {
   }
 
   for (const pos of positions) {
+    const isManual = !!pos.isManual;
+
+    // ── MANUAL CLOSE REQUEST (user tapped "Sell Now" on dashboard) ─────────
+    if (pos.closeRequested) {
+      const price = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
+      const pnl   = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+      await closePosition(pos.id, { exitPrice: price, exitReason: 'MANUAL_CLOSE', pnl });
+      await updateDailyStats(pnl, pnl > 0, isManual);
+      enteredToday.delete(pos.address);
+      await sendTelegram(
+        `🚫 *MANUAL CLOSE*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
+        `Exit: $${fmtPrice(price)} | P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*`
+      );
+      continue;
+    }
+
     // Auto-close after 7 days
     if (Date.now() - pos.enteredAt > 7 * 86400000) {
       const price = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
       const pnl = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
       await closePosition(pos.id, { exitPrice: price, exitReason: 'EXPIRED', pnl });
-      await updateDailyStats(pnl, pnl > 0);
+      await updateDailyStats(pnl, pnl > 0, isManual);
       await sendTelegram(`⏰ *EXPIRED* — *${pos.symbol}*\nExit: $${fmtPrice(price)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
       enteredToday.delete(pos.address);
       continue;
@@ -451,7 +482,7 @@ async function monitorPositions() {
     if (price <= pos.currentSL) {
       const pnl = gain * pos.size * pos.remaining;
       await closePosition(pos.id, { exitPrice: price, exitReason: 'STOP_LOSS', pnl });
-      await updateDailyStats(pnl, false);
+      await updateDailyStats(pnl, false, isManual);
       enteredToday.delete(pos.address);
       await sendTelegram(
         `🛑 *STOP LOSS HIT*\n\n` +
@@ -480,7 +511,7 @@ async function monitorPositions() {
         const newRec   = (pos.recoveredAmount || 0) + proceeds;
         updates = { partialStage:1, remaining: pos.remaining - frac,
           recoveredAmount: newRec, pnl: FieldValue.increment(partPnL) };
-        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true);
+        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
         alertMsg = `⚡ *STAGE 1 — 25% SOLD (+50%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
           `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
           `🎯 Recovered $${newRec.toFixed(2)} / $${target.toFixed(2)} — riding 75%\n🔗 [Chart](${pos.dexUrl})`;
@@ -494,7 +525,7 @@ async function monitorPositions() {
         const fr       = newRec >= target;
         updates = { partialStage:2, remaining: pos.remaining - frac,
           recoveredAmount: newRec, freeRide: fr, pnl: FieldValue.increment(partPnL) };
-        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true);
+        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
         alertMsg = `⚡ *STAGE 2 — 30% SOLD (+100%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
           `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
           `🎯 Recovered $${newRec.toFixed(2)}${fr?' ✅ FREE RIDE!':''}\n🔗 [Chart](${pos.dexUrl})`;
@@ -507,7 +538,7 @@ async function monitorPositions() {
         const newRec   = (pos.recoveredAmount || 0) + proceeds;
         updates = { partialStage:3, remaining: pos.remaining - frac,
           recoveredAmount: newRec, freeRide: true, pnl: FieldValue.increment(partPnL) };
-        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true);
+        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
         alertMsg = `🚀 *STAGE 3 — FREE RIDE (+200%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
           `💰 Total recovered: $${newRec.toFixed(2)} | Remaining ${((pos.remaining-frac)*100).toFixed(0)}% is pure profit\n🔗 [Chart](${pos.dexUrl})`;
         Object.assign(pos, updates);
@@ -522,7 +553,7 @@ async function monitorPositions() {
         const partPnL = gain * pos.size * 0.50;
         updates = { tp1Hit:true, remaining: pos.remaining - 0.50,
           currentSL: pos.entryPrice * 1.01, trailingActive:true, pnl: FieldValue.increment(partPnL) };
-        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true);
+        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
         alertMsg = `✅ *TP1 HIT — 50% SOLD*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
           `Entry: $${fmtPrice(pos.entryPrice)} → $${fmtPrice(price)}\n` +
           `💰 +$${partPnL.toFixed(2)} | SL → breakeven\n🔗 [Chart](${pos.dexUrl})`;
@@ -532,7 +563,7 @@ async function monitorPositions() {
         const partPnL = gain * pos.size * 0.30;
         updates = { tp2Hit:true, remaining: pos.remaining - 0.30,
           currentSL: pos.tp1 * 0.99, pnl: FieldValue.increment(partPnL) };
-        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true);
+        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
         alertMsg = `🎯 *TP2 HIT — 30% SOLD*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
           `💰 +$${partPnL.toFixed(2)} | SL → TP1 level\n🔗 [Chart](${pos.dexUrl})`;
         Object.assign(pos, updates);
@@ -540,7 +571,7 @@ async function monitorPositions() {
       else if (pos.tp1Hit && pos.tp2Hit && price >= pos.tp3) {
         const partPnL = gain * pos.size * pos.remaining;
         await closePosition(pos.id, { exitPrice: price, exitReason:'TP3', pnl: FieldValue.increment(partPnL) });
-        await updateDailyStats(partPnL, true);
+        await updateDailyStats(partPnL, true, isManual);
         enteredToday.delete(pos.address);
         await sendTelegram(`🏆 *TP3 — FULL EXIT*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
           `Entry: $${fmtPrice(pos.entryPrice)} → $${fmtPrice(price)}\n` +

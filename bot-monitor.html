@@ -129,6 +129,35 @@ header {
 .btn-ghost:hover { background: var(--border); }
 .btn-link { background: none; border: none; color: var(--fg3); font-size: 11px; cursor: pointer; padding: 0; }
 
+/* ── Sell button ──────────────────────────────────────────────────────────────── */
+.sell-btn {
+  background: rgba(232,83,74,.12); color: var(--red);
+  border: 1px solid rgba(232,83,74,.3); border-radius: 6px;
+  padding: 4px 10px; font-size: 11px; font-weight: 600;
+  font-family: var(--sans); cursor: pointer; white-space: nowrap;
+  transition: background .15s;
+}
+.sell-btn:hover  { background: rgba(232,83,74,.25); }
+.sell-btn.confirm {
+  background: var(--red); color: #fff; border-color: var(--red);
+  animation: pulse-red .4s ease;
+}
+@keyframes pulse-red { 0%,100% { transform: scale(1) } 50% { transform: scale(1.06) } }
+.sell-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+/* ── pnl split row ────────────────────────────────────────────────────────────── */
+.pnl-split {
+  display: flex; gap: 6px; align-items: center;
+  font-size: 10px; color: var(--fg3); margin-top: 3px;
+  font-family: var(--mono);
+}
+.pnl-split-tag {
+  padding: 1px 6px; border-radius: 4px; font-size: 9px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .05em;
+}
+.pnl-split-tag.auto   { background: rgba(79,110,247,.15); color: #7a9fff; }
+.pnl-split-tag.manual { background: rgba(255,193,7,.15);  color: var(--yellow); }
+
 /* ── Stats tiles ─────────────────────────────────────────────────────────────── */
 .stats-grid {
   display: grid;
@@ -352,6 +381,7 @@ const S = {
   toggling: false,    // prevent double-tap
   manualQueue: [],    // items in paper_manual_queue
   manualAdding: false,
+  closingPos: {},     // { [posId]: 'confirm' | 'closing' }
 };
 
 // ── Config store ──────────────────────────────────────────────────────────────
@@ -635,6 +665,10 @@ function render() {
           <div class="stat-label">Today's P&amp;L</div>
           <div class="stat-val ${todayPnl >= 0 ? 'c-green' : 'c-red'}">${fmtPnl(todayPnl)}</div>
           <div class="stat-note">${s.trades || 0} trades closed</div>
+          ${(s.autoTrades || s.manualTrades) ? `<div class="pnl-split">
+            <span class="pnl-split-tag auto">Bot</span><span>${fmtPnl(s.autoPnL || 0)}</span>
+            <span class="pnl-split-tag manual">Manual</span><span>${fmtPnl(s.manualPnL || 0)}</span>
+          </div>` : ''}
         </div>
         <div class="stat-tile">
           <div class="stat-label">Win Rate</div>
@@ -715,11 +749,53 @@ function posCard(pos) {
     <div class="pos-foot">
       <div>
         <div class="pnl-big ${pnl != null ? (pnl >= 0 ? 'c-green' : 'c-red') : ''}">${fmtPnl(pnl)}</div>
-        <div class="pnl-pct">${pct != null ? fmtPct(pct) : 'fetching price…'}</div>
+        <div class="pnl-pct">${pct != null ? fmtPct(pct) : 'fetching price…'}${pos.isManual ? ' · <span style="color:var(--yellow);font-size:9px">🎯 MANUAL</span>' : ''}</div>
       </div>
-      <div class="pos-ts">$${pos.size} · ${fmtDate(pos.enteredAt)}</div>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:5px">
+        <div class="pos-ts">$${pos.size} · ${fmtDate(pos.enteredAt)}</div>
+        ${sellBtn(pos)}
+      </div>
     </div>
   </div>`;
+}
+
+// ── Individual position sell ──────────────────────────────────────────────────
+function sellBtn(pos) {
+  const state = S.closingPos[pos._id];
+  if (state === 'closing') {
+    return `<button class="sell-btn" disabled>…selling</button>`;
+  }
+  if (state === 'confirm') {
+    return `<button class="sell-btn confirm" onclick="confirmSell('${pos._id}')">Confirm Sell?</button>`;
+  }
+  return `<button class="sell-btn" onclick="requestSell('${pos._id}')">🛑 Sell Now</button>`;
+}
+
+function requestSell(posId) {
+  S.closingPos[posId] = 'confirm';
+  render();
+  // Auto-cancel confirm state after 4 seconds if not tapped again
+  setTimeout(() => {
+    if (S.closingPos[posId] === 'confirm') {
+      delete S.closingPos[posId];
+      render();
+    }
+  }, 4000);
+}
+
+async function confirmSell(posId) {
+  if (!S.config || S.closingPos[posId] === 'closing') return;
+  S.closingPos[posId] = 'closing';
+  render();
+  try {
+    await fsSet(S.config, 'paper_positions', posId, { closeRequested: true });
+    // Wait a moment then reload — bot will pick it up within 5s
+    setTimeout(() => { delete S.closingPos[posId]; loadData(); }, 6000);
+  } catch (e) {
+    S.error = 'Sell request failed: ' + e.message;
+    delete S.closingPos[posId];
+    render();
+  }
 }
 
 // ── Manual queue UI ───────────────────────────────────────────────────────────
