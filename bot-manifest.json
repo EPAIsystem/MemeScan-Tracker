@@ -1,0 +1,25 @@
+{
+  "name": "MemeScan Bot Monitor",
+  "short_name": "Bot Monitor",
+  "description": "Live paper trading dashboard for MemeScan PRO bot",
+  "start_url": "/bot-monitor.html",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#090c14",
+  "theme_color": "#090c14",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/bot-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/bot-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
