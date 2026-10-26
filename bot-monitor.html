@@ -225,6 +225,36 @@ td { padding: 10px 14px; border-top: 1px solid var(--border); font-family: var(-
 .td-sym { font-family: var(--sans); font-weight: 600; font-size: 13px; }
 tbody tr:hover td { background: var(--bg3); }
 
+/* ── Bot control button ──────────────────────────────────────────────────────── */
+.bot-ctrl {
+  display: flex; align-items: center; gap: 7px;
+  border: none; border-radius: 8px;
+  padding: 7px 14px; font-size: 13px; font-weight: 600;
+  font-family: var(--sans); cursor: pointer;
+  transition: opacity .15s, transform .1s;
+  white-space: nowrap;
+}
+.bot-ctrl:hover  { opacity: .85; }
+.bot-ctrl:active { transform: scale(.97); }
+.bot-ctrl.running {
+  background: rgba(232,83,74,.15); color: var(--red);
+  border: 1px solid rgba(232,83,74,.4);
+}
+.bot-ctrl.stopped {
+  background: rgba(46,194,126,.15); color: var(--green);
+  border: 1px solid rgba(46,194,126,.4);
+}
+.bot-ctrl.unknown {
+  background: var(--bg3); color: var(--fg3);
+  border: 1px solid var(--border);
+}
+.bot-ctrl-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+}
+.bot-ctrl.running  .bot-ctrl-dot { background: var(--red);   animation: blink 1.4s ease-in-out infinite; }
+.bot-ctrl.stopped  .bot-ctrl-dot { background: var(--green); }
+.bot-ctrl.unknown  .bot-ctrl-dot { background: var(--fg3); }
+
 /* ── Misc ────────────────────────────────────────────────────────────────────── */
 .empty-state {
   text-align: center; padding: 44px 16px;
@@ -265,6 +295,8 @@ const S = {
   loading: false,
   error: null,
   lastUpdated: null,
+  botRunning: null,   // null=unknown, true=running, false=stopped
+  toggling: false,    // prevent double-tap
 };
 
 // ── Config store ──────────────────────────────────────────────────────────────
@@ -319,6 +351,25 @@ async function fsGet(cfg, coll, id) {
   return parseDoc(await r.json());
 }
 
+async function fsSet(cfg, coll, id, fields) {
+  // Build Firestore field map
+  const fsFields = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (typeof v === 'boolean') fsFields[k] = { booleanValue: v };
+    else if (typeof v === 'number') fsFields[k] = { doubleValue: v };
+    else fsFields[k] = { stringValue: String(v) };
+  }
+  const fieldPaths = Object.keys(fields).map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join('&');
+  const url = `${base(cfg)}/${coll}/${id}?key=${cfg.apiKey}&${fieldPaths}`;
+  const r = await fetch(url, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields: fsFields }),
+  });
+  if (!r.ok) { const t = await r.text(); throw new Error(`Firestore set ${r.status}: ${t.slice(0,120)}`); }
+  return parseDoc(await r.json());
+}
+
 // ── DexScreener ───────────────────────────────────────────────────────────────
 async function fetchPrice(addr) {
   try {
@@ -336,14 +387,17 @@ async function loadData() {
   S.loading = true; S.error = null;
   render();
   try {
-    const [positions, history] = await Promise.all([
+    const today = new Date().toISOString().slice(0, 10);
+    const [positions, history, statsDoc, ctrlDoc] = await Promise.all([
       fsQuery(S.config, 'paper_positions', 'status', 'open'),
       fsQuery(S.config, 'paper_history'),
+      fsGet(S.config, 'paper_stats', today),
+      fsGet(S.config, 'paper_config', 'control'),
     ]);
     S.positions = positions;
     S.history = history.slice(0, 15);
-    const today = new Date().toISOString().slice(0, 10);
-    S.stats = await fsGet(S.config, 'paper_stats', today);
+    S.stats = statsDoc;
+    S.botRunning = ctrlDoc ? (ctrlDoc.running !== false) : true; // default running if doc absent
     // Live prices
     const addrs = [...new Set(positions.map(p => p.address).filter(Boolean))];
     await Promise.all(addrs.map(async a => { const p = await fetchPrice(a); if (p) S.prices[a] = p; }));
@@ -483,6 +537,7 @@ function render() {
         <div class="header-right">
           ${S.lastUpdated ? `<div class="live-badge"><div class="live-dot"></div>LIVE</div>` : ''}
           <span class="update-time">${updTime}</span>
+          ${botCtrlBtn()}
           <button class="btn-ghost" onclick="loadData()">⟳ Refresh</button>
           <button class="btn-link" onclick="disconnect()">Disconnect</button>
         </div>
@@ -508,7 +563,7 @@ function render() {
         </div>
         <div class="stat-tile">
           <div class="stat-label">Positions</div>
-          <div class="stat-val c-fg">${S.positions.length}<span style="font-size:13px;color:var(--fg3)">/5</span></div>
+          <div class="stat-val c-fg">${S.positions.length}<span style="font-size:13px;color:var(--fg3)">/10</span></div>
           <div class="stat-note">open now</div>
         </div>
       </div>
@@ -542,7 +597,7 @@ function posCard(pos) {
         <div class="pos-name">${pos.name || ''}</div>
       </div>
       <div class="pos-right">
-        <span class="cat-badge">${pos.catLabel || ''}</span>
+        <span class="cat-badge">${pos.strategyLabel || pos.catLabel || ''}</span>
         <div class="pos-score">Score ${pos.score || '—'}/100</div>
       </div>
     </div>
@@ -583,6 +638,43 @@ function posCard(pos) {
       <div class="pos-ts">$${pos.size} · ${fmtDate(pos.enteredAt)}</div>
     </div>
   </div>`;
+}
+
+// ── Bot control ───────────────────────────────────────────────────────────────
+function botCtrlBtn() {
+  if (S.botRunning === null) {
+    return `<button class="bot-ctrl unknown" onclick="toggleBot()" title="Loading bot status…">
+      <span class="bot-ctrl-dot"></span>…
+    </button>`;
+  }
+  if (S.toggling) {
+    return `<button class="bot-ctrl unknown" disabled style="opacity:.5">
+      <span class="spin" style="width:10px;height:10px;border-width:2px"></span>…
+    </button>`;
+  }
+  if (S.botRunning) {
+    return `<button class="bot-ctrl running" onclick="toggleBot()" title="Tap to pause the bot">
+      <span class="bot-ctrl-dot"></span>🛑 Stop Bot
+    </button>`;
+  }
+  return `<button class="bot-ctrl stopped" onclick="toggleBot()" title="Tap to resume scanning">
+    <span class="bot-ctrl-dot"></span>▶ Start Bot
+  </button>`;
+}
+
+async function toggleBot() {
+  if (!S.config || S.toggling) return;
+  S.toggling = true;
+  render();
+  try {
+    const newState = !S.botRunning;
+    await fsSet(S.config, 'paper_config', 'control', { running: newState });
+    S.botRunning = newState;
+  } catch (e) {
+    S.error = 'Bot control failed: ' + e.message;
+  }
+  S.toggling = false;
+  render();
 }
 
 // ── Actions ───────────────────────────────────────────────────────────────────
