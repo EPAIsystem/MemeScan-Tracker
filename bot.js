@@ -495,12 +495,13 @@ async function monitorPositions() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
+    // ── TAKE PROFIT (skipped when tpDisabled — trailing SL rides the surge)
     // ── PARTIAL PROFIT SYSTEM (Active Momentum + Surge Catch) ────────────
     // Stage 0 → +50%: sell 25%
     // Stage 1 → +100%: sell 30%
     // Stage 2 → +200%: sell 15%, mark free ride
     // ══════════════════════════════════════════════════════════════════════
-    if (pos.partialStage !== null) {
+    if (!pos.tpDisabled && pos.partialStage !== null) {
       const stage     = pos.partialStage || 0;
       const target    = pos.size * 1.2; // recover 120% of investment
 
@@ -548,7 +549,7 @@ async function monitorPositions() {
     // ══════════════════════════════════════════════════════════════════════
     // ── STANDARD TP1 / TP2 / TP3 (Bottom Bounce + Old Recovery) ─────────
     // ══════════════════════════════════════════════════════════════════════
-    else {
+    else if (!pos.tpDisabled) {
       if (!pos.tp1Hit && price >= pos.tp1) {
         const partPnL = gain * pos.size * 0.50;
         updates = { tp1Hit:true, remaining: pos.remaining - 0.50,

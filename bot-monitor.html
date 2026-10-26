@@ -144,6 +144,19 @@ header {
 }
 @keyframes pulse-red { 0%,100% { transform: scale(1) } 50% { transform: scale(1.06) } }
 .sell-btn:disabled { opacity: .4; cursor: not-allowed; }
+.tp-btn {
+  background: rgba(79,110,247,.12); color: var(--blue);
+  border: 1px solid rgba(79,110,247,.3); border-radius: 6px;
+  padding: 4px 10px; font-size: 11px; font-weight: 600;
+  font-family: var(--sans); cursor: pointer; white-space: nowrap;
+  transition: background .15s;
+}
+.tp-btn:hover { background: rgba(79,110,247,.25); }
+.tp-btn.disabled-tp {
+  background: rgba(255,165,0,.12); color: #ffaa33;
+  border-color: rgba(255,165,0,.35);
+}
+.tp-btn.disabled-tp:hover { background: rgba(255,165,0,.25); }
 
 /* ── pnl split row ────────────────────────────────────────────────────────────── */
 .pnl-split {
@@ -753,7 +766,10 @@ function posCard(pos) {
       </div>
       <div style="display:flex;flex-direction:column;align-items:flex-end;gap:5px">
         <div class="pos-ts">$${pos.size} · ${fmtDate(pos.enteredAt)}</div>
-        ${sellBtn(pos)}
+        <div style="display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end">
+          ${tpBtn(pos)}
+          ${sellBtn(pos)}
+        </div>
       </div>
     </div>
   </div>`;
@@ -794,6 +810,26 @@ async function confirmSell(posId) {
   } catch (e) {
     S.error = 'Sell request failed: ' + e.message;
     delete S.closingPos[posId];
+    render();
+  }
+}
+
+// ── TP disable toggle ─────────────────────────────────────────────────────────
+function tpBtn(pos) {
+  const off = !!pos.tpDisabled;
+  return off
+    ? `<button class="tp-btn disabled-tp" onclick="toggleTP('${pos._id}', true)"  title="Take profit OFF — trailing SL riding">🚀 TP: OFF</button>`
+    : `<button class="tp-btn"             onclick="toggleTP('${pos._id}', false)" title="Take profit targets active">✅ TP: ON</button>`;
+}
+
+async function toggleTP(posId, currentlyDisabled) {
+  if (!S.config) return;
+  const newVal = !currentlyDisabled;
+  try {
+    await fsSet(S.config, 'paper_positions', posId, { tpDisabled: newVal });
+    loadData();
+  } catch (e) {
+    S.error = 'TP toggle failed: ' + e.message;
     render();
   }
 }
