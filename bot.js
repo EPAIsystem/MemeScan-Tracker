@@ -366,11 +366,12 @@ async function closePosition(id, data) {
 }
 
 async function getDailyStats() {
-  const today = new Date().toISOString().slice(0,10);
-  const doc   = await db.collection('paper_stats').doc(today).get();
+  const today           = new Date().toISOString().slice(0,10);
+  const doc             = await db.collection('paper_stats').doc(today).get();
+  const expectedBalance = POSITION_SIZE * MAX_POSITIONS;
   if (!doc.exists) {
     const init = {
-      date: today, startBalance: POSITION_SIZE * MAX_POSITIONS,
+      date: today, startBalance: expectedBalance,
       realizedPnL: 0, trades: 0, wins: 0, losses: 0,
       autoPnL: 0, autoTrades: 0, autoWins: 0,
       manualPnL: 0, manualTrades: 0, manualWins: 0,
@@ -378,7 +379,14 @@ async function getDailyStats() {
     await db.collection('paper_stats').doc(today).set(init);
     return init;
   }
-  return doc.data();
+  const data = doc.data();
+  // Auto-correct startBalance if MAX_POSITIONS or POSITION_SIZE changed
+  if (data.startBalance !== expectedBalance) {
+    await db.collection('paper_stats').doc(today).update({ startBalance: expectedBalance });
+    data.startBalance = expectedBalance;
+    console.log(`[BOT] startBalance corrected: $${data.startBalance} → $${expectedBalance}`);
+  }
+  return data;
 }
 
 async function updateDailyStats(pnl, isWin, isManual = false) {
@@ -608,6 +616,8 @@ async function scanForEntries() {
   const positions = await getOpenPositions();
   if (positions.length >= MAX_POSITIONS) return;
 
+  const vacantSlots = MAX_POSITIONS - positions.length;
+
   // Count open slots per strategy
   const slotCount = {};
   STRATEGIES.forEach(s => slotCount[s.id] = 0);
@@ -616,8 +626,17 @@ async function scanForEntries() {
   const openStrategies = STRATEGIES.filter(s => slotCount[s.id] < s.maxSlots);
   if (!openStrategies.length) return;
 
+  // ── Dynamic score threshold — fill slots aggressively when many are empty ──
+  // 6+ vacant → 45  |  3–5 vacant → 50  |  1–2 vacant → normal 60
+  const scoreThreshold = vacantSlots >= 6 ? 45 : vacantSlots >= 3 ? 50 : MIN_SCORE;
+  if (vacantSlots >= 3) console.log(`[BOT] ${vacantSlots} slots vacant — score threshold: ${scoreThreshold}`);
+
   // Fetch candidates from DexScreener
   const keywords = ['meme','pepe','dog','cat','inu','moon','elon','baby','pump','shib'];
+  // When urgently filling (5+ vacant), cast a wider net
+  if (vacantSlots >= 5) {
+    keywords.push('sol','grok','ai','doge','floki','frog','chad','coin','trump','wojak');
+  }
   const seen = new Set();
   const candidates = [];
 
@@ -652,7 +671,7 @@ async function scanForEntries() {
     if (openAddrs.has(addr) || enteredToday.has(addr)) continue;
 
     const result = detectStrategy(pair, openStrategies);
-    if (result && result.score >= MIN_SCORE) {
+    if (result && result.score >= scoreThreshold) {
       matches.push(result);
     }
   }
