@@ -225,6 +225,59 @@ td { padding: 10px 14px; border-top: 1px solid var(--border); font-family: var(-
 .td-sym { font-family: var(--sans); font-weight: 600; font-size: 13px; }
 tbody tr:hover td { background: var(--bg3); }
 
+/* ── Manual queue section ────────────────────────────────────────────────────── */
+.manual-section {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 12px; padding: 18px 16px; margin-bottom: 28px;
+}
+.manual-title {
+  font-size: 12px; font-weight: 700; color: var(--fg2);
+  text-transform: uppercase; letter-spacing: .09em; margin-bottom: 14px;
+  display: flex; align-items: center; gap: 8px;
+}
+.manual-form {
+  display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px;
+}
+.manual-input {
+  background: var(--bg3); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--fg); font-family: var(--mono); font-size: 12px;
+  padding: 9px 12px; outline: none; transition: border-color .15s;
+}
+.manual-input:focus { border-color: var(--accent); }
+.manual-input.addr { flex: 1 1 220px; min-width: 0; }
+.manual-input.size { width: 88px; flex-shrink: 0; }
+.manual-add-btn {
+  background: var(--accent); color: #fff; border: none;
+  border-radius: 8px; padding: 9px 16px; font-size: 13px;
+  font-weight: 600; font-family: var(--sans); cursor: pointer;
+  white-space: nowrap; transition: opacity .15s;
+}
+.manual-add-btn:hover { opacity: .85; }
+.manual-add-btn:disabled { opacity: .45; cursor: not-allowed; }
+.manual-sym-preview {
+  font-size: 11px; color: var(--green); margin-top: -4px; margin-bottom: 4px;
+  min-height: 16px; font-family: var(--mono);
+}
+.manual-queue-list { display: flex; flex-direction: column; gap: 8px; }
+.manual-item {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 8px; padding: 9px 12px; font-size: 12px;
+}
+.manual-item-sym { font-weight: 700; font-size: 13px; min-width: 56px; }
+.manual-item-addr { font-family: var(--mono); color: var(--fg3); font-size: 10px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.manual-item-size { font-family: var(--mono); color: var(--yellow); white-space: nowrap; }
+.manual-item-status { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; white-space: nowrap; }
+.manual-item-status.pending  { color: var(--yellow); }
+.manual-item-status.entered  { color: var(--green); }
+.manual-item-status.failed   { color: var(--red); }
+.manual-item-del {
+  background: none; border: none; color: var(--fg3); font-size: 14px;
+  cursor: pointer; padding: 0 2px; line-height: 1; flex-shrink: 0;
+}
+.manual-item-del:hover { color: var(--red); }
+.manual-empty { font-size: 12px; color: var(--fg3); text-align: center; padding: 8px 0; }
+
 /* ── Bot control button ──────────────────────────────────────────────────────── */
 .bot-ctrl {
   display: flex; align-items: center; gap: 7px;
@@ -297,6 +350,8 @@ const S = {
   lastUpdated: null,
   botRunning: null,   // null=unknown, true=running, false=stopped
   toggling: false,    // prevent double-tap
+  manualQueue: [],    // items in paper_manual_queue
+  manualAdding: false,
 };
 
 // ── Config store ──────────────────────────────────────────────────────────────
@@ -351,6 +406,29 @@ async function fsGet(cfg, coll, id) {
   return parseDoc(await r.json());
 }
 
+async function fsAdd(cfg, coll, fields) {
+  // POST to collection — Firestore auto-generates ID
+  const fsFields = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (typeof v === 'boolean') fsFields[k] = { booleanValue: v };
+    else if (typeof v === 'number') fsFields[k] = { doubleValue: v };
+    else fsFields[k] = { stringValue: String(v) };
+  }
+  const url = `${base(cfg)}/${coll}?key=${cfg.apiKey}`;
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields: fsFields }),
+  });
+  if (!r.ok) { const t = await r.text(); throw new Error(`Firestore add ${r.status}: ${t.slice(0,120)}`); }
+  return parseDoc(await r.json());
+}
+
+async function fsDelete(cfg, coll, id) {
+  const r = await fetch(`${base(cfg)}/${coll}/${id}?key=${cfg.apiKey}`, { method: 'DELETE' });
+  if (!r.ok && r.status !== 404) throw new Error(`Firestore delete ${r.status}`);
+}
+
 async function fsSet(cfg, coll, id, fields) {
   // Build Firestore field map
   const fsFields = {};
@@ -388,16 +466,18 @@ async function loadData() {
   render();
   try {
     const today = new Date().toISOString().slice(0, 10);
-    const [positions, history, statsDoc, ctrlDoc] = await Promise.all([
+    const [positions, history, statsDoc, ctrlDoc, manualQueue] = await Promise.all([
       fsQuery(S.config, 'paper_positions', 'status', 'open'),
       fsQuery(S.config, 'paper_history'),
       fsGet(S.config, 'paper_stats', today),
       fsGet(S.config, 'paper_config', 'control'),
+      fsQuery(S.config, 'paper_manual_queue'),
     ]);
     S.positions = positions;
     S.history = history.slice(0, 15);
     S.stats = statsDoc;
-    S.botRunning = ctrlDoc ? (ctrlDoc.running !== false) : true; // default running if doc absent
+    S.botRunning = ctrlDoc ? (ctrlDoc.running !== false) : true;
+    S.manualQueue = manualQueue.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0)).slice(0, 20);
     // Live prices
     const addrs = [...new Set(positions.map(p => p.address).filter(Boolean))];
     await Promise.all(addrs.map(async a => { const p = await fetchPrice(a); if (p) S.prices[a] = p; }));
@@ -568,6 +648,8 @@ function render() {
         </div>
       </div>
 
+      ${manualQueueHTML()}
+
       <div class="section-head">
         <span class="section-label">Open Positions</span>
         <span class="section-meta">${S.positions.length} active</span>
@@ -638,6 +720,86 @@ function posCard(pos) {
       <div class="pos-ts">$${pos.size} · ${fmtDate(pos.enteredAt)}</div>
     </div>
   </div>`;
+}
+
+// ── Manual queue UI ───────────────────────────────────────────────────────────
+function manualQueueHTML() {
+  const statusIcon = { pending: '⏳', entered: '✅', failed: '❌' };
+
+  const items = S.manualQueue.length
+    ? S.manualQueue.map(item => `
+        <div class="manual-item">
+          <span class="manual-item-sym">${item.symbol || '?'}</span>
+          <span class="manual-item-addr" title="${item.address}">${item.address}</span>
+          <span class="manual-item-size">$${item.size || 100}</span>
+          <span class="manual-item-status ${item.status}">${statusIcon[item.status] || ''} ${item.status}</span>
+          ${item.status === 'pending'
+            ? `<button class="manual-item-del" onclick="removeManualToken('${item._id}')" title="Cancel">✕</button>`
+            : ''}
+        </div>`).join('')
+    : `<div class="manual-empty">No tokens queued — add one above</div>`;
+
+  return `
+    <div class="manual-section">
+      <div class="manual-title">🎯 Manual Token Queue</div>
+      <div class="manual-form">
+        <input class="manual-input addr" id="m-addr" placeholder="Contract address (0x… or token CA)" autocomplete="off" spellcheck="false">
+        <input class="manual-input size" id="m-size" type="number" placeholder="$" min="10" step="10" value="100">
+        <button class="manual-add-btn" id="m-addbtn" onclick="addManualToken()" ${S.manualAdding ? 'disabled' : ''}>
+          ${S.manualAdding ? '…' : '+ Add'}
+        </button>
+      </div>
+      <div class="manual-queue-list">${items}</div>
+    </div>`;
+}
+
+async function addManualToken() {
+  if (!S.config || S.manualAdding) return;
+  const addrEl = document.getElementById('m-addr');
+  const sizeEl = document.getElementById('m-size');
+  const addr   = addrEl?.value.trim();
+  const size   = parseFloat(sizeEl?.value) || 100;
+  if (!addr) { addrEl?.focus(); return; }
+
+  S.manualAdding = true;
+  render();
+
+  try {
+    // Try to resolve symbol from DexScreener first
+    let symbol = '?';
+    try {
+      const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${addr}`);
+      const d = await r.json();
+      if (d.pairs?.length) {
+        d.pairs.sort((a,b) => (b.liquidity?.usd||0) - (a.liquidity?.usd||0));
+        symbol = d.pairs[0].baseToken?.symbol || '?';
+      }
+    } catch {}
+
+    await fsAdd(S.config, 'paper_manual_queue', {
+      address: addr,
+      symbol,
+      size,
+      status: 'pending',
+      addedAt: Date.now(),
+    });
+
+    if (addrEl) addrEl.value = '';
+    await loadData();
+  } catch (e) {
+    S.error = 'Queue failed: ' + e.message;
+  }
+  S.manualAdding = false;
+  render();
+}
+
+async function removeManualToken(id) {
+  if (!S.config || !id) return;
+  try {
+    await fsDelete(S.config, 'paper_manual_queue', id);
+    S.manualQueue = S.manualQueue.filter(x => x._id !== id);
+    render();
+  } catch (e) { S.error = 'Remove failed: ' + e.message; render(); }
 }
 
 // ── Bot control ───────────────────────────────────────────────────────────────

@@ -258,10 +258,11 @@ async function getOpenPositions() {
   return snap.docs.map(d => ({ id: d.id, ...d.data() }));
 }
 
-async function enterPosition(coin) {
+async function enterPosition(coin, overrides = {}) {
   const ref = db.collection('paper_positions').doc();
   const s   = coin.strategy;
   const usePartial = !!s.usePartialProfit;
+  const posSize = overrides.size || POSITION_SIZE;
   const pos = {
     symbol: coin.symbol, name: coin.name, address: coin.addr,
     chain: coin.chain, strategyId: s.id, strategyLabel: s.label,
@@ -274,13 +275,14 @@ async function enterPosition(coin) {
     currentSL: coin.price * s.slx,
     initialTrailPct: s.initialTrailPct,
     trailingActive: false,
-    size: POSITION_SIZE,
+    size: posSize,
     remaining: 1.0,
     tp1Hit: false, tp2Hit: false,
     // Partial profit fields (Active Momentum + Surge)
     partialStage:    usePartial ? 0 : null,
     recoveredAmount: usePartial ? 0 : null,
     freeRide:        usePartial ? false : null,
+    isManual:        overrides.isManual || false,
     status: 'open',
     enteredAt: Date.now(),
     dexUrl: coin.dexUrl,
@@ -288,6 +290,69 @@ async function enterPosition(coin) {
   };
   await ref.set(pos);
   return { id: ref.id, ...pos };
+}
+
+// ── Manual token queue ────────────────────────────────────────────────────────
+// Dashboard writes to paper_manual_queue; bot picks them up each scan cycle.
+const MANUAL_STRATEGY = {
+  id: 99, label: '🎯 Manual',
+  tp1x: 1.25, tp2x: 1.75, tp3x: 3.00, slx: 0.85, initialTrailPct: 15,
+  usePartialProfit: false,
+};
+
+async function processManualQueue() {
+  try {
+    const snap = await db.collection('paper_manual_queue')
+      .where('status', '==', 'pending')
+      .get();
+    if (snap.empty) return;
+
+    const positions = await getOpenPositions();
+    for (const doc of snap.docs) {
+      if (positions.length >= MAX_POSITIONS) break;
+
+      const item = doc.data();
+      try {
+        // Fetch live price from DexScreener
+        const r = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${item.address}`);
+        const d = JSON.parse(r.body);
+        if (!d.pairs?.length) throw new Error('Token not found on DexScreener');
+        d.pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+        const pair = d.pairs[0];
+        const price = parseFloat(pair.priceUsd || 0);
+        if (!price) throw new Error('No price available');
+
+        const coin = {
+          symbol: item.symbol || pair.baseToken?.symbol || '?',
+          name:   pair.baseToken?.name || '',
+          addr:   item.address,
+          chain:  pair.chainId,
+          price,
+          score:  100,
+          dexUrl: `https://dexscreener.com/${pair.chainId}/${pair.pairAddress}`,
+          strategy: MANUAL_STRATEGY,
+        };
+
+        const pos = await enterPosition(coin, {
+          size: item.size || POSITION_SIZE,
+          isManual: true,
+        });
+
+        await doc.ref.update({ status: 'entered', enteredPositionId: pos.id, processedAt: Date.now() });
+        positions.push(pos);
+
+        await sendTelegram(
+          `🎯 *MANUAL ENTRY*\n` +
+          `*${coin.symbol}* @ ${fmtPrice(price)}\n` +
+          `💰 Size: $${coin.size || POSITION_SIZE} · TP3: ${fmtPrice(pos.tp3)} · SL: ${fmtPrice(pos.sl)}`
+        );
+        console.log(`[MANUAL] Entered ${coin.symbol} @ ${price}`);
+      } catch (e) {
+        await doc.ref.update({ status: 'failed', error: e.message, processedAt: Date.now() });
+        console.error(`[MANUAL] Failed for ${item.address}: ${e.message}`);
+      }
+    }
+  } catch (e) { console.error('[MANUAL QUEUE]', e.message); }
 }
 
 async function updatePosition(id, data) {
@@ -651,6 +716,7 @@ async function main() {
   setInterval(async () => {
     try {
       scanCount++;
+      await processManualQueue();   // manual entries first
       await scanForEntries();
       if (scanCount % 4 === 0) console.log(`[BOT] Scan #${scanCount}`);
     } catch(e) { console.error('[SCANNER]', e.message); }
