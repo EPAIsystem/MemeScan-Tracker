@@ -1,0 +1,604 @@
+<title>MemeScan Bot</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+
+<style>
+/* Dark terminal — single committed theme */
+:root {
+  --bg:     #090c14;
+  --bg2:    #0f1420;
+  --bg3:    #171e2e;
+  --border: #1e2a40;
+  --fg:     #dde4f0;
+  --fg2:    #7988a6;
+  --fg3:    #3a4560;
+  --green:  #2ec27e;
+  --red:    #e8534a;
+  --yellow: #e8a838;
+  --blue:   #4098d6;
+  --accent: #4f6ef7;
+  --mono:   'JetBrains Mono', Consolas, monospace;
+  --sans:   'Inter', system-ui, sans-serif;
+  color-scheme: dark;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  margin: 0;
+  min-height: 100%;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 20px;
+}
+
+#app { max-width: 960px; margin: 0 auto; }
+
+/* ── Setup ─────────────────────────────────────────────────────────────────── */
+.setup {
+  max-width: 460px;
+  margin: 48px auto 0;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 32px;
+}
+.setup-icon { font-size: 32px; margin-bottom: 16px; }
+.setup h1 { font-size: 18px; font-weight: 600; margin: 0 0 6px; }
+.setup .sub { color: var(--fg2); font-size: 13px; margin: 0 0 28px; }
+.field-label {
+  font-size: 11px; color: var(--fg3); text-transform: uppercase;
+  letter-spacing: .07em; font-weight: 500; margin-bottom: 5px; display: block;
+}
+.field-input {
+  width: 100%;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 9px 12px;
+  margin-bottom: 18px;
+  outline: none;
+  transition: border-color .15s;
+}
+.field-input:focus { border-color: var(--accent); }
+.field-hint { font-size: 11px; color: var(--fg3); margin: -13px 0 18px; }
+.setup-err { color: var(--red); font-size: 12px; margin-top: 10px; }
+
+/* ── Header ─────────────────────────────────────────────────────────────────── */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.logo-row { display: flex; align-items: center; gap: 12px; }
+.logo-icon {
+  width: 38px; height: 38px;
+  background: linear-gradient(135deg, #4f6ef7 0%, #2ec27e 100%);
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; flex-shrink: 0;
+}
+.logo-name { font-size: 15px; font-weight: 600; }
+.logo-sub  { font-size: 11px; color: var(--fg2); }
+
+.header-right { display: flex; align-items: center; gap: 10px; }
+.live-badge {
+  display: flex; align-items: center; gap: 5px;
+  background: rgba(46,194,126,.1); border: 1px solid rgba(46,194,126,.2);
+  border-radius: 20px; padding: 3px 9px;
+  font-size: 11px; color: var(--green); font-weight: 500;
+}
+.live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: blink 2s ease-in-out infinite; }
+@keyframes blink { 0%,100% { opacity:1 } 50% { opacity:.3 } }
+.update-time { font-family: var(--mono); font-size: 11px; color: var(--fg3); }
+
+/* ── Buttons ─────────────────────────────────────────────────────────────────── */
+.btn {
+  background: var(--accent); color: #fff; border: none;
+  border-radius: 8px; padding: 9px 20px;
+  font-size: 14px; font-weight: 500; font-family: var(--sans);
+  cursor: pointer; transition: opacity .15s;
+}
+.btn:hover { opacity: .85; }
+.btn-ghost {
+  background: var(--bg3); color: var(--fg2);
+  border: 1px solid var(--border); border-radius: 7px;
+  padding: 5px 12px; font-size: 12px; cursor: pointer;
+  font-family: var(--sans); transition: background .15s;
+}
+.btn-ghost:hover { background: var(--border); }
+.btn-link { background: none; border: none; color: var(--fg3); font-size: 11px; cursor: pointer; padding: 0; }
+
+/* ── Stats tiles ─────────────────────────────────────────────────────────────── */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-bottom: 24px;
+}
+@media (max-width: 600px) { .stats-grid { grid-template-columns: repeat(2, 1fr); } }
+
+.stat-tile {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+.stat-label { font-size: 10px; color: var(--fg3); text-transform: uppercase; letter-spacing: .08em; font-weight: 500; margin-bottom: 6px; }
+.stat-val   { font-family: var(--mono); font-size: 22px; font-weight: 500; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.stat-note  { font-size: 11px; color: var(--fg2); margin-top: 3px; }
+.c-green  { color: var(--green); }
+.c-red    { color: var(--red); }
+.c-yellow { color: var(--yellow); }
+.c-fg     { color: var(--fg); }
+
+/* ── Section heading ─────────────────────────────────────────────────────────── */
+.section-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 12px;
+}
+.section-label { font-size: 11px; font-weight: 600; color: var(--fg2); text-transform: uppercase; letter-spacing: .09em; }
+.section-meta  { font-family: var(--mono); font-size: 11px; color: var(--fg3); }
+
+/* ── Position cards ──────────────────────────────────────────────────────────── */
+.pos-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+  gap: 12px;
+  margin-bottom: 28px;
+}
+
+.pos-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  padding: 16px;
+  position: relative;
+  overflow: hidden;
+}
+.pos-card::after {
+  content: '';
+  position: absolute; top: 0; left: 0; right: 0;
+  height: 2px;
+  background: var(--border);
+}
+.pos-card.profit::after { background: var(--green); }
+.pos-card.loss::after   { background: var(--red); }
+
+.pos-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
+.pos-sym  { font-size: 17px; font-weight: 600; }
+.pos-name { font-size: 11px; color: var(--fg2); margin-top: 1px; }
+.pos-right { text-align: right; }
+.cat-badge {
+  display: inline-block;
+  font-size: 10px; padding: 2px 8px; border-radius: 20px;
+  background: var(--bg3); border: 1px solid var(--border);
+  color: var(--fg2); white-space: nowrap;
+}
+.pos-score { font-family: var(--mono); font-size: 10px; color: var(--fg3); margin-top: 4px; }
+
+.price-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 13px; }
+.price-block { }
+.price-block .plabel { font-size: 10px; color: var(--fg3); text-transform: uppercase; letter-spacing: .05em; }
+.price-block .pval   { font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; margin-top: 1px; }
+
+/* Progress track */
+.track-wrap { margin-bottom: 13px; }
+.track-top  { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 10px; margin-bottom: 5px; }
+.track-rail { height: 5px; background: var(--bg3); border-radius: 3px; overflow: hidden; }
+.track-fill { height: 100%; border-radius: 3px; transition: width .5s ease; min-width: 2px; }
+.track-fill.profit { background: var(--green); }
+.track-fill.loss   { background: var(--red); }
+.track-tps  { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 9px; color: var(--fg3); margin-top: 4px; }
+
+.pos-foot { display: flex; align-items: flex-end; justify-content: space-between; }
+.pnl-big  { font-family: var(--mono); font-size: 16px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.pnl-pct  { font-size: 11px; color: var(--fg2); }
+.pos-ts   { font-size: 10px; color: var(--fg3); text-align: right; }
+
+/* ── History table ───────────────────────────────────────────────────────────── */
+.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 11px; margin-bottom: 30px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; min-width: 480px; }
+thead tr { background: var(--bg3); }
+th { padding: 10px 14px; font-size: 10px; color: var(--fg3); text-transform: uppercase; letter-spacing: .07em; font-weight: 500; text-align: left; white-space: nowrap; }
+td { padding: 10px 14px; border-top: 1px solid var(--border); font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.td-sym { font-family: var(--sans); font-weight: 600; font-size: 13px; }
+tbody tr:hover td { background: var(--bg3); }
+
+/* ── Misc ────────────────────────────────────────────────────────────────────── */
+.empty-state {
+  text-align: center; padding: 44px 16px;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 11px;
+  margin-bottom: 28px; color: var(--fg3);
+}
+.empty-state .ei { font-size: 30px; margin-bottom: 10px; }
+.empty-state p   { font-size: 13px; margin: 0; }
+
+.loader { text-align: center; padding: 40px; color: var(--fg3); font-size: 13px; }
+.spin {
+  display: inline-block; width: 16px; height: 16px;
+  border: 2px solid var(--bg3); border-top-color: var(--accent);
+  border-radius: 50%; animation: rot .65s linear infinite;
+  vertical-align: middle; margin-right: 8px;
+}
+@keyframes rot { to { transform: rotate(360deg) } }
+
+.err-box {
+  background: rgba(232,83,74,.08); border: 1px solid rgba(232,83,74,.25);
+  border-radius: 9px; color: var(--red); padding: 12px 16px;
+  font-size: 13px; margin-bottom: 18px; line-height: 1.5;
+}
+</style>
+
+<div id="root"></div>
+
+<script>
+'use strict';
+
+// ── State ─────────────────────────────────────────────────────────────────────
+const S = {
+  config: null,
+  positions: [],
+  history: [],
+  stats: null,
+  prices: {},
+  loading: false,
+  error: null,
+  lastUpdated: null,
+};
+
+// ── Config store ──────────────────────────────────────────────────────────────
+function loadCfg() {
+  try { const r = localStorage.getItem('mscan_cfg'); return r ? JSON.parse(r) : null; } catch { return null; }
+}
+function saveCfg(c) {
+  try { localStorage.setItem('mscan_cfg', JSON.stringify(c)); } catch {}
+}
+
+// ── Firestore REST helpers ────────────────────────────────────────────────────
+function base(cfg) {
+  return `https://firestore.googleapis.com/v1/projects/${cfg.projectId}/databases/(default)/documents`;
+}
+
+function parseVal(v) {
+  if (!v) return null;
+  if ('stringValue'  in v) return v.stringValue;
+  if ('integerValue' in v) return Number(v.integerValue);
+  if ('doubleValue'  in v) return v.doubleValue;
+  if ('booleanValue' in v) return v.booleanValue;
+  if ('nullValue'    in v) return null;
+  return null;
+}
+
+function parseDoc(doc) {
+  if (!doc?.fields) return null;
+  const o = { _id: doc.name?.split('/').pop() };
+  for (const [k, v] of Object.entries(doc.fields)) o[k] = parseVal(v);
+  return o;
+}
+
+async function fsQuery(cfg, coll, field, value) {
+  const url = `${base(cfg)}:runQuery?key=${cfg.apiKey}`;
+  const q = { structuredQuery: { from: [{ collectionId: coll }], limit: 25 } };
+  if (field) {
+    q.structuredQuery.where = { fieldFilter: { field: { fieldPath: field }, op: 'EQUAL', value: { stringValue: value } } };
+  }
+  q.structuredQuery.orderBy = [{ field: { fieldPath: 'enteredAt' }, direction: 'DESCENDING' }];
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(q) });
+  if (!r.ok) { const t = await r.text(); throw new Error(`Firestore ${r.status}: ${t.slice(0,120)}`); }
+  const rows = await r.json();
+  return rows.map(x => x.document ? parseDoc(x.document) : null).filter(Boolean);
+}
+
+async function fsGet(cfg, coll, id) {
+  const r = await fetch(`${base(cfg)}/${coll}/${id}?key=${cfg.apiKey}`);
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(`Firestore ${r.status}`);
+  return parseDoc(await r.json());
+}
+
+// ── DexScreener ───────────────────────────────────────────────────────────────
+async function fetchPrice(addr) {
+  try {
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${addr}`);
+    const d = await r.json();
+    if (!d.pairs?.length) return null;
+    d.pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+    return parseFloat(d.pairs[0].priceUsd) || null;
+  } catch { return null; }
+}
+
+// ── Load data ─────────────────────────────────────────────────────────────────
+async function loadData() {
+  if (!S.config) return;
+  S.loading = true; S.error = null;
+  render();
+  try {
+    const [positions, history] = await Promise.all([
+      fsQuery(S.config, 'paper_positions', 'status', 'open'),
+      fsQuery(S.config, 'paper_history'),
+    ]);
+    S.positions = positions;
+    S.history = history.slice(0, 15);
+    const today = new Date().toISOString().slice(0, 10);
+    S.stats = await fsGet(S.config, 'paper_stats', today);
+    // Live prices
+    const addrs = [...new Set(positions.map(p => p.address).filter(Boolean))];
+    await Promise.all(addrs.map(async a => { const p = await fetchPrice(a); if (p) S.prices[a] = p; }));
+    S.lastUpdated = new Date();
+  } catch (e) { S.error = e.message; }
+  S.loading = false;
+  render();
+}
+
+// ── Format helpers ────────────────────────────────────────────────────────────
+function fmtPrice(p) {
+  if (p == null || p === 0) return '—';
+  if (p < 0.000001) return '$' + p.toFixed(10).replace(/\.?0+$/, '');
+  if (p < 0.0001)   return '$' + p.toFixed(8).replace(/0+$/, '');
+  if (p < 0.01)     return '$' + p.toFixed(6).replace(/0+$/, '');
+  if (p < 1)        return '$' + p.toFixed(4);
+  return '$' + p.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function fmtPnl(n) {
+  if (n == null) return '—';
+  return (n >= 0 ? '+' : '') + '$' + Math.abs(n).toFixed(2);
+}
+
+function fmtPct(n) {
+  if (n == null) return '';
+  return (n >= 0 ? '+' : '') + n.toFixed(1) + '%';
+}
+
+function fmtDate(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  return d.toLocaleDateString('en-GB', { day:'2-digit', month:'short' }) + ' ' +
+         d.toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit' });
+}
+
+function livePnl(pos) {
+  const cur = S.prices[pos.address];
+  if (!cur) return null;
+  return (cur - pos.entryPrice) / pos.entryPrice * pos.size * (pos.remaining ?? 1);
+}
+
+function livePct(pos) {
+  const cur = S.prices[pos.address];
+  if (!cur) return null;
+  return (cur - pos.entryPrice) / pos.entryPrice * 100;
+}
+
+function trackFill(pos) {
+  const cur = S.prices[pos.address];
+  if (!cur) return 50;
+  const range = pos.tp3 - pos.sl;
+  if (range <= 0) return 50;
+  return Math.max(2, Math.min(98, (cur - pos.sl) / range * 100));
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function render() {
+  const root = document.getElementById('root');
+
+  if (!S.config) {
+    root.innerHTML = `
+      <div class="setup">
+        <div class="setup-icon">📊</div>
+        <h1>MemeScan PRO Dashboard</h1>
+        <p class="sub">Connect to Firebase to monitor your paper trading bot live.</p>
+        <label class="field-label" for="pid">Firebase Project ID</label>
+        <input class="field-input" id="pid" value="memescan-pro" placeholder="your-project-id">
+        <label class="field-label" for="akey">Web API Key</label>
+        <input class="field-input" id="akey" placeholder="AIzaSy…">
+        <p class="field-hint">Firebase Console → Project Settings → General → Web API Key</p>
+        <button class="btn" onclick="doSetup()">Connect →</button>
+        <p class="setup-err" id="serr" style="display:none"></p>
+      </div>`;
+    return;
+  }
+
+  const s = S.stats || {};
+  const openLivePnl = S.positions.reduce((sum, p) => sum + (livePnl(p) || 0), 0);
+  const portfolio = 500 + (s.realizedPnL || 0) + openLivePnl;
+  const todayPnl  = s.realizedPnL || 0;
+  const winRate   = s.trades > 0 ? Math.round(s.wins / s.trades * 100) : null;
+  const updTime   = S.lastUpdated
+    ? S.lastUpdated.toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit', second:'2-digit' })
+    : '—';
+
+  // Positions HTML
+  let posHTML = '';
+  if (S.loading) {
+    posHTML = `<div class="loader"><span class="spin"></span>Loading positions…</div>`;
+  } else if (!S.positions.length) {
+    posHTML = `<div class="empty-state"><div class="ei">👀</div><p>No open positions — bot is scanning for signals</p></div>`;
+  } else {
+    posHTML = `<div class="pos-grid">${S.positions.map(posCard).join('')}</div>`;
+  }
+
+  // History HTML
+  let histHTML = '';
+  if (!S.loading && !S.history.length) {
+    histHTML = `<div class="empty-state" style="margin-bottom:0"><div class="ei">📜</div><p>No closed trades yet</p></div>`;
+  } else if (!S.loading) {
+    const rows = S.history.map(t => {
+      const pnl = t.pnl || 0;
+      const pct = t.entryPrice && t.exitPrice ? (t.exitPrice - t.entryPrice) / t.entryPrice * 100 : null;
+      return `<tr>
+        <td class="td-sym">${t.symbol || '?'}</td>
+        <td>${fmtPrice(t.entryPrice)}</td>
+        <td>${fmtPrice(t.exitPrice)}</td>
+        <td class="${pct >= 0 ? 'c-green' : 'c-red'}">${pct != null ? fmtPct(pct) : '—'}</td>
+        <td class="${pnl >= 0 ? 'c-green' : 'c-red'}">${fmtPnl(pnl)}</td>
+        <td style="color:var(--fg2)">${t.exitReason || '—'}</td>
+        <td style="color:var(--fg3)">${fmtDate(t.closedAt)}</td>
+      </tr>`;
+    }).join('');
+    histHTML = `<div class="table-wrap">
+      <table>
+        <thead><tr><th>Token</th><th>Entry</th><th>Exit</th><th>%</th><th>P&amp;L</th><th>Reason</th><th>Closed</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  }
+
+  const errHTML = S.error
+    ? `<div class="err-box">⚠ ${S.error}<br><small>Check your API key and Firestore security rules.</small></div>`
+    : '';
+
+  root.innerHTML = `
+    <div id="app">
+      <header>
+        <div class="logo-row">
+          <div class="logo-icon">📊</div>
+          <div>
+            <div class="logo-name">MemeScan PRO Bot</div>
+            <div class="logo-sub">Paper Trading Dashboard</div>
+          </div>
+        </div>
+        <div class="header-right">
+          ${S.lastUpdated ? `<div class="live-badge"><div class="live-dot"></div>LIVE</div>` : ''}
+          <span class="update-time">${updTime}</span>
+          <button class="btn-ghost" onclick="loadData()">⟳ Refresh</button>
+          <button class="btn-link" onclick="disconnect()">Disconnect</button>
+        </div>
+      </header>
+
+      ${errHTML}
+
+      <div class="stats-grid">
+        <div class="stat-tile">
+          <div class="stat-label">Portfolio</div>
+          <div class="stat-val c-fg">$${portfolio.toFixed(2)}</div>
+          <div class="stat-note">Paper balance</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-label">Today's P&amp;L</div>
+          <div class="stat-val ${todayPnl >= 0 ? 'c-green' : 'c-red'}">${fmtPnl(todayPnl)}</div>
+          <div class="stat-note">${s.trades || 0} trades closed</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-label">Win Rate</div>
+          <div class="stat-val ${winRate == null ? 'c-fg' : winRate >= 50 ? 'c-green' : 'c-red'}">${winRate != null ? winRate + '%' : '—'}</div>
+          <div class="stat-note">${s.wins || 0}W / ${s.losses || 0}L</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-label">Positions</div>
+          <div class="stat-val c-fg">${S.positions.length}<span style="font-size:13px;color:var(--fg3)">/5</span></div>
+          <div class="stat-note">open now</div>
+        </div>
+      </div>
+
+      <div class="section-head">
+        <span class="section-label">Open Positions</span>
+        <span class="section-meta">${S.positions.length} active</span>
+      </div>
+      ${posHTML}
+
+      <div class="section-head">
+        <span class="section-label">Trade History</span>
+        <span class="section-meta">${S.history.length} closed</span>
+      </div>
+      ${histHTML}
+    </div>`;
+}
+
+function posCard(pos) {
+  const pnl  = livePnl(pos);
+  const pct  = livePct(pos);
+  const fill = trackFill(pos);
+  const cur  = S.prices[pos.address];
+  const isProfit = pnl != null && pnl >= 0;
+  const cardClass = pnl == null ? '' : isProfit ? 'profit' : 'loss';
+
+  return `<div class="pos-card ${cardClass}">
+    <div class="pos-head">
+      <div>
+        <div class="pos-sym">${pos.symbol || '?'}</div>
+        <div class="pos-name">${pos.name || ''}</div>
+      </div>
+      <div class="pos-right">
+        <span class="cat-badge">${pos.catLabel || ''}</span>
+        <div class="pos-score">Score ${pos.score || '—'}/100</div>
+      </div>
+    </div>
+
+    <div class="price-row">
+      <div class="price-block">
+        <div class="plabel">Entry</div>
+        <div class="pval">${fmtPrice(pos.entryPrice)}</div>
+      </div>
+      <div class="price-block">
+        <div class="plabel">Current</div>
+        <div class="pval ${cur ? (cur >= pos.entryPrice ? 'c-green' : 'c-red') : ''}">${cur ? fmtPrice(cur) : '…'}</div>
+      </div>
+    </div>
+
+    <div class="track-wrap">
+      <div class="track-top">
+        <span style="color:var(--red)">SL ${fmtPrice(pos.sl)}</span>
+        <span style="color:var(--fg3)">Entry ${fmtPrice(pos.entryPrice)}</span>
+        <span style="color:var(--green)">TP3 ${fmtPrice(pos.tp3)}</span>
+      </div>
+      <div class="track-rail">
+        <div class="track-fill ${isProfit ? 'profit' : 'loss'}" style="width:${fill}%"></div>
+      </div>
+      <div class="track-tps">
+        <span style="color:var(--red)">▸ SL</span>
+        <span>TP1 ${fmtPrice(pos.tp1)}</span>
+        <span>TP2 ${fmtPrice(pos.tp2)}</span>
+        <span style="color:var(--green)">TP3 ◂</span>
+      </div>
+    </div>
+
+    <div class="pos-foot">
+      <div>
+        <div class="pnl-big ${pnl != null ? (pnl >= 0 ? 'c-green' : 'c-red') : ''}">${fmtPnl(pnl)}</div>
+        <div class="pnl-pct">${pct != null ? fmtPct(pct) : 'fetching price…'}</div>
+      </div>
+      <div class="pos-ts">$${pos.size} · ${fmtDate(pos.enteredAt)}</div>
+    </div>
+  </div>`;
+}
+
+// ── Actions ───────────────────────────────────────────────────────────────────
+function doSetup() {
+  const pid  = document.getElementById('pid')?.value.trim();
+  const akey = document.getElementById('akey')?.value.trim();
+  const err  = document.getElementById('serr');
+  if (!pid || !akey) {
+    if (err) { err.style.display = ''; err.textContent = 'Both fields are required.'; }
+    return;
+  }
+  S.config = { projectId: pid, apiKey: akey };
+  saveCfg(S.config);
+  loadData();
+}
+
+function disconnect() {
+  S.config = null;
+  try { localStorage.removeItem('mscan_cfg'); } catch {}
+  render();
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+S.config = loadCfg();
+render();
+if (S.config) loadData();
+setInterval(() => { if (S.config && !S.loading) loadData(); }, 30000);
+</script>
