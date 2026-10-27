@@ -124,7 +124,8 @@ function detectStrategy(pair, openStrategies) {
   const liq     = pair.liquidity?.usd || 0;
   const vol24   = pair.volume?.h24 || 0;
   const mcap    = pair.fdv || pair.marketCap || 1;
-  const ch1     = parseFloat(pair.priceChange?.h1  || 0);
+  const ch1Raw  = pair.priceChange?.h1;                                 // null = no data
+  const ch1     = ch1Raw == null ? null : parseFloat(ch1Raw);
   const ch24    = parseFloat(pair.priceChange?.h24 || 0);
   const m5Ch    = parseFloat(pair.priceChange?.m5  || 0);
   const buys24  = pair.txns?.h24?.buys  || 0;
@@ -145,6 +146,15 @@ function detectStrategy(pair, openStrategies) {
   if (liq < 3000)  return null;
   if (price <= 0)  return null;
   if (sells24 === 0 && buys24 > 10) return null; // honeypot guard
+
+  // DEAD COIN GUARD: reject any coin where the 1h price change is missing or flat.
+  // ch1 === null → DexScreener has no h1 data at all (coin too new / data gap).
+  // ch1 === 0    → price did not move one pip in the last hour = zero trade activity.
+  // Both cases mean there is nothing to trade; we skip them unconditionally.
+  // A very small non-zero value combined with zero recent txns also signals a dead market.
+  if (ch1 === null)                            return null; // no h1 data
+  if (ch1 === 0)                               return null; // completely flat h1
+  if (Math.abs(ch1) < 0.1 && m5Txns < 3)      return null; // near-flat + no recent txns
 
   const ageMinutes = (now - created) / 60000;
   const dexId      = pair.dexId || '';
