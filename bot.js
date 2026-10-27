@@ -147,14 +147,18 @@ function detectStrategy(pair, openStrategies) {
   if (price <= 0)  return null;
   if (sells24 === 0 && buys24 > 10) return null; // honeypot guard
 
-  // DEAD COIN GUARD: reject any coin where the 1h price change is missing or flat.
-  // ch1 === null → DexScreener has no h1 data at all (coin too new / data gap).
-  // ch1 === 0    → price did not move one pip in the last hour = zero trade activity.
-  // Both cases mean there is nothing to trade; we skip them unconditionally.
-  // A very small non-zero value combined with zero recent txns also signals a dead market.
-  if (ch1 === null)                            return null; // no h1 data
-  if (ch1 === 0)                               return null; // completely flat h1
-  if (Math.abs(ch1) < 0.1 && m5Txns < 3)      return null; // near-flat + no recent txns
+  // DEAD COIN GUARD: reject any coin where the 1h price change is missing or effectively flat.
+  //
+  // ch1 === null       → DexScreener returned no h1 data (coin too new / data gap)
+  // Math.abs(ch1) < 0.5 → displays as "0.0%" on the signal — price has not moved
+  //                        meaningfully in the last hour, i.e. no real trading activity.
+  //                        This is an UNCONDITIONAL reject — no m5Txns escape hatch —
+  //                        because a coin that rounds to 0.0% h1 has nothing to trade.
+  //
+  // Root cause of the original bug: ch1 could be 0.02 or 0.04 (not integer zero),
+  // which DexScreener rounds to "0.0%" in the display but was not caught by === 0.
+  if (ch1 === null)          return null; // no h1 data from DexScreener
+  if (Math.abs(ch1) < 0.5)   return null; // rounds to 0.0% → dead / inactive token
 
   const ageMinutes = (now - created) / 60000;
   const dexId      = pair.dexId || '';
