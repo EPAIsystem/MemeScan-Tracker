@@ -271,6 +271,9 @@ const alertCooldown = new Map();
 const recentSLCoins = new Map();
 const SL_BLOCK_MS   = 6 * 60 * 60 * 1000; // 6 hours
 let scanCount = 0;
+// Daily loss limit state — set true when limit hit, cleared on /restart
+let dayHaltedToday  = false;
+let telegramOffset  = 0; // for Telegram command polling
 
 // ─── POSITION CACHE ───────────────────────────────────────────────────────────
 // Reduces Firestore reads from ~250K/day to ~1.5K/day
@@ -486,19 +489,143 @@ async function isBotRunning() {
   } catch { return true; } // on error, don't block trading
 }
 
+// ─── DAY RESTART ─────────────────────────────────────────────────────────────
+// Called at the top of each scan/monitor cycle.
+// If paper_config/control.restartDay == true → zero out today's P&L, clear
+// in-memory state, resume trading.  Also handles real-mode restart (future).
+async function checkDayRestart() {
+  try {
+    const doc = await db.collection('paper_config').doc('control').get();
+    if (!doc.exists) return false;
+    const data = doc.data();
+    if (!data.restartDay) return false;
+
+    // ── Perform restart ──
+    const today = new Date().toISOString().slice(0, 10);
+    const statsSnap = await db.collection('paper_stats').doc(today).get();
+    const prevPnL   = statsSnap.exists ? (statsSnap.data().realizedPnL || 0) : 0;
+
+    // Zero out today's P&L; accumulate total loss across restarts for transparency
+    await db.collection('paper_stats').doc(today).set({
+      realizedPnL: 0, autoPnL: 0, manualPnL: 0,
+      restartCount:   FieldValue.increment(1),
+      cumulativeLoss: FieldValue.increment(prevPnL < 0 ? prevPnL : 0),
+      lastRestartAt:  Date.now(),
+    }, { merge: true });
+
+    // Clear in-memory state so old coins don't block fresh entries
+    enteredToday.clear();
+    recentSLCoins.clear();
+    alertCooldown.clear();
+    dayHaltedToday = false;
+
+    // Clear the flag so we don't restart again immediately
+    await db.collection('paper_config').doc('control').update({
+      restartDay: false, lastRestartAt: Date.now(),
+    });
+
+    const lostStr = prevPnL >= 0
+      ? `+$${prevPnL.toFixed(2)}`
+      : `-$${Math.abs(prevPnL).toFixed(2)}`;
+
+    await sendTelegram(
+      `🔄 *DAY RESTARTED*\n\n` +
+      `Session P&L locked: *${lostStr}*\n` +
+      `Loss counter reset → $0. Bot scanning again.\n\n` +
+      `_Send /restart any time to reset again_`
+    );
+    console.log(`[BOT] Day restarted — prev session PnL: ${lostStr}`);
+    return true;
+  } catch(e) {
+    console.error('[BOT] checkDayRestart error:', e.message);
+    return false;
+  }
+}
+
+// ─── TELEGRAM COMMAND POLLING ─────────────────────────────────────────────────
+// Polls for /restart and /status commands from the authorized chat.
+// Lightweight — runs every 30 s, uses long-poll with timeout=5.
+async function pollTelegramCommands() {
+  try {
+    const path = `/bot${TELEGRAM_TOKEN}/getUpdates?offset=${telegramOffset}&timeout=5&allowed_updates=${encodeURIComponent('["message"]')}`;
+    const r = await httpGet('api.telegram.org', path);
+    const d = JSON.parse(r.body);
+    if (!d.ok || !d.result?.length) return;
+
+    for (const update of d.result) {
+      telegramOffset = update.update_id + 1;
+      const text   = (update.message?.text || '').trim().toLowerCase();
+      const chatId = String(update.message?.chat?.id || '');
+
+      if (chatId !== String(TELEGRAM_CHAT)) continue; // ignore strangers
+
+      if (text === '/restart' || text === '/restart_day') {
+        if (dayHaltedToday) {
+          // Directly perform restart — no Firestore round-trip needed
+          await db.collection('paper_config').doc('control').set(
+            { restartDay: true }, { merge: true }
+          );
+          await sendTelegram('⏳ Restart queued — will apply within 5 seconds.');
+        } else {
+          // Day is running fine — still allow restart (clears state / counters)
+          await db.collection('paper_config').doc('control').set(
+            { restartDay: true }, { merge: true }
+          );
+          await sendTelegram('✅ Day reset queued — loss counter & cooldowns will clear shortly.');
+        }
+      }
+
+      if (text === '/status') {
+        const stats  = await getDailyStats();
+        const pnlStr = stats.realizedPnL >= 0
+          ? `+$${stats.realizedPnL.toFixed(2)}`
+          : `-$${Math.abs(stats.realizedPnL).toFixed(2)}`;
+        const pct    = ((stats.realizedPnL / stats.startBalance) * 100).toFixed(1);
+        const state  = dayHaltedToday ? '🚨 HALTED (daily limit)' : '✅ Running';
+        await sendTelegram(
+          `📊 *STATUS*\n\n` +
+          `${state}\n` +
+          `Daily P&L: *${pnlStr}* (${pct}%)\n` +
+          `Limit: ${(DAILY_LOSS_LIMIT * 100).toFixed(0)}%\n\n` +
+          `_/restart — reset day  · /status — this report_`
+        );
+      }
+    }
+  } catch(e) {
+    console.error('[TELEGRAM-POLL]', e.message);
+  }
+}
+
 async function monitorPositions() {
   if (!(await isBotRunning())) return;
+
+  // Check for day-restart request before anything else
+  await checkDayRestart();
+
   const positions = await getOpenPositions();
   if (!positions.length) return;
 
   const stats = await getDailyStats();
   if (stats.realizedPnL / stats.startBalance <= DAILY_LOSS_LIMIT) {
-    console.log('[BOT] Daily loss limit — closing all');
-    for (const pos of positions) {
-      const price = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
-      const pnl = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
-      await closePosition(pos.id, { exitPrice: price, exitReason: 'DAILY_LIMIT', pnl });
-      await sendTelegram(`🚨 *DAILY LOSS LIMIT*\n*${pos.symbol}* closed. P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
+    if (!dayHaltedToday) {
+      // First time crossing the limit this session — close all and notify
+      console.log('[BOT] Daily loss limit hit — closing all positions');
+      dayHaltedToday = true;
+      for (const pos of positions) {
+        const price = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
+        const pnl = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+        await closePosition(pos.id, { exitPrice: price, exitReason: 'DAILY_LIMIT', pnl });
+        await sendTelegram(`🚨 *DAILY LOSS LIMIT*\n*${pos.symbol}* closed. P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
+      }
+      const lostPct = Math.abs((stats.realizedPnL / stats.startBalance) * 100).toFixed(1);
+      await sendTelegram(
+        `🛑 *BOT HALTED — Daily ${lostPct}% loss limit reached*\n\n` +
+        `All positions closed. No new entries today.\n\n` +
+        `▶️ *To restart the day:*\n` +
+        `• Send */restart* here\n` +
+        `• Or tap Restart Day on the dashboard\n\n` +
+        `_Loss counter resets. Previous P&L is locked for records._`
+      );
     }
     return;
   }
@@ -750,6 +877,11 @@ async function monitorPositions() {
 // ═════════════════════════════════════════════════════════════════════════════
 async function scanForEntries() {
   if (!(await isBotRunning())) return;
+  // Fast in-memory check — no Firestore read needed when already halted
+  if (dayHaltedToday) {
+    await checkDayRestart(); // check if user sent /restart
+    return;
+  }
   const positions = await getOpenPositions();
   if (positions.length >= MAX_POSITIONS) return;
 
@@ -905,7 +1037,8 @@ async function main() {
     `🚀 Surge Catch: 2 slots\n` +
     `📈 Old Recovery: 2 slots\n\n` +
     `💰 $${POSITION_SIZE}/position · 🛑 Daily limit: 30%\n` +
-    `⏱ Scanning every 15 seconds`
+    `⏱ Scanning every 15 seconds\n\n` +
+    `_Commands: /restart — reset day · /status — P&L report_`
   );
 
   let lastHourly = Date.now();
@@ -932,6 +1065,11 @@ async function main() {
       try { await sendHourlySummary(); } catch(e) {}
     }
   }, 60000);
+
+  // Poll for /restart and /status Telegram commands every 30 s
+  setInterval(async () => {
+    try { await pollTelegramCommands(); } catch(e) {}
+  }, 30000);
 }
 
 main().catch(e => { console.error('[FATAL]', e); process.exit(1); });
