@@ -252,11 +252,23 @@ const enteredToday  = new Set();
 const alertCooldown = new Map();
 let scanCount = 0;
 
-// ─── FIREBASE HELPERS ─────────────────────────────────────────────────────────
+// ─── POSITION CACHE ───────────────────────────────────────────────────────────
+// Reduces Firestore reads from ~250K/day to ~1.5K/day
+// Full re-query every 60s; individual updates/closes patch in-place.
+let _posCache   = null;
+let _posCacheAt = 0;
+const POS_TTL   = 60000; // 60 seconds between full re-queries
+
 async function getOpenPositions() {
-  const snap = await db.collection('paper_positions').where('status','==','open').get();
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  const now = Date.now();
+  if (_posCache && now - _posCacheAt < POS_TTL) return _posCache;
+  const snap  = await db.collection('paper_positions').where('status','==','open').get();
+  _posCache   = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  _posCacheAt = now;
+  return _posCache;
 }
+
+// ─── FIREBASE HELPERS ─────────────────────────────────────────────────────────
 
 async function enterPosition(coin, overrides = {}) {
   const ref = db.collection('paper_positions').doc();
@@ -289,7 +301,10 @@ async function enterPosition(coin, overrides = {}) {
     pnl: 0,
   };
   await ref.set(pos);
-  return { id: ref.id, ...pos };
+  const newPos = { id: ref.id, ...pos };
+  // Add to cache immediately so next cycle sees it without a Firestore read
+  if (_posCache) _posCache.push(newPos);
+  return newPos;
 }
 
 // ── Manual token queue ────────────────────────────────────────────────────────
@@ -357,12 +372,26 @@ async function processManualQueue() {
 
 async function updatePosition(id, data) {
   await db.collection('paper_positions').doc(id).update(data);
+  // Patch cache in-place so TP/SL logic sees current state without re-querying
+  if (_posCache) {
+    const p = _posCache.find(p => p.id === id);
+    if (p) Object.assign(p, data);
+  }
 }
 
 async function closePosition(id, data) {
-  await db.collection('paper_positions').doc(id).update({ ...data, status:'closed', closedAt: Date.now() });
-  const snap = await db.collection('paper_positions').doc(id).get();
-  await db.collection('paper_history').add(snap.data());
+  const closeData = { ...data, status: 'closed', closedAt: Date.now() };
+  // Use cached position to build history entry — avoids an extra Firestore read
+  const cached = _posCache?.find(p => p.id === id);
+  await db.collection('paper_positions').doc(id).update(closeData);
+  if (cached) {
+    await db.collection('paper_history').add({ ...cached, ...closeData });
+  } else {
+    const snap = await db.collection('paper_positions').doc(id).get();
+    await db.collection('paper_history').add({ ...snap.data(), ...closeData });
+  }
+  // Remove from cache immediately
+  if (_posCache) _posCache = _posCache.filter(p => p.id !== id);
 }
 
 async function getDailyStats() {
@@ -597,7 +626,8 @@ async function monitorPositions() {
       const trailPct  = calcTrailPct(pos.initialTrailPct, gainPct);
       const newSL     = price * (1 - trailPct / 100);
       const currentSL = updates.currentSL ?? pos.currentSL;
-      if (newSL > currentSL) {
+      // Only write if SL moved ≥ 0.5% — prevents thousands of tiny writes per day
+      if (newSL > currentSL * 1.005) {
         updates.currentSL      = newSL;
         updates.trailingActive = true;
       }

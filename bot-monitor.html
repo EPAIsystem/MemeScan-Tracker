@@ -975,5 +975,5 @@ function disconnect() {
 S.config = loadCfg();
 render();
 if (S.config) loadData();
-setInterval(() => { if (S.config && !S.loading) loadData(); }, 30000);
+setInterval(() => { if (S.config && !S.loading) loadData(); }, 60000);
 </script>
