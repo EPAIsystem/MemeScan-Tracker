@@ -107,8 +107,10 @@ const STRATEGIES = [
 
 // Trailing SL: tightens as price rises, floors at 5%
 // gain = % gain e.g. 50 for +50%
+// Tightening: faster than before — at 80% gain, Active Momentum locks within 7% of price
 function calcTrailPct(initialTrailPct, gainPct) {
-  return Math.max(5, initialTrailPct - (gainPct / 10));
+  // Tighten twice as fast for big gains (÷7 instead of ÷10)
+  return Math.max(5, initialTrailPct - (gainPct / 7));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -299,6 +301,7 @@ async function enterPosition(coin, overrides = {}) {
     enteredAt: Date.now(),
     dexUrl: coin.dexUrl,
     pnl: 0,
+    peakPrice: coin.price,  // track highest price seen — for rug detection
   };
   await ref.set(pos);
   const newPos = { id: ref.id, ...pos };
@@ -514,6 +517,35 @@ async function monitorPositions() {
     const gainPct = gain * 100;
     let updates   = {};
     let alertMsg  = null;
+
+    // ── PEAK PRICE TRACKER ─────────────────────────────────────────────────
+    // Track highest price seen — used for rug detection & trailing SL base
+    const peak = pos.peakPrice || pos.entryPrice;
+    if (price > peak * 1.05) {          // only write to Firestore every 5% rise
+      updates.peakPrice = price;
+      pos.peakPrice = price;            // patch cache immediately
+    }
+    const currentPeak = pos.peakPrice || peak;
+
+    // ── RUG DETECTION — EMERGENCY EXIT ────────────────────────────────────
+    // If price crashes >40% from peak in a single 5s tick AND we were profitable,
+    // exit immediately before it goes to near-zero
+    if (currentPeak > pos.entryPrice * 1.15 && price < currentPeak * 0.60) {
+      const pnl = gain * pos.size * pos.remaining;
+      await closePosition(pos.id, { exitPrice: price, exitReason: 'RUG_DETECTED', pnl });
+      await updateDailyStats(pnl, pnl > 0, isManual);
+      enteredToday.delete(pos.address);
+      const dropPct = ((price / currentPeak - 1) * 100).toFixed(0);
+      await sendTelegram(
+        `⚠️ *RUG DETECTED — EMERGENCY EXIT*\n\n` +
+        `*${pos.symbol}* ${pos.strategyLabel}\n` +
+        `📉 Dropped *${dropPct}%* from peak in one tick\n` +
+        `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(price)}\n` +
+        `📊 P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*\n🔗 [Chart](${pos.dexUrl})`
+      );
+      console.log(`[BOT] RUG_DETECTED ${pos.symbol}: peak $${fmtPrice(currentPeak)} → now $${fmtPrice(price)} (${dropPct}%)`);
+      continue;
+    }
 
     // ── STOP LOSS ──────────────────────────────────────────────────────────
     if (price <= pos.currentSL) {
