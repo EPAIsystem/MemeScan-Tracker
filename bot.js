@@ -146,7 +146,8 @@ function detectStrategy(pair, openStrategies) {
   if (price <= 0)  return null;
   if (sells24 === 0 && buys24 > 10) return null; // honeypot guard
 
-  const base = { addr, price, liq, vol24, buyPct, buys24, ch1, ch24, m5Ch, m5Txns, ageDays, volMcap,
+  const ageMinutes = (now - created) / 60000;
+  const base = { addr, price, liq, vol24, buyPct, buys24, ch1, ch24, m5Ch, m5Txns, ageDays, ageMinutes, volMcap,
     symbol: pair.baseToken?.symbol || '???',
     name:   pair.baseToken?.name   || '',
     chain:  pair.chainId || 'unknown',
@@ -297,6 +298,9 @@ async function enterPosition(coin, overrides = {}) {
     recoveredAmount: usePartial ? 0 : null,
     freeRide:        usePartial ? false : null,
     isManual:        overrides.isManual || false,
+    // Young coin mode: if Active Momentum coin is < 1h old, use quick 10/20/30% exits
+    // instead of chasing 50/100/200% — new coins pump fast then rug
+    youngCoin: (s.id === 1 && (coin.ageMinutes || 0) < 60),
     status: 'open',
     enteredAt: Date.now(),
     dexUrl: coin.dexUrl,
@@ -565,53 +569,107 @@ async function monitorPositions() {
 
     // ══════════════════════════════════════════════════════════════════════
     // ── TAKE PROFIT (skipped when tpDisabled — trailing SL rides the surge)
-    // ── PARTIAL PROFIT SYSTEM (Active Momentum + Surge Catch) ────────────
-    // Stage 0 → +50%: sell 25%
-    // Stage 1 → +100%: sell 30%
-    // Stage 2 → +200%: sell 15%, mark free ride
+    // ══════════════════════════════════════════════════════════════════════
+    // TWO MODES for Active Momentum:
+    //
+    // 🔥 YOUNG COIN (< 1h old at entry): quick exits — 10 / 20 / 30% gains
+    //    Sell 30% at each stage, keep 10% for trailing SL ride
+    //    These coins pump fast then rug — don't chase 50/100/200%
+    //
+    // 📈 NORMAL (≥ 1h old): standard stages — 50 / 100 / 200% gains
+    //    Sell 25% / 30% / 15%, let the rest ride
     // ══════════════════════════════════════════════════════════════════════
     if (!pos.tpDisabled && pos.partialStage !== null) {
-      const stage     = pos.partialStage || 0;
-      const target    = pos.size * 1.2; // recover 120% of investment
+      const stage  = pos.partialStage || 0;
+      const target = pos.size * 1.2; // recover 120% of investment
 
-      if (stage === 0 && price >= pos.entryPrice * 1.5) {
-        const frac     = 0.25;
-        const proceeds = frac * pos.size * (price / pos.entryPrice);
-        const partPnL  = proceeds - frac * pos.size;
-        const newRec   = (pos.recoveredAmount || 0) + proceeds;
-        updates = { partialStage:1, remaining: pos.remaining - frac,
-          recoveredAmount: newRec, pnl: FieldValue.increment(partPnL) };
-        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
-        alertMsg = `⚡ *STAGE 1 — 25% SOLD (+50%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-          `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
-          `🎯 Recovered $${newRec.toFixed(2)} / $${target.toFixed(2)} — riding 75%\n🔗 [Chart](${pos.dexUrl})`;
-        Object.assign(pos, updates);
-      }
-      else if (stage === 1 && price >= pos.entryPrice * 2.0) {
-        const frac     = 0.30;
-        const proceeds = frac * pos.size * (price / pos.entryPrice);
-        const partPnL  = proceeds - frac * pos.size;
-        const newRec   = (pos.recoveredAmount || 0) + proceeds;
-        const fr       = newRec >= target;
-        updates = { partialStage:2, remaining: pos.remaining - frac,
-          recoveredAmount: newRec, freeRide: fr, pnl: FieldValue.increment(partPnL) };
-        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
-        alertMsg = `⚡ *STAGE 2 — 30% SOLD (+100%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-          `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
-          `🎯 Recovered $${newRec.toFixed(2)}${fr?' ✅ FREE RIDE!':''}\n🔗 [Chart](${pos.dexUrl})`;
-        Object.assign(pos, updates);
-      }
-      else if (stage === 2 && price >= pos.entryPrice * 3.0) {
-        const frac     = Math.min(0.15, pos.remaining - 0.10);
-        const proceeds = frac * pos.size * (price / pos.entryPrice);
-        const partPnL  = proceeds - frac * pos.size;
-        const newRec   = (pos.recoveredAmount || 0) + proceeds;
-        updates = { partialStage:3, remaining: pos.remaining - frac,
-          recoveredAmount: newRec, freeRide: true, pnl: FieldValue.increment(partPnL) };
-        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
-        alertMsg = `🚀 *STAGE 3 — FREE RIDE (+200%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-          `💰 Total recovered: $${newRec.toFixed(2)} | Remaining ${((pos.remaining-frac)*100).toFixed(0)}% is pure profit\n🔗 [Chart](${pos.dexUrl})`;
-        Object.assign(pos, updates);
+      if (pos.youngCoin) {
+        // ── YOUNG COIN MODE: quick 10 / 20 / 30% ──────────────────────────
+        if (stage === 0 && price >= pos.entryPrice * 1.10) {
+          const frac     = 0.30;
+          const proceeds = frac * pos.size * (price / pos.entryPrice);
+          const partPnL  = proceeds - frac * pos.size;
+          const newRec   = (pos.recoveredAmount || 0) + proceeds;
+          updates = { partialStage:1, remaining: pos.remaining - frac,
+            recoveredAmount: newRec, pnl: FieldValue.increment(partPnL) };
+          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
+          alertMsg = `🔥 *YOUNG COIN — 30% SOLD (+10%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
+            `⚡ Quick exit: coin is <1h old\n` +
+            `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
+            `🎯 Riding 70% — next exit at +20%\n🔗 [Chart](${pos.dexUrl})`;
+          Object.assign(pos, updates);
+        }
+        else if (stage === 1 && price >= pos.entryPrice * 1.20) {
+          const frac     = 0.30;
+          const proceeds = frac * pos.size * (price / pos.entryPrice);
+          const partPnL  = proceeds - frac * pos.size;
+          const newRec   = (pos.recoveredAmount || 0) + proceeds;
+          updates = { partialStage:2, remaining: pos.remaining - frac,
+            recoveredAmount: newRec, pnl: FieldValue.increment(partPnL) };
+          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
+          alertMsg = `🔥 *YOUNG COIN — 30% MORE SOLD (+20%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
+            `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
+            `🎯 Riding 40% — next exit at +30%\n🔗 [Chart](${pos.dexUrl})`;
+          Object.assign(pos, updates);
+        }
+        else if (stage === 2 && price >= pos.entryPrice * 1.30) {
+          const frac     = 0.30;
+          const proceeds = frac * pos.size * (price / pos.entryPrice);
+          const partPnL  = proceeds - frac * pos.size;
+          const newRec   = (pos.recoveredAmount || 0) + proceeds;
+          // After 3 quick exits: 10% remains riding on tight trailing SL only
+          updates = { partialStage:3, remaining: pos.remaining - frac,
+            recoveredAmount: newRec, freeRide: newRec >= target,
+            pnl: FieldValue.increment(partPnL),
+            // Tighten SL to 5% after final quick exit — protect the last 10%
+            currentSL: price * 0.95, initialTrailPct: 8 };
+          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
+          alertMsg = `🔥 *YOUNG COIN — FINAL QUICK EXIT (+30%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
+            `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
+            `🎯 10% remains on tight 5% trailing SL — ride or die!\n🔗 [Chart](${pos.dexUrl})`;
+          Object.assign(pos, updates);
+        }
+      } else {
+        // ── NORMAL MODE: standard 50 / 100 / 200% stages ─────────────────
+        if (stage === 0 && price >= pos.entryPrice * 1.5) {
+          const frac     = 0.25;
+          const proceeds = frac * pos.size * (price / pos.entryPrice);
+          const partPnL  = proceeds - frac * pos.size;
+          const newRec   = (pos.recoveredAmount || 0) + proceeds;
+          updates = { partialStage:1, remaining: pos.remaining - frac,
+            recoveredAmount: newRec, pnl: FieldValue.increment(partPnL) };
+          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
+          alertMsg = `⚡ *STAGE 1 — 25% SOLD (+50%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
+            `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
+            `🎯 Recovered $${newRec.toFixed(2)} / $${target.toFixed(2)} — riding 75%\n🔗 [Chart](${pos.dexUrl})`;
+          Object.assign(pos, updates);
+        }
+        else if (stage === 1 && price >= pos.entryPrice * 2.0) {
+          const frac     = 0.30;
+          const proceeds = frac * pos.size * (price / pos.entryPrice);
+          const partPnL  = proceeds - frac * pos.size;
+          const newRec   = (pos.recoveredAmount || 0) + proceeds;
+          const fr       = newRec >= target;
+          updates = { partialStage:2, remaining: pos.remaining - frac,
+            recoveredAmount: newRec, freeRide: fr, pnl: FieldValue.increment(partPnL) };
+          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
+          alertMsg = `⚡ *STAGE 2 — 30% SOLD (+100%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
+            `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
+            `🎯 Recovered $${newRec.toFixed(2)}${fr?' ✅ FREE RIDE!':''}\n🔗 [Chart](${pos.dexUrl})`;
+          Object.assign(pos, updates);
+        }
+        else if (stage === 2 && price >= pos.entryPrice * 3.0) {
+          const frac     = Math.min(0.15, pos.remaining - 0.10);
+          const proceeds = frac * pos.size * (price / pos.entryPrice);
+          const partPnL  = proceeds - frac * pos.size;
+          const newRec   = (pos.recoveredAmount || 0) + proceeds;
+          updates = { partialStage:3, remaining: pos.remaining - frac,
+            recoveredAmount: newRec, freeRide: true, pnl: FieldValue.increment(partPnL) };
+          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
+          alertMsg = `🚀 *STAGE 3 — FREE RIDE (+200%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
+            `💰 Total recovered: $${newRec.toFixed(2)} | Remaining ${((pos.remaining-frac)*100).toFixed(0)}% is pure profit\n🔗 [Chart](${pos.dexUrl})`;
+          Object.assign(pos, updates);
+        }
       }
     }
 
@@ -759,11 +817,19 @@ async function scanForEntries() {
     slotCount[coin.strategy.id]++;
 
     const s = coin.strategy;
-    const tpInfo = s.usePartialProfit
-      ? `🎯 Stage 1 (+50%): sell 25%\n🎯 Stage 2 (+100%): sell 30%\n🎯 Stage 3 (+200%): sell 15% → free ride\n`
-      : `🎯 TP1: $${fmtPrice(coin.price * s.tp1x)} (+${((s.tp1x-1)*100).toFixed(0)}%) → 50%\n` +
-        `🎯 TP2: $${fmtPrice(coin.price * s.tp2x)} (+${((s.tp2x-1)*100).toFixed(0)}%) → 30%\n` +
-        `🎯 TP3: $${fmtPrice(coin.price * s.tp3x)} (+${((s.tp3x-1)*100).toFixed(0)}%) → 20%\n`;
+    const isYoung = s.id === 1 && (coin.ageMinutes || 0) < 60;
+    const ageLabel = coin.ageMinutes < 60
+      ? `${Math.round(coin.ageMinutes)}min old`
+      : `${(coin.ageDays * 24).toFixed(1)}h old`;
+    const tpInfo = isYoung
+      ? `⚡ *YOUNG COIN MODE* (${ageLabel}) — quick exits:\n` +
+        `🎯 +10%: sell 30% | +20%: sell 30% | +30%: sell 30%\n` +
+        `🏁 10% remains on 5% tight trailing SL\n`
+      : s.usePartialProfit
+        ? `🎯 Stage 1 (+50%): sell 25%\n🎯 Stage 2 (+100%): sell 30%\n🎯 Stage 3 (+200%): sell 15% → free ride\n`
+        : `🎯 TP1: $${fmtPrice(coin.price * s.tp1x)} (+${((s.tp1x-1)*100).toFixed(0)}%) → 50%\n` +
+          `🎯 TP2: $${fmtPrice(coin.price * s.tp2x)} (+${((s.tp2x-1)*100).toFixed(0)}%) → 30%\n` +
+          `🎯 TP3: $${fmtPrice(coin.price * s.tp3x)} (+${((s.tp3x-1)*100).toFixed(0)}%) → 20%\n`;
 
     await sendTelegram(
       `📊 *PAPER TRADE ENTRY*\n\n` +
@@ -773,7 +839,7 @@ async function scanForEntries() {
       `💵 Entry: $${fmtPrice(coin.price)}\n` +
       `💰 Position: $${POSITION_SIZE} (paper)\n` +
       `📊 Buy%: ${coin.buyPct.toFixed(0)}% | Liq: $${(coin.liq/1000).toFixed(0)}k\n` +
-      `📈 m5: ${coin.m5Ch>0?'+':''}${coin.m5Ch.toFixed(1)}% | h1: ${coin.ch1>0?'+':''}${coin.ch1.toFixed(1)}% | 24h: ${coin.ch24>0?'+':''}${coin.ch24.toFixed(1)}%\n\n` +
+      `📈 Age: ${ageLabel} | m5: ${coin.m5Ch>0?'+':''}${coin.m5Ch.toFixed(1)}% | h1: ${coin.ch1>0?'+':''}${coin.ch1.toFixed(1)}%\n\n` +
       tpInfo +
       `🛑 SL: $${fmtPrice(coin.price * s.slx)} | Trail: ${s.initialTrailPct}% → floors at 5%\n\n` +
       `\`${coin.addr}\`\n🔗 [Chart](${coin.dexUrl})`

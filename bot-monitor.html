@@ -727,6 +727,7 @@ function posCard(pos) {
       </div>
       <div class="pos-right">
         <span class="cat-badge">${pos.strategyLabel || pos.catLabel || ''}</span>
+        ${pos.youngCoin ? `<span style="font-size:10px;background:rgba(255,100,0,0.25);color:#ff8c42;border:1px solid rgba(255,140,66,0.4);border-radius:4px;padding:1px 5px;margin-left:3px;">🔥 YOUNG</span>` : ''}
         <div class="pos-score">Score ${pos.score || '—'}/100</div>
       </div>
     </div>
