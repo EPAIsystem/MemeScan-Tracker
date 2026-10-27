@@ -848,8 +848,9 @@ async function monitorPositions() {
       console.log('[BOT] Daily loss limit hit — closing all positions');
       dayHaltedToday = true;
       for (const pos of positions) {
-        const price = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
-        const pnl = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+        const price   = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
+        const exitPnl = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+        const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
         await closePosition(pos.id, { exitPrice: price, exitReason: 'DAILY_LIMIT', pnl });
         await sendTelegram(`🚨 *DAILY LOSS LIMIT*\n*${pos.symbol}* closed. P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
       }
@@ -871,10 +872,11 @@ async function monitorPositions() {
 
     // ── MANUAL CLOSE REQUEST (user tapped "Sell Now" on dashboard) ─────────
     if (pos.closeRequested) {
-      const price = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
-      const pnl   = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+      const price   = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
+      const exitPnl = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+      const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
       await closePosition(pos.id, { exitPrice: price, exitReason: 'MANUAL_CLOSE', pnl });
-      await updateDailyStats(pnl, pnl > 0, isManual);
+      await updateDailyStats(exitPnl, exitPnl > 0, isManual);  // only the final slice (TPs already counted)
       enteredToday.delete(pos.address);
       await sendTelegram(
         `🚫 *MANUAL CLOSE*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
@@ -885,10 +887,11 @@ async function monitorPositions() {
 
     // Auto-close after 7 days
     if (Date.now() - pos.enteredAt > 7 * 86400000) {
-      const price = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
-      const pnl = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+      const price   = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
+      const exitPnl = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+      const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
       await closePosition(pos.id, { exitPrice: price, exitReason: 'EXPIRED', pnl });
-      await updateDailyStats(pnl, pnl > 0, isManual);
+      await updateDailyStats(exitPnl, exitPnl > 0, isManual);
       await sendTelegram(`⏰ *EXPIRED* — *${pos.symbol}*\nExit: $${fmtPrice(price)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
       enteredToday.delete(pos.address);
       continue;
@@ -915,9 +918,10 @@ async function monitorPositions() {
     // If price crashes >40% from peak in a single 5s tick AND we were profitable,
     // exit immediately before it goes to near-zero
     if (currentPeak > pos.entryPrice * 1.15 && price < currentPeak * 0.60) {
-      const pnl = gain * pos.size * pos.remaining;
+      const exitPnl = gain * pos.size * pos.remaining;
+      const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
       await closePosition(pos.id, { exitPrice: price, exitReason: 'RUG_DETECTED', pnl });
-      await updateDailyStats(pnl, pnl > 0, isManual);
+      await updateDailyStats(exitPnl, exitPnl > 0, isManual);
       recentSLCoins.set(pos.address, Date.now()); // block re-entry for 6h
       const dropPct = ((price / currentPeak - 1) * 100).toFixed(0);
       await sendTelegram(
@@ -933,9 +937,10 @@ async function monitorPositions() {
 
     // ── STOP LOSS ──────────────────────────────────────────────────────────
     if (price <= pos.currentSL) {
-      const pnl = gain * pos.size * pos.remaining;
+      const exitPnl = gain * pos.size * pos.remaining;
+      const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial TP exits
       await closePosition(pos.id, { exitPrice: price, exitReason: 'STOP_LOSS', pnl });
-      await updateDailyStats(pnl, false, isManual);
+      await updateDailyStats(exitPnl, false, isManual);
       recentSLCoins.set(pos.address, Date.now()); // block re-entry for 6h — prevents triple entries
       await sendTelegram(
         `🛑 *STOP LOSS HIT*\n\n` +
@@ -971,7 +976,7 @@ async function monitorPositions() {
           const partPnL  = proceeds - frac * pos.size;
           const newRec   = (pos.recoveredAmount || 0) + proceeds;
           updates = { partialStage:1, remaining: pos.remaining - frac,
-            recoveredAmount: newRec, pnl: FieldValue.increment(partPnL) };
+            recoveredAmount: newRec, pnl: (pos.pnl || 0) + partPnL };
           await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
           alertMsg = `🔥 *YOUNG COIN — 30% SOLD (+10%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
             `⚡ Quick exit: coin is <1h old\n` +
@@ -985,7 +990,7 @@ async function monitorPositions() {
           const partPnL  = proceeds - frac * pos.size;
           const newRec   = (pos.recoveredAmount || 0) + proceeds;
           updates = { partialStage:2, remaining: pos.remaining - frac,
-            recoveredAmount: newRec, pnl: FieldValue.increment(partPnL) };
+            recoveredAmount: newRec, pnl: (pos.pnl || 0) + partPnL };
           await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
           alertMsg = `🔥 *YOUNG COIN — 30% MORE SOLD (+20%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
             `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
@@ -1000,7 +1005,7 @@ async function monitorPositions() {
           // After 3 quick exits: 10% remains riding on tight trailing SL only
           updates = { partialStage:3, remaining: pos.remaining - frac,
             recoveredAmount: newRec, freeRide: newRec >= target,
-            pnl: FieldValue.increment(partPnL),
+            pnl: (pos.pnl || 0) + partPnL,
             // Tighten SL to 5% after final quick exit — protect the last 10%
             currentSL: price * 0.95, initialTrailPct: 8 };
           await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
@@ -1017,7 +1022,7 @@ async function monitorPositions() {
           const partPnL  = proceeds - frac * pos.size;
           const newRec   = (pos.recoveredAmount || 0) + proceeds;
           updates = { partialStage:1, remaining: pos.remaining - frac,
-            recoveredAmount: newRec, pnl: FieldValue.increment(partPnL) };
+            recoveredAmount: newRec, pnl: (pos.pnl || 0) + partPnL };
           await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
           alertMsg = `⚡ *STAGE 1 — 25% SOLD (+50%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
             `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
@@ -1031,7 +1036,7 @@ async function monitorPositions() {
           const newRec   = (pos.recoveredAmount || 0) + proceeds;
           const fr       = newRec >= target;
           updates = { partialStage:2, remaining: pos.remaining - frac,
-            recoveredAmount: newRec, freeRide: fr, pnl: FieldValue.increment(partPnL) };
+            recoveredAmount: newRec, freeRide: fr, pnl: (pos.pnl || 0) + partPnL };
           await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
           alertMsg = `⚡ *STAGE 2 — 30% SOLD (+100%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
             `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
@@ -1044,7 +1049,7 @@ async function monitorPositions() {
           const partPnL  = proceeds - frac * pos.size;
           const newRec   = (pos.recoveredAmount || 0) + proceeds;
           updates = { partialStage:3, remaining: pos.remaining - frac,
-            recoveredAmount: newRec, freeRide: true, pnl: FieldValue.increment(partPnL) };
+            recoveredAmount: newRec, freeRide: true, pnl: (pos.pnl || 0) + partPnL };
           await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
           alertMsg = `🚀 *STAGE 3 — FREE RIDE (+200%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
             `💰 Total recovered: $${newRec.toFixed(2)} | Remaining ${((pos.remaining-frac)*100).toFixed(0)}% is pure profit\n🔗 [Chart](${pos.dexUrl})`;
@@ -1060,7 +1065,7 @@ async function monitorPositions() {
       if (!pos.tp1Hit && price >= pos.tp1) {
         const partPnL = gain * pos.size * 0.50;
         updates = { tp1Hit:true, remaining: pos.remaining - 0.50,
-          currentSL: pos.entryPrice * 1.01, trailingActive:true, pnl: FieldValue.increment(partPnL) };
+          currentSL: pos.entryPrice * 1.01, trailingActive:true, pnl: (pos.pnl || 0) + partPnL };
         await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
         alertMsg = `✅ *TP1 HIT — 50% SOLD*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
           `Entry: $${fmtPrice(pos.entryPrice)} → $${fmtPrice(price)}\n` +
@@ -1070,7 +1075,7 @@ async function monitorPositions() {
       else if (pos.tp1Hit && !pos.tp2Hit && price >= pos.tp2) {
         const partPnL = gain * pos.size * 0.30;
         updates = { tp2Hit:true, remaining: pos.remaining - 0.30,
-          currentSL: pos.tp1 * 0.99, pnl: FieldValue.increment(partPnL) };
+          currentSL: pos.tp1 * 0.99, pnl: (pos.pnl || 0) + partPnL };
         await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
         alertMsg = `🎯 *TP2 HIT — 30% SOLD*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
           `💰 +$${partPnL.toFixed(2)} | SL → TP1 level\n🔗 [Chart](${pos.dexUrl})`;
@@ -1078,7 +1083,7 @@ async function monitorPositions() {
       }
       else if (pos.tp1Hit && pos.tp2Hit && price >= pos.tp3) {
         const partPnL = gain * pos.size * pos.remaining;
-        await closePosition(pos.id, { exitPrice: price, exitReason:'TP3', pnl: FieldValue.increment(partPnL) });
+        await closePosition(pos.id, { exitPrice: price, exitReason:'TP3', pnl: (pos.pnl || 0) + partPnL });
         await updateDailyStats(partPnL, true, isManual);
         enteredToday.delete(pos.address);
         await sendTelegram(`🏆 *TP3 — FULL EXIT*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
