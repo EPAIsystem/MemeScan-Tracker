@@ -282,6 +282,123 @@ let _posCache   = null;
 let _posCacheAt = 0;
 const POS_TTL   = 60000; // 60 seconds between full re-queries
 
+// ─── TRADING CONFIG CACHE ─────────────────────────────────────────────────────
+// paper_config/control + paper_config/wallets cached for 30s
+let _tradingCfg    = null;
+let _tradingCfgAt  = 0;
+let _walletsCache  = null;
+let _walletsCacheAt = 0;
+const CFG_TTL      = 30000; // 30s
+
+async function getTradingConfig() {
+  const now = Date.now();
+  if (_tradingCfg && now - _tradingCfgAt < CFG_TTL) return _tradingCfg;
+  try {
+    const doc = await db.collection('paper_config').doc('control').get();
+    _tradingCfg   = doc.exists ? doc.data() : {};
+    _tradingCfgAt = now;
+  } catch { _tradingCfg = _tradingCfg || {}; }
+  return _tradingCfg;
+}
+
+// Returns active wallets array, sorted by envKey (WALLET_1 first)
+async function getWallets() {
+  const now = Date.now();
+  if (_walletsCache && now - _walletsCacheAt < CFG_TTL) return _walletsCache;
+  try {
+    const snap = await db.collection('paper_config').doc('wallets').collection('slots').get();
+    _walletsCache = snap.docs
+      .map(d => ({ id: d.id, ...d.data() }))
+      .filter(w => w.active !== false)
+      .sort((a, b) => (a.envKey || '').localeCompare(b.envKey || ''));
+    _walletsCacheAt = now;
+  } catch { _walletsCache = _walletsCache || []; }
+  return _walletsCache;
+}
+
+// Normalise DexScreener chainId → wallet chain key
+function normaliseChain(chainId = '') {
+  const c = chainId.toLowerCase();
+  if (c === 'solana')                          return 'solana';
+  if (c === 'ethereum' || c === 'eth')         return 'ethereum';
+  if (c === 'bsc' || c === 'binance-smart-chain') return 'bsc';
+  if (c === 'base')                            return 'base';
+  if (c === 'arbitrum' || c === 'arbitrum-one') return 'arbitrum';
+  return c; // passthrough for anything else
+}
+
+// Auto-select the best wallet for a given chain.
+// Preference order: manually pinned override → first matching active wallet
+async function selectWalletForChain(chain, cfg) {
+  const wallets = await getWallets();
+  const matching = wallets.filter(w => w.chain === chain && w.active !== false);
+  if (!matching.length) return null;
+
+  // Check manual override in config: cfg.activeWalletId[chain]
+  const overrides = cfg.activeWalletId || {};
+  if (overrides[chain]) {
+    const pinned = matching.find(w => w.id === overrides[chain]);
+    if (pinned) return pinned;
+  }
+  return matching[0]; // first active wallet for this chain
+}
+
+// Check if trader has queued an "add funds" request and apply it.
+// Paper mode: credits virtual balance. Real mode: logs the deposit for records.
+async function checkAddFunds(cfg) {
+  const amount = parseFloat(cfg.addFunds || 0);
+  if (!amount || amount <= 0) return;
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const newBalance = (parseFloat(cfg.paperBalance || 0)) + amount;
+
+    // Credit the virtual balance and update today's start balance
+    await db.collection('paper_config').doc('control').update({
+      paperBalance: newBalance,
+      addFunds: 0,
+      lastFundsAddedAt: Date.now(),
+    });
+    await db.collection('paper_stats').doc(today).set(
+      { startBalance: newBalance, fundsAdded: FieldValue.increment(amount) },
+      { merge: true }
+    );
+    _tradingCfg = null; // bust cache so new balance is picked up
+
+    const modeLabel = (cfg.tradingMode || 'paper') === 'real' ? 'Real' : 'Paper';
+    await sendTelegram(
+      `💵 *FUNDS ADDED — ${modeLabel} Mode*\n\n` +
+      `Added: *+$${amount.toFixed(2)}*\n` +
+      `New balance: *$${newBalance.toFixed(2)}*`
+    );
+    console.log(`[BOT] Funds added: +$${amount} → balance $${newBalance}`);
+  } catch(e) {
+    console.error('[BOT] checkAddFunds error:', e.message);
+  }
+}
+
+// ─── REAL TRADE EXECUTION STUBS ───────────────────────────────────────────────
+// These will be wired to actual chain SDKs in a future release.
+// Solana: @solana/web3.js + Jupiter aggregator
+// EVM (ETH/BSC/Base): ethers.js + 1inch or Uniswap v3 router
+// Private key loaded from Fly.io secret: process.env[wallet.envKey + '_PRIVATE_KEY']
+async function executeRealEntry(coin, wallet, posSize) {
+  const privKey = process.env[`${wallet.envKey}_PRIVATE_KEY`] || '';
+  if (!privKey) {
+    console.warn(`[REAL] ⚠️  No private key for ${wallet.label} (${wallet.envKey}_PRIVATE_KEY). Simulating.`);
+  }
+  console.log(`[REAL] 🟡 ENTRY STUB — ${coin.symbol} | chain: ${coin.chain} | wallet: ${wallet.label} | $${posSize}`);
+  // TODO: swap execution
+  return { txHash: 'PENDING-REAL', executedPrice: coin.price };
+}
+
+async function executeRealExit(pos, wallet, exitPrice) {
+  const privKey = process.env[`${wallet.envKey}_PRIVATE_KEY`] || '';
+  if (!privKey) console.warn(`[REAL] ⚠️  No private key for ${wallet.label}.`);
+  console.log(`[REAL] 🟡 EXIT STUB — ${pos.symbol} | chain: ${pos.chain} | wallet: ${wallet.label} | price: ${exitPrice}`);
+  // TODO: swap execution
+  return { txHash: 'PENDING-REAL', executedPrice: exitPrice };
+}
+
 async function getOpenPositions() {
   const now = Date.now();
   if (_posCache && now - _posCacheAt < POS_TTL) return _posCache;
@@ -294,10 +411,26 @@ async function getOpenPositions() {
 // ─── FIREBASE HELPERS ─────────────────────────────────────────────────────────
 
 async function enterPosition(coin, overrides = {}) {
-  const ref = db.collection('paper_positions').doc();
-  const s   = coin.strategy;
+  const ref  = db.collection('paper_positions').doc();
+  const s    = coin.strategy;
   const usePartial = !!s.usePartialProfit;
-  const posSize = overrides.size || POSITION_SIZE;
+  const posSize    = overrides.size || POSITION_SIZE;
+
+  // ── Trading mode & wallet ──────────────────────────────────────────────────
+  const cfg        = await getTradingConfig();
+  const tradingMode = cfg.tradingMode || 'paper';
+  const coinChain  = normaliseChain(coin.chain);
+  const wallet     = await selectWalletForChain(coinChain, cfg);
+
+  // Real mode: execute swap (stub for now)
+  let realTx = null;
+  if (tradingMode === 'real' && wallet) {
+    realTx = await executeRealEntry(coin, wallet, posSize);
+  } else if (tradingMode === 'real' && !wallet) {
+    console.warn(`[REAL] No wallet configured for chain "${coinChain}" — skipping ${coin.symbol}`);
+    return null; // can't enter a real trade without a wallet
+  }
+
   const pos = {
     symbol: coin.symbol, name: coin.name, address: coin.addr,
     chain: coin.chain, strategyId: s.id, strategyLabel: s.label,
@@ -318,18 +451,23 @@ async function enterPosition(coin, overrides = {}) {
     recoveredAmount: usePartial ? 0 : null,
     freeRide:        usePartial ? false : null,
     isManual:        overrides.isManual || false,
-    // Young coin mode: if Active Momentum coin is < 1h old, use quick 10/20/30% exits
-    // instead of chasing 50/100/200% — new coins pump fast then rug
+    // Young coin mode: quick 10/20/30% exits for Active Momentum coins < 1h old
     youngCoin: (s.id === 1 && (coin.ageMinutes || 0) < 60),
     status: 'open',
     enteredAt: Date.now(),
     dexUrl: coin.dexUrl,
     pnl: 0,
-    peakPrice: coin.price,  // track highest price seen — for rug detection
+    peakPrice: coin.price,
+    // ── Trade mode & wallet ──
+    tradingMode,
+    walletId:      wallet ? wallet.id      : null,
+    walletLabel:   wallet ? wallet.label   : null,
+    walletAddress: wallet ? wallet.address : null,
+    walletChain:   wallet ? wallet.chain   : null,
+    realTxEntry:   realTx ? realTx.txHash  : null,
   };
   await ref.set(pos);
   const newPos = { id: ref.id, ...pos };
-  // Add to cache immediately so next cycle sees it without a Firestore read
   if (_posCache) _posCache.push(newPos);
   return newPos;
 }
@@ -422,9 +560,11 @@ async function closePosition(id, data) {
 }
 
 async function getDailyStats() {
-  const today           = new Date().toISOString().slice(0,10);
-  const doc             = await db.collection('paper_stats').doc(today).get();
-  const expectedBalance = POSITION_SIZE * MAX_POSITIONS;
+  const today  = new Date().toISOString().slice(0, 10);
+  const doc    = await db.collection('paper_stats').doc(today).get();
+  // Use paperBalance from config if set; fall back to env-based default
+  const cfg    = await getTradingConfig();
+  const expectedBalance = parseFloat(cfg.paperBalance || 0) || (POSITION_SIZE * MAX_POSITIONS);
   if (!doc.exists) {
     const init = {
       date: today, startBalance: expectedBalance,
@@ -436,11 +576,11 @@ async function getDailyStats() {
     return init;
   }
   const data = doc.data();
-  // Auto-correct startBalance if MAX_POSITIONS or POSITION_SIZE changed
+  // Auto-correct startBalance if balance was topped up today
   if (data.startBalance !== expectedBalance) {
     await db.collection('paper_stats').doc(today).update({ startBalance: expectedBalance });
     data.startBalance = expectedBalance;
-    console.log(`[BOT] startBalance corrected: $${data.startBalance} → $${expectedBalance}`);
+    console.log(`[BOT] startBalance updated: $${data.startBalance} → $${expectedBalance}`);
   }
   return data;
 }
@@ -576,18 +716,98 @@ async function pollTelegramCommands() {
       }
 
       if (text === '/status') {
-        const stats  = await getDailyStats();
-        const pnlStr = stats.realizedPnL >= 0
+        const stats   = await getDailyStats();
+        const cfg     = await getTradingConfig();
+        const mode    = (cfg.tradingMode || 'paper').toUpperCase();
+        const pnlStr  = stats.realizedPnL >= 0
           ? `+$${stats.realizedPnL.toFixed(2)}`
           : `-$${Math.abs(stats.realizedPnL).toFixed(2)}`;
-        const pct    = ((stats.realizedPnL / stats.startBalance) * 100).toFixed(1);
-        const state  = dayHaltedToday ? '🚨 HALTED (daily limit)' : '✅ Running';
+        const pct     = ((stats.realizedPnL / stats.startBalance) * 100).toFixed(1);
+        const state   = dayHaltedToday ? '🚨 HALTED (daily limit)' : '✅ Running';
         await sendTelegram(
           `📊 *STATUS*\n\n` +
-          `${state}\n` +
+          `${state} · *${mode} mode*\n` +
           `Daily P&L: *${pnlStr}* (${pct}%)\n` +
+          `Balance: $${(cfg.paperBalance || POSITION_SIZE * MAX_POSITIONS).toFixed(2)}\n` +
           `Limit: ${(DAILY_LOSS_LIMIT * 100).toFixed(0)}%\n\n` +
-          `_/restart — reset day  · /status — this report_`
+          `_Commands: /mode paper|real · /wallets · /addfunds <$> · /restart_`
+        );
+      }
+
+      // ── /mode paper  or  /mode real ──────────────────────────────────────────
+      if (text.startsWith('/mode ')) {
+        const newMode = text.split(' ')[1]?.trim();
+        if (newMode === 'paper' || newMode === 'real') {
+          await db.collection('paper_config').doc('control').set(
+            { tradingMode: newMode }, { merge: true }
+          );
+          _tradingCfg = null; // bust cache
+          const emoji = newMode === 'real' ? '💰' : '📄';
+          await sendTelegram(
+            `${emoji} *Mode switched to ${newMode.toUpperCase()}*\n\n` +
+            (newMode === 'real'
+              ? `Real trades will execute on connected wallets.\nSend /wallets to review wallet setup.`
+              : `Paper (simulated) trading active. No real funds used.`)
+          );
+        } else {
+          await sendTelegram('Usage: `/mode paper` or `/mode real`');
+        }
+      }
+
+      // ── /wallets ─────────────────────────────────────────────────────────────
+      if (text === '/wallets') {
+        _walletsCache = null; // force fresh read
+        const wallets = await getWallets();
+        const cfg     = await getTradingConfig();
+        const mode    = cfg.tradingMode || 'paper';
+        if (!wallets.length) {
+          await sendTelegram(
+            `👛 *No wallets configured*\n\n` +
+            `Add wallets in the dashboard or Firestore:\n` +
+            `Collection: \`paper_config/wallets/slots\`\n` +
+            `Fields: label, address, chain (solana/ethereum/bsc/base), active, receiveProceeds, envKey (WALLET\\_1…5)\n\n` +
+            `Set private keys in Fly.io secrets:\n\`WALLET_1_PRIVATE_KEY\`, \`WALLET_2_PRIVATE_KEY\`, …`
+          );
+        } else {
+          const lines = wallets.map(w => {
+            const hasKey = !!process.env[`${w.envKey}_PRIVATE_KEY`];
+            const keyIcon = mode === 'real' ? (hasKey ? '🔑' : '⚠️ no key') : '';
+            const procIcon = w.receiveProceeds ? '💸' : '';
+            return `• *${w.label}* (${w.chain}) ${keyIcon}${procIcon}\n  \`${w.address.slice(0, 8)}…${w.address.slice(-4)}\``;
+          });
+          await sendTelegram(
+            `👛 *Wallets* — ${mode.toUpperCase()} mode\n\n` +
+            lines.join('\n') + '\n\n' +
+            `🔑 = key present · 💸 = receives proceeds\n` +
+            `⚠️ = missing Fly.io secret`
+          );
+        }
+      }
+
+      // ── /addfunds <amount> ────────────────────────────────────────────────────
+      if (text.startsWith('/addfunds')) {
+        const parts  = text.split(' ');
+        const amount = parseFloat(parts[1]);
+        if (!amount || amount <= 0) {
+          await sendTelegram('Usage: `/addfunds 500` — adds $500 to the trading balance');
+        } else {
+          await db.collection('paper_config').doc('control').set(
+            { addFunds: amount }, { merge: true }
+          );
+          await sendTelegram(`⏳ Adding $${amount.toFixed(2)} to balance — will apply within 30 seconds.`);
+        }
+      }
+
+      // ── /help ─────────────────────────────────────────────────────────────────
+      if (text === '/help') {
+        await sendTelegram(
+          `📋 *MemeScan Bot Commands*\n\n` +
+          `/status — P&L, mode, balance\n` +
+          `/mode paper — switch to paper trading\n` +
+          `/mode real — switch to real trading\n` +
+          `/wallets — list connected wallets\n` +
+          `/addfunds 500 — add $500 to balance\n` +
+          `/restart — reset daily loss counter\n`
         );
       }
     }
@@ -599,8 +819,10 @@ async function pollTelegramCommands() {
 async function monitorPositions() {
   if (!(await isBotRunning())) return;
 
-  // Check for day-restart request before anything else
+  // Check for day-restart and add-funds requests before anything else
   await checkDayRestart();
+  const cfg = await getTradingConfig();
+  await checkAddFunds(cfg);
 
   const positions = await getOpenPositions();
   if (!positions.length) return;
@@ -966,6 +1188,7 @@ async function scanForEntries() {
 
     alertCooldown.set(coin.addr, Date.now());
     const pos = await enterPosition(coin);
+    if (!pos) continue; // null = real mode with no matching wallet for this chain
     enteredToday.add(coin.addr);
     usedThisScan.add(coin.addr);
     positions.push(pos);
@@ -994,7 +1217,7 @@ async function scanForEntries() {
       `${pumpBadge}` +
       `💡 ${s.desc}\n\n` +
       `💵 Entry: $${fmtPrice(coin.price)}\n` +
-      `💰 Position: $${POSITION_SIZE} (paper)\n` +
+      `💰 Position: $${pos.size}${pos.tradingMode === 'real' ? ` 💰 REAL` : ` (paper)`}${pos.walletLabel ? ` · ${pos.walletLabel}` : ''}\n` +
       `📊 Buy%: ${coin.buyPct.toFixed(0)}% | Liq: $${(coin.liq/1000).toFixed(0)}k\n` +
       `📈 Age: ${ageLabel} | m5: ${coin.m5Ch>0?'+':''}${coin.m5Ch.toFixed(1)}% | h1: ${coin.ch1>0?'+':''}${coin.ch1.toFixed(1)}%\n\n` +
       tpInfo +
@@ -1030,6 +1253,13 @@ async function sendHourlySummary() {
 // ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 async function main() {
   console.log('[BOT] MemeScan PRO — 4-Strategy Bot starting...');
+  const startCfg  = await getTradingConfig();
+  const startMode = (startCfg.tradingMode || 'paper').toUpperCase();
+  const wallets   = await getWallets();
+  const walletLine = wallets.length
+    ? `👛 ${wallets.length} wallet(s): ${wallets.map(w => w.chain).join(', ')}`
+    : `👛 No wallets configured (/wallets to set up)`;
+
   await sendTelegram(
     `✅ *MemeScan PRO — 4-STRATEGY BOT LIVE*\n\n` +
     `📉 Bottom Bounce: 3 slots\n` +
@@ -1037,8 +1267,10 @@ async function main() {
     `🚀 Surge Catch: 2 slots\n` +
     `📈 Old Recovery: 2 slots\n\n` +
     `💰 $${POSITION_SIZE}/position · 🛑 Daily limit: 30%\n` +
+    `🎛 Mode: *${startMode}*\n` +
+    `${walletLine}\n` +
     `⏱ Scanning every 15 seconds\n\n` +
-    `_Commands: /restart — reset day · /status — P&L report_`
+    `_/help for all commands_`
   );
 
   let lastHourly = Date.now();
