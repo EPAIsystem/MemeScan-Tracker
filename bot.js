@@ -54,7 +54,7 @@ const STRATEGIES = [
     desc: 'Price ticking every 5-15 min — strong live activity',
     // ── Entry criteria ──
     minM5Txns: 15,       // busy last 5 min
-    minAbsM5Ch: 1.0,     // at least 1% price move in 5 min
+    minM5Ch: 1.0,        // at least +1% in last 5 min — MUST be going UP (was abs check)
     minCh1: 3,           // positive h1 trend
     minBuyPct: 55,
     minLiq: 8000,
@@ -147,11 +147,24 @@ function detectStrategy(pair, openStrategies) {
   if (sells24 === 0 && buys24 > 10) return null; // honeypot guard
 
   const ageMinutes = (now - created) / 60000;
+  const dexId      = pair.dexId || '';
+  const isPumpFun  = dexId === 'pump-fun';
+
+  // PUMP.FUN INFANT PROTECTION: coins < 20 min old are pre-pump / extreme rug risk
+  // Skip entirely — the initial hype dies in minutes and most go to 0
+  if (isPumpFun && ageMinutes < 20) return null;
+
+  // PUMP.FUN YOUNG COIN extra requirements (20–60 min): tighter liquidity + buy pressure
+  // Standard liq/buyPct minimums are too loose for coins this fresh
+  if (isPumpFun && ageMinutes < 60 && liq < 15000) return null;
+  if (isPumpFun && ageMinutes < 60 && buyPct < 62)  return null;
+
   const base = { addr, price, liq, vol24, buyPct, buys24, ch1, ch24, m5Ch, m5Txns, ageDays, ageMinutes, volMcap,
     symbol: pair.baseToken?.symbol || '???',
     name:   pair.baseToken?.name   || '',
     chain:  pair.chainId || 'unknown',
     dexUrl: `https://dexscreener.com/${pair.chainId}/${addr}`,
+    isPumpFun,
   };
 
   // Try each open strategy, return first match with highest confidence
@@ -183,12 +196,12 @@ function detectStrategy(pair, openStrategies) {
 
     else if (s.id === 1) {
       // ── ACTIVE MOMENTUM ────────────────────────────────────────────────────
-      if (m5Txns < s.minM5Txns)             { match = false; }
-      if (Math.abs(m5Ch) < s.minAbsM5Ch)    { match = false; }
-      if (ch1 < s.minCh1)                   { match = false; }
-      if (buyPct < s.minBuyPct)             { match = false; }
-      if (liq < s.minLiq)                   { match = false; }
-      if (ageDays > s.maxAgeDays)           { match = false; }
+      if (m5Txns < s.minM5Txns)  { match = false; }
+      if (m5Ch < s.minM5Ch)      { match = false; } // POSITIVE direction required (was abs)
+      if (ch1 < s.minCh1)        { match = false; }
+      if (buyPct < s.minBuyPct)  { match = false; }
+      if (liq < s.minLiq)        { match = false; }
+      if (ageDays > s.maxAgeDays){ match = false; }
       if (match) {
         score += Math.min(20, m5Txns / 2);         // very active = more confidence
         if (m5Ch > 5)  score += 15; else if (m5Ch > 2) score += 8;
@@ -253,6 +266,10 @@ function detectStrategy(pair, openStrategies) {
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const enteredToday  = new Set();
 const alertCooldown = new Map();
+// Block re-entry for 6h after SL or rug — prevents the triple-entry bug
+// (address → timestamp of SL/rug close)
+const recentSLCoins = new Map();
+const SL_BLOCK_MS   = 6 * 60 * 60 * 1000; // 6 hours
 let scanCount = 0;
 
 // ─── POSITION CACHE ───────────────────────────────────────────────────────────
@@ -538,7 +555,7 @@ async function monitorPositions() {
       const pnl = gain * pos.size * pos.remaining;
       await closePosition(pos.id, { exitPrice: price, exitReason: 'RUG_DETECTED', pnl });
       await updateDailyStats(pnl, pnl > 0, isManual);
-      enteredToday.delete(pos.address);
+      recentSLCoins.set(pos.address, Date.now()); // block re-entry for 6h
       const dropPct = ((price / currentPeak - 1) * 100).toFixed(0);
       await sendTelegram(
         `⚠️ *RUG DETECTED — EMERGENCY EXIT*\n\n` +
@@ -556,7 +573,7 @@ async function monitorPositions() {
       const pnl = gain * pos.size * pos.remaining;
       await closePosition(pos.id, { exitPrice: price, exitReason: 'STOP_LOSS', pnl });
       await updateDailyStats(pnl, false, isManual);
-      enteredToday.delete(pos.address);
+      recentSLCoins.set(pos.address, Date.now()); // block re-entry for 6h — prevents triple entries
       await sendTelegram(
         `🛑 *STOP LOSS HIT*\n\n` +
         `*${pos.symbol}* ${pos.strategyLabel}\n` +
@@ -782,13 +799,19 @@ async function scanForEntries() {
     }
   } catch(e) {}
 
+  // Clean up expired SL blocks (older than 6h)
+  const nowTs = Date.now();
+  for (const [addr, ts] of recentSLCoins) {
+    if (nowTs - ts > SL_BLOCK_MS) recentSLCoins.delete(addr);
+  }
+
   // Score and match each candidate to a strategy
   const openAddrs = new Set(positions.map(p => p.address));
   const matches   = [];
 
   for (const pair of candidates) {
     const addr = pair.baseToken?.address || '';
-    if (openAddrs.has(addr) || enteredToday.has(addr)) continue;
+    if (openAddrs.has(addr) || enteredToday.has(addr) || recentSLCoins.has(addr)) continue;
 
     const result = detectStrategy(pair, openStrategies);
     if (result && result.score >= scoreThreshold) {
@@ -831,10 +854,12 @@ async function scanForEntries() {
           `🎯 TP2: $${fmtPrice(coin.price * s.tp2x)} (+${((s.tp2x-1)*100).toFixed(0)}%) → 30%\n` +
           `🎯 TP3: $${fmtPrice(coin.price * s.tp3x)} (+${((s.tp3x-1)*100).toFixed(0)}%) → 20%\n`;
 
+    const pumpBadge = coin.isPumpFun ? `🎪 Pump.fun${isYoung?' · YOUNG COIN':''}\n` : '';
     await sendTelegram(
       `📊 *PAPER TRADE ENTRY*\n\n` +
       `*${coin.symbol}* — ${coin.name}\n` +
       `${s.label} · Score: *${coin.score}/100*\n` +
+      `${pumpBadge}` +
       `💡 ${s.desc}\n\n` +
       `💵 Entry: $${fmtPrice(coin.price)}\n` +
       `💰 Position: $${POSITION_SIZE} (paper)\n` +
