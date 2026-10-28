@@ -12,6 +12,36 @@ const DAILY_LOSS_LIMIT= -0.30;
 const SCAN_INTERVAL   = 15000;  // 15s — entry scanner
 const PRICE_CHECK     =  5000;  //  5s — position monitor
 
+// ─── SURGE MOMENTUM MODE ──────────────────────────────────────────────────────
+// Fast-surging coins skip TP1/TP2, ride to 80%+ then full-exit.
+// After exit: 80% of profit split as moon bag (50%) + normal TP position (50%).
+const SURGE_M5_ENTRY_TRIGGER = 10;           // m5% ≥ 10 at scan → surge flag at entry
+const SURGE_AUTO_GAIN_TRIGGER = 0.40;        // auto-switch if +40% in first 20 min
+const SURGE_AUTO_TIME_LIMIT   = 20 * 60 * 1000;
+const SURGE_EXIT_AT           = 0.80;        // 80% gain → full exit & reinvest
+const SURGE_REINVEST_RATIO    = 0.80;        // reinvest 80% of total profit
+const SURGE_MOON_BAG_RATIO    = 0.50;        // 50% of reinvest = moon bag
+const MOON_BAG_INITIAL_SL     = 0.25;        // moon bag starts at 25% SL
+const MOON_BAG_SL_FLOOR       = 0.05;        // 5% floor — never tighter
+// [minGainFromMoonBagEntry, slLevel] — checked largest-gain first
+const MOON_BAG_SL_SCHEDULE = [
+  [2.50, 0.05],  // +250%+ from moon entry → 5% SL
+  [1.50, 0.10],  // +150%+                 → 10% SL
+  [1.00, 0.15],  // +100%+                 → 15% SL
+  [0.50, 0.20],  //  +50%+                 → 20% SL
+  [0.00, 0.25],  //    0%+                 → 25% SL (initial)
+];
+
+// ─── GOPLUS LP LOCK CHECK ─────────────────────────────────────────────────────
+// DexScreener chain ID → GoPlus numeric / named chain ID
+const GOPLUS_CHAIN_MAP = {
+  solana: 'solana', ethereum: '1', eth: '1',
+  bsc: '56', base: '8453', polygon: '137',
+  arbitrum: '42161', avalanche: '43114', optimism: '10',
+};
+const lpLockCache = new Map();   // addr → { locked: bool, ts: number }
+const LP_LOCK_TTL = 30 * 60 * 1000; // 30-min cache — GoPlus data changes rarely
+
 // ─── FIREBASE INIT ────────────────────────────────────────────────────────────
 let db;
 try {
@@ -111,6 +141,15 @@ const STRATEGIES = [
 function calcTrailPct(initialTrailPct, gainPct) {
   // Tighten twice as fast for big gains (÷7 instead of ÷10)
   return Math.max(5, initialTrailPct - (gainPct / 7));
+}
+
+// Moon bag SL: returns the current SL fraction (e.g. 0.20 = 20%) based on
+// how much the moon bag position has gained since its own entry price.
+function getMoonBagSL(gainFromEntry) {
+  for (const [minGain, sl] of MOON_BAG_SL_SCHEDULE) {
+    if (gainFromEntry >= minGain) return sl;
+  }
+  return MOON_BAG_INITIAL_SL;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -429,6 +468,8 @@ async function enterPosition(coin, overrides = {}) {
   const s    = coin.strategy;
   const usePartial = !!s.usePartialProfit;
   const posSize    = overrides.size || POSITION_SIZE;
+  // Surge momentum: flag if m5 is ripping fast at entry (not applicable to moon bags)
+  const isSurge = !overrides.isMoonBag && (coin.m5Ch || 0) >= SURGE_M5_ENTRY_TRIGGER;
 
   // ── Trading mode & wallet ──────────────────────────────────────────────────
   const cfg        = await getTradingConfig();
@@ -467,6 +508,11 @@ async function enterPosition(coin, overrides = {}) {
     isManual:        overrides.isManual || false,
     // Young coin mode: quick 10/20/30% exits for Active Momentum coins < 1h old
     youngCoin: (s.id === 1 && (coin.ageMinutes || 0) < 60),
+    // Surge momentum: skip TP1/TP2, ride to 80%+ then full-exit & reinvest
+    surgeMomentum: isSurge,
+    // Moon bag: funded from surge reinvestment — uses graduated SL, no TP exits
+    isMoonBag: overrides.isMoonBag || false,
+    isReinvest: overrides.isReinvest || false,
     status: 'open',
     enteredAt: Date.now(),
     dexUrl: coin.dexUrl,
@@ -830,6 +876,153 @@ async function pollTelegramCommands() {
   }
 }
 
+// ─── SURGE REINVESTMENT ──────────────────────────────────────────────────────
+// Called after a surge exit. Opens two new positions from 80% of the profit:
+//   • Moon bag  (50%): tpDisabled, graduated SL 25% → 5% floor
+//   • Normal    (50%): standard TP1/TP2/TP3 for the original strategy
+async function openSurgeReinvest(pos, exitPrice, totalPnL) {
+  if (totalPnL <= 0) return;
+
+  // Check slots
+  const openPositions = await getOpenPositions();
+  const slotsLeft = MAX_POSITIONS - openPositions.length;
+  if (slotsLeft < 1) {
+    await sendTelegram(`⚠️ *SURGE REINVEST SKIPPED — ${pos.symbol}*\nNo open slots (${openPositions.length}/${MAX_POSITIONS})`);
+    return;
+  }
+
+  const reinvestAmt = totalPnL * SURGE_REINVEST_RATIO;
+  const moonBagAmt  = reinvestAmt * SURGE_MOON_BAG_RATIO;
+  const normalAmt   = reinvestAmt - moonBagAmt;
+  const s           = STRATEGIES.find(st => st.id === pos.strategyId) || STRATEGIES[1];
+
+  const baseDoc = {
+    symbol: pos.symbol, name: pos.name, address: pos.address,
+    chain: pos.chain, dexUrl: pos.dexUrl,
+    strategyId: pos.strategyId, strategyLabel: pos.strategyLabel,
+    entryPrice: exitPrice, peakPrice: exitPrice,
+    currentSL: exitPrice * (1 - MOON_BAG_INITIAL_SL),
+    sl:         exitPrice * (1 - MOON_BAG_INITIAL_SL),
+    initialTrailPct: MOON_BAG_INITIAL_SL * 100,
+    trailingActive: false, remaining: 1.0,
+    tp1Hit: false, tp2Hit: false,
+    partialStage: 0, recoveredAmount: 0, freeRide: false,
+    youngCoin: false, surgeMomentum: false,
+    status: 'open', enteredAt: Date.now(), pnl: 0,
+    tradingMode: pos.tradingMode || 'paper',
+    walletId: pos.walletId || null, walletLabel: pos.walletLabel || null,
+    walletAddress: pos.walletAddress || null, walletChain: pos.walletChain || null,
+    score: pos.score || 80, isManual: false, isReinvest: true,
+  };
+
+  // ── Moon bag ─────────────────────────────────────────────────────────────
+  const mbRef = db.collection('paper_positions').doc();
+  const moonBagDoc = {
+    ...baseDoc, size: moonBagAmt,
+    tp1: exitPrice * 1.30, tp2: exitPrice * 1.80, tp3: exitPrice * 3.00,
+    tpDisabled: true,  // no TP exits — rides on graduated SL only
+    isMoonBag: true, parentPositionId: pos.id,
+  };
+  await mbRef.set(moonBagDoc);
+
+  // ── Normal TP position ────────────────────────────────────────────────────
+  let normalRef = null;
+  if (slotsLeft >= 2) {
+    normalRef = db.collection('paper_positions').doc();
+    const normalDoc = {
+      ...baseDoc, size: normalAmt,
+      tp1: exitPrice * s.tp1x, tp2: exitPrice * s.tp2x, tp3: exitPrice * s.tp3x,
+      sl: exitPrice * s.slx, currentSL: exitPrice * s.slx,
+      initialTrailPct: s.initialTrailPct,
+      tpDisabled: false, isMoonBag: false,
+    };
+    await normalRef.set(normalDoc);
+  }
+
+  // Invalidate cache so next monitor cycle picks up the new positions
+  _posCacheAt = 0;
+
+  const tpLine = slotsLeft >= 2
+    ? `📈 *Normal $${normalAmt.toFixed(2)}*: TP1 +${((s.tp1x-1)*100).toFixed(0)}% → TP2 +${((s.tp2x-1)*100).toFixed(0)}% → TP3 +${((s.tp3x-1)*100).toFixed(0)}%`
+    : `⚠️ Only 1 slot open — moon bag only`;
+
+  await sendTelegram(
+    `♻️ *SURGE REINVEST — ${pos.symbol}*\n\n` +
+    `💰 Total profit: +$${totalPnL.toFixed(2)} | Reinvesting 80% = $${reinvestAmt.toFixed(2)}\n\n` +
+    `🌕 *Moon Bag $${moonBagAmt.toFixed(2)}*:\n` +
+    `   SL: 25% → 20% (+50%) → 15% (+100%) → 10% (+150%) → 5% (+250%)\n` +
+    `   Pure ride — no TP exits, just gradual SL floor\n\n` +
+    `${tpLine}\n\n🔗 [Chart](${pos.dexUrl})`
+  );
+  console.log(`[SURGE REINVEST] ${pos.symbol}: MoonBag $${moonBagAmt.toFixed(2)} + Normal $${slotsLeft>=2?normalAmt.toFixed(2):'SKIPPED (no slot)'}`);
+}
+
+// ─── LP LOCK FILTER (GoPlus batch check) ─────────────────────────────────────
+// Filters a list of strategy matches, returning only those with confirmed
+// locked or burned LP. Pump.fun bonding-curve tokens are exempt (their curve
+// IS the lock). Results cached 30 min to minimise API calls.
+async function filterByLpLock(matches) {
+  const locked  = new Set();
+  const toCheck = [];
+
+  for (const coin of matches) {
+    // Pump.fun bonding-curve: liquidity lives in the curve contract (no LP to lock)
+    if (coin.isPumpFun) { locked.add(coin.addr); continue; }
+
+    const cached = lpLockCache.get(coin.addr);
+    if (cached && Date.now() - cached.ts < LP_LOCK_TTL) {
+      if (cached.locked) locked.add(coin.addr);
+      continue;
+    }
+    toCheck.push(coin);
+  }
+
+  if (!toCheck.length) return matches.filter(c => locked.has(c.addr));
+
+  // Group by chain for batched API calls
+  const byChain = {};
+  for (const coin of toCheck) {
+    const chain = (coin.chain || '').toLowerCase();
+    if (!byChain[chain]) byChain[chain] = [];
+    byChain[chain].push(coin);
+  }
+
+  for (const [chain, coins] of Object.entries(byChain)) {
+    const goplusChain = GOPLUS_CHAIN_MAP[chain] || null;
+    if (!goplusChain) {
+      // Unknown chain → skip conservatively
+      for (const c of coins) lpLockCache.set(c.addr, { locked: false, ts: Date.now() });
+      continue;
+    }
+
+    // GoPlus accepts comma-separated addresses per chain
+    const addrs = coins.map(c => c.addr).join(',');
+    try {
+      const r = await httpGet('api.gopluslabs.io', `/api/v1/token_security/${goplusChain}?contract_addresses=${addrs}`);
+      if (r.status !== 200) continue;
+      const d      = JSON.parse(r.body);
+      const result = d?.result || {};
+
+      for (const coin of coins) {
+        // GoPlus keys EVM addresses in lowercase; Solana keeps exact case
+        const info     = result[coin.addr.toLowerCase()] || result[coin.addr] || null;
+        const isLocked = info?.lp_locked === '1' || info?.lp_burned === '1';
+        lpLockCache.set(coin.addr, { locked: isLocked, ts: Date.now() });
+        if (isLocked) {
+          locked.add(coin.addr);
+        } else {
+          console.log(`[LP LOCK] ❌ ${coin.symbol} (${coin.addr.slice(0,8)}…) — LP not locked, skipped`);
+        }
+      }
+    } catch(e) {
+      console.warn(`[LP LOCK] Batch check failed for chain ${chain}: ${e.message}`);
+    }
+    await sleep(200); // brief pause between chain batches
+  }
+
+  return matches.filter(c => locked.has(c.addr));
+}
+
 async function monitorPositions() {
   if (!(await isBotRunning())) return;
 
@@ -914,6 +1107,37 @@ async function monitorPositions() {
     }
     const currentPeak = pos.peakPrice || peak;
 
+    // ── SURGE MOMENTUM — AUTO-DETECT & EXIT ───────────────────────────────────
+    // Auto-switch to surge mode if coin rips +40%+ within first 20 minutes.
+    if (!pos.surgeMomentum && !pos.isMoonBag) {
+      const elapsed = Date.now() - pos.enteredAt;
+      if (gain >= SURGE_AUTO_GAIN_TRIGGER && elapsed < SURGE_AUTO_TIME_LIMIT) {
+        await updatePosition(pos.id, { surgeMomentum: true });
+        pos.surgeMomentum = true;
+        await sendTelegram(
+          `🚀 *SURGE MODE AUTO-SWITCH*\n*${pos.symbol}* +${gainPct.toFixed(1)}% in ${Math.round(elapsed/60000)}min\n` +
+          `Skipping TP1/TP2 — riding to 80%+ full exit\n🔗 [Chart](${pos.dexUrl})`
+        );
+      }
+    }
+    // Surge exit: full position at 80%+ gain, then reinvest 80% of profit
+    if (pos.surgeMomentum && !pos.isMoonBag && gain >= SURGE_EXIT_AT) {
+      const exitPnl = gain * pos.size * pos.remaining;
+      const pnl     = (pos.pnl || 0) + exitPnl;
+      await closePosition(pos.id, { exitPrice: price, exitReason: 'SURGE_EXIT', pnl });
+      await updateDailyStats(exitPnl, true, isManual);
+      enteredToday.delete(pos.address);
+      await sendTelegram(
+        `🚀 *SURGE EXIT — FULL POSITION*\n\n` +
+        `*${pos.symbol}* ${pos.strategyLabel}\n` +
+        `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(price)}\n` +
+        `📊 P&L: *+$${pnl.toFixed(2)}* (+${gainPct.toFixed(1)}%)\n` +
+        `♻️ Reinvesting 80% of profit…\n🔗 [Chart](${pos.dexUrl})`
+      );
+      await openSurgeReinvest(pos, price, pnl);
+      continue;
+    }
+
     // ── RUG DETECTION — EMERGENCY EXIT ────────────────────────────────────
     // If price crashes >40% from peak in a single 5s tick AND we were profitable,
     // exit immediately before it goes to near-zero
@@ -964,7 +1188,7 @@ async function monitorPositions() {
     // 📈 NORMAL (≥ 1h old): standard stages — 50 / 100 / 200% gains
     //    Sell 25% / 30% / 15%, let the rest ride
     // ══════════════════════════════════════════════════════════════════════
-    if (!pos.tpDisabled && pos.partialStage !== null) {
+    if (!pos.tpDisabled && pos.partialStage !== null && !(pos.surgeMomentum && !pos.isMoonBag)) {
       const stage  = pos.partialStage || 0;
       const target = pos.size * 1.2; // recover 120% of investment
 
@@ -1098,8 +1322,24 @@ async function monitorPositions() {
     // Tightens as price rises, floors at 5%
     // ══════════════════════════════════════════════════════════════════════
     if (gainPct > 0) {
-      const trailPct  = calcTrailPct(pos.initialTrailPct, gainPct);
-      const newSL     = price * (1 - trailPct / 100);
+      let newSL;
+      if (pos.isMoonBag) {
+        // Moon bag: graduated SL schedule (25 → 20 → 15 → 10 → 5% floor)
+        const targetPct = getMoonBagSL(gain);
+        newSL = price * (1 - targetPct);
+        // Notify when the SL tier actually drops (not every tick)
+        const prevGain  = ((pos.peakPrice || pos.entryPrice) - pos.entryPrice) / pos.entryPrice;
+        const prevPct   = getMoonBagSL(prevGain);
+        if (targetPct < prevPct && newSL > (updates.currentSL ?? pos.currentSL) * 1.005) {
+          await sendTelegram(
+            `🌕 *MOON BAG SL TIGHTENED — ${pos.symbol}*\n` +
+            `+${gainPct.toFixed(1)}% from entry\n` +
+            `SL: ${(prevPct*100).toFixed(0)}% → *${(targetPct*100).toFixed(0)}%*\n🔗 [Chart](${pos.dexUrl})`
+          );
+        }
+      } else {
+        newSL = price * (1 - calcTrailPct(pos.initialTrailPct, gainPct) / 100);
+      }
       const currentSL = updates.currentSL ?? pos.currentSL;
       // Only write if SL moved ≥ 0.5% — prevents thousands of tiny writes per day
       if (newSL > currentSL * 1.005) {
@@ -1192,11 +1432,15 @@ async function scanForEntries() {
     }
   }
 
-  // Sort by score, enter top matches (one per unique address)
+  // Sort by score, then filter by LP lock (batch GoPlus check per chain)
   matches.sort((a,b) => b.score - a.score);
+  const lockedMatches = await filterByLpLock(matches);
+  if (lockedMatches.length < matches.length) {
+    console.log(`[LP LOCK] ${matches.length - lockedMatches.length}/${matches.length} matches skipped — LP not locked`);
+  }
   const usedThisScan = new Set();
 
-  for (const coin of matches) {
+  for (const coin of lockedMatches) {
     if (positions.length >= MAX_POSITIONS) break;
     if (usedThisScan.has(coin.addr)) continue;
     // Check cooldown
