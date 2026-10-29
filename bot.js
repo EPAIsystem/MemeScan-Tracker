@@ -51,7 +51,13 @@ const PRICE_HIST_REBOUND_PCT = 0.05; // 5% recovery from dip = rebound confirmed
 // ─── FIREBASE INIT ────────────────────────────────────────────────────────────
 let db;
 try {
-  const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!raw) throw new Error('FIREBASE_SERVICE_ACCOUNT env var is missing');
+  console.log('[BOT] Parsing service account, length:', raw.length);
+  // Fix common issue: private_key newlines double-escaped when pasted via web UI
+  const fixed = raw.replace(/\\\\n/g, '\\n');
+  const sa = JSON.parse(fixed);
+  console.log('[BOT] Service account project:', sa.project_id);
   initializeApp({ credential: cert(sa) });
   db = getFirestore();
   console.log('[BOT] Firebase connected');
