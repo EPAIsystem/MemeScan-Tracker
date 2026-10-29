@@ -359,6 +359,21 @@ tbody tr:hover td { background: var(--bg3); }
 .empty-state .ei { font-size: 30px; margin-bottom: 10px; }
 .empty-state p   { font-size: 13px; margin: 0; }
 
+/* ── Daily P&L list ──────────────────────────────────────────────────────────── */
+.daily-list {
+  border: 1px solid var(--border); border-radius: 11px;
+  overflow: hidden; margin-bottom: 28px;
+}
+.daily-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.daily-row:last-child { border-bottom: none; }
+.daily-date   { font-weight: 600; min-width: 90px; color: var(--fg1); }
+.daily-trades { flex: 1; color: var(--fg3); font-size: 11px; font-family: var(--mono); }
+.daily-pnl    { font-family: var(--mono); font-weight: 600; font-size: 14px; text-align: right; min-width: 80px; }
+
 .loader { text-align: center; padding: 40px; color: var(--fg3); font-size: 13px; }
 .spin {
   display: inline-block; width: 16px; height: 16px;
@@ -395,6 +410,7 @@ const S = {
   manualQueue: [],    // items in paper_manual_queue
   manualAdding: false,
   closingPos: {},     // { [posId]: 'confirm' | 'closing' }
+  dailyHistory: [],   // [{date, realizedPnL, trades, wins, losses}, ...]
 };
 
 // ── Config store ──────────────────────────────────────────────────────────────
@@ -519,6 +535,19 @@ async function loadData() {
     S.positions = positions;
     S.history = history.slice(0, 15);
     S.stats = statsDoc;
+
+    // Load last 30 days of daily P&L history
+    const dailyFetches = [];
+    for (let i = 0; i < 30; i++) {
+      const d = new Date(); d.setDate(d.getDate() - i);
+      const dateStr = d.toISOString().slice(0, 10);
+      dailyFetches.push(
+        fsGet(S.config, 'paper_stats', dateStr)
+          .then(doc => doc && (doc.trades > 0) ? { ...doc, date: dateStr } : null)
+          .catch(() => null)
+      );
+    }
+    S.dailyHistory = (await Promise.all(dailyFetches)).filter(Boolean);
     S.botRunning = ctrlDoc ? (ctrlDoc.running !== false) : true;
     S.manualQueue = manualQueue.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0)).slice(0, 20);
     // Live prices
@@ -578,6 +607,33 @@ function trackFill(pos) {
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
+function dailyPnlHTML() {
+  const rows = S.dailyHistory || [];
+  if (!rows.length) {
+    return `<div class="empty-state" style="margin-bottom:0"><div class="ei">📅</div><p>No daily records yet</p></div>`;
+  }
+  const items = rows.map(day => {
+    const pnl     = day.realizedPnL || 0;
+    const trades  = day.trades  || 0;
+    const wins    = day.wins    || 0;
+    const losses  = day.losses  || 0;
+    const wr      = trades > 0 ? Math.round(wins / trades * 100) : null;
+    const isToday = day.date === new Date().toISOString().slice(0, 10);
+    const label   = isToday ? 'Today' : fmtDayLabel(day.date);
+    return `<div class="daily-row">
+      <div class="daily-date">${label}</div>
+      <div class="daily-trades">${trades} trade${trades !== 1 ? 's' : ''} · ${wins}W/${losses}L${wr != null ? ' · ' + wr + '%' : ''}</div>
+      <div class="daily-pnl ${pnl >= 0 ? 'c-green' : 'c-red'}">${fmtPnl(pnl)}</div>
+    </div>`;
+  }).join('');
+  return `<div class="daily-list">${items}</div>`;
+}
+
+function fmtDayLabel(dateStr) {
+  const d = new Date(dateStr + 'T12:00:00Z');
+  return d.toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: 'short' });
+}
+
 function render() {
   const root = document.getElementById('root');
 
@@ -708,6 +764,12 @@ function render() {
         <span class="section-meta">${S.history.length} closed</span>
       </div>
       ${histHTML}
+
+      <div class="section-head" style="margin-top:24px">
+        <span class="section-label">Daily P&amp;L</span>
+        <span class="section-meta">${S.dailyHistory ? S.dailyHistory.length + ' days' : '—'}</span>
+      </div>
+      ${dailyPnlHTML()}
     </div>`;
 }
 

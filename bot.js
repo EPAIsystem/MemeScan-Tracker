@@ -42,6 +42,12 @@ const GOPLUS_CHAIN_MAP = {
 const lpLockCache = new Map();   // addr → { locked: bool, ts: number }
 const LP_LOCK_TTL = 30 * 60 * 1000; // 30-min cache — GoPlus data changes rarely
 
+// ─── PRICE HISTORY TRACKER ────────────────────────────────────────────────────
+const priceHistory = new Map(); // addr → [{price, score, ts}, ...]
+const PRICE_HIST_MAX    = 20;   // keep last 20 scan snapshots per coin
+const PRICE_HIST_TREND  = 3;    // consecutive rising points = confirmed uptrend
+const PRICE_HIST_REBOUND_PCT = 0.05; // 5% recovery from dip = rebound confirmed
+
 // ─── FIREBASE INIT ────────────────────────────────────────────────────────────
 let db;
 try {
@@ -662,7 +668,7 @@ async function updateDailyStats(pnl, isWin, isManual = false) {
     base.autoTrades = FieldValue.increment(1);
     base.autoWins   = FieldValue.increment(isWin ? 1 : 0);
   }
-  await db.collection('paper_stats').doc(today).update(base);
+  await db.collection('paper_stats').doc(today).set(base, { merge: true });
 }
 
 // ─── PRICE FETCHER ────────────────────────────────────────────────────────────
@@ -955,6 +961,51 @@ async function openSurgeReinvest(pos, exitPrice, totalPnL) {
     `${tpLine}\n\n🔗 [Chart](${pos.dexUrl})`
   );
   console.log(`[SURGE REINVEST] ${pos.symbol}: MoonBag $${moonBagAmt.toFixed(2)} + Normal $${slotsLeft>=2?normalAmt.toFixed(2):'SKIPPED (no slot)'}`);
+}
+
+// ─── PRICE HISTORY HELPERS ────────────────────────────────────────────────────
+function recordPriceHistory(addr, price, score) {
+  if (!price || price <= 0) return;
+  const hist = priceHistory.get(addr) || [];
+  hist.push({ price, score, ts: Date.now() });
+  if (hist.length > PRICE_HIST_MAX) hist.shift();
+  priceHistory.set(addr, hist);
+}
+
+// True = last N prices consistently rising (momentum confirmed)
+// False = declining, null = not enough data yet
+function isTrendingUp(addr, points = PRICE_HIST_TREND) {
+  const hist = priceHistory.get(addr);
+  if (!hist || hist.length < points) return null;
+  const tail = hist.slice(-points);
+  for (let i = 1; i < tail.length; i++) {
+    if (tail[i].price < tail[i-1].price * 0.998) return false; // allow 0.2% noise
+  }
+  return true;
+}
+
+// True = coin dipped then recovered >= 5% from local minimum
+// False = still at/near minimum, null = not enough data
+function isRebounding(addr) {
+  const hist = priceHistory.get(addr);
+  if (!hist || hist.length < PRICE_HIST_TREND) return null;
+  const prices = hist.map(h => h.price);
+  const minPrice = Math.min(...prices);
+  const minIdx   = prices.lastIndexOf(minPrice);
+  const curPrice = prices[prices.length - 1];
+  if (minIdx === prices.length - 1) return false; // still at the bottom
+  const recovery = (curPrice - minPrice) / minPrice;
+  return recovery >= PRICE_HIST_REBOUND_PCT;
+}
+
+// Returns a quality label for logging
+function priceQualityLabel(addr) {
+  const trending   = isTrendingUp(addr);
+  const rebounding = isRebounding(addr);
+  if (trending === true)   return '📈 TREND';
+  if (rebounding === true) return '🔄 REBOUND';
+  if (trending === null)   return '🆕 NEW';
+  return '📉 FLAT';
 }
 
 // ─── LP LOCK FILTER (GoPlus batch check) ─────────────────────────────────────
@@ -1428,19 +1479,47 @@ async function scanForEntries() {
 
     const result = detectStrategy(pair, openStrategies);
     if (result && result.score >= scoreThreshold) {
+      // Record price snapshot for trend/rebound tracking
+      const price = parseFloat(pair.priceUsd || 0);
+      recordPriceHistory(result.addr, price, result.score);
       matches.push(result);
     }
   }
 
-  // Sort by score, then filter by LP lock (batch GoPlus check per chain)
-  matches.sort((a,b) => b.score - a.score);
+  // Sort: trending/rebounding coins first, then by score
+  matches.sort((a, b) => {
+    const qa = isTrendingUp(a.addr) === true || isRebounding(a.addr) === true ? 1 : 0;
+    const qb = isTrendingUp(b.addr) === true || isRebounding(b.addr) === true ? 1 : 0;
+    if (qb !== qa) return qb - qa; // quality coins first
+    return b.score - a.score;      // then by score
+  });
+
+  // Filter by LP lock (batch GoPlus check per chain)
   const lockedMatches = await filterByLpLock(matches);
   if (lockedMatches.length < matches.length) {
     console.log(`[LP LOCK] ${matches.length - lockedMatches.length}/${matches.length} matches skipped — LP not locked`);
   }
+
+  // Apply price quality gate: skip coins with enough history that show no trend/rebound
+  // High-confidence signals (score ≥ 80) always pass regardless of trend
+  const qualityMatches = lockedMatches.filter(coin => {
+    if (coin.score >= 80) return true; // always trust high scores
+    const hist     = priceHistory.get(coin.addr);
+    const hasEnough = hist && hist.length >= PRICE_HIST_TREND;
+    if (!hasEnough) return true; // new coin — allow, not enough data yet
+    const trending   = isTrendingUp(coin.addr);
+    const rebounding = isRebounding(coin.addr);
+    if (trending === false && rebounding === false) {
+      console.log(`[QUALITY] ❌ ${coin.symbol} — ${priceQualityLabel(coin.addr)}, no momentum, skipped`);
+      return false;
+    }
+    console.log(`[QUALITY] ✅ ${coin.symbol} — ${priceQualityLabel(coin.addr)}`);
+    return true;
+  });
+
   const usedThisScan = new Set();
 
-  for (const coin of lockedMatches) {
+  for (const coin of qualityMatches) {
     if (positions.length >= MAX_POSITIONS) break;
     if (usedThisScan.has(coin.addr)) continue;
     // Check cooldown
