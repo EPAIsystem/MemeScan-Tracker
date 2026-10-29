@@ -1060,7 +1060,12 @@ async function filterByLpLock(matches) {
     const addrs = coins.map(c => c.addr).join(',');
     try {
       const r = await httpGet('api.gopluslabs.io', `/api/v1/token_security/${goplusChain}?contract_addresses=${addrs}`);
-      if (r.status !== 200) continue;
+      if (r.status !== 200) {
+        // GoPlus unavailable — fail open so the bot can still trade
+        console.warn(`[LP LOCK] GoPlus returned ${r.status} for chain ${chain} — failing open (${coins.length} coins allowed through)`);
+        for (const c of coins) locked.add(c.addr);
+        continue;
+      }
       const d      = JSON.parse(r.body);
       const result = d?.result || {};
 
@@ -1076,7 +1081,9 @@ async function filterByLpLock(matches) {
         }
       }
     } catch(e) {
-      console.warn(`[LP LOCK] Batch check failed for chain ${chain}: ${e.message}`);
+      // GoPlus network error — fail open so the bot can still trade
+      console.warn(`[LP LOCK] GoPlus error for chain ${chain}: ${e.message} — failing open (${coins.length} coins allowed through)`);
+      for (const c of coins) locked.add(c.addr);
     }
     await sleep(200); // brief pause between chain batches
   }
@@ -1153,6 +1160,14 @@ async function monitorPositions() {
 
     const price = await getCurrentPrice(pos.address, pos.chain);
     if (!price || price <= 0) continue;
+
+    // Store currentPrice in Firestore so dashboard doesn't depend on browser-side DexScreener fetch.
+    // Only write when price moved ≥ 0.5% to limit Firestore writes.
+    const lastStored = pos.currentPrice || 0;
+    if (!lastStored || Math.abs(price - lastStored) / lastStored > 0.005) {
+      pos.currentPrice = price; // patch cache immediately
+      await updatePosition(pos.id, { currentPrice: price, priceUpdatedAt: Date.now() });
+    }
 
     const gain    = (price - pos.entryPrice) / pos.entryPrice; // e.g. 0.50 = +50%
     const gainPct = gain * 100;
@@ -1505,9 +1520,12 @@ async function scanForEntries() {
   });
 
   // Filter by LP lock (batch GoPlus check per chain)
+  if (matches.length > 0) console.log(`[SCAN] ${candidates.length} candidates → ${matches.length} scored matches`);
   const lockedMatches = await filterByLpLock(matches);
-  if (lockedMatches.length < matches.length) {
-    console.log(`[LP LOCK] ${matches.length - lockedMatches.length}/${matches.length} matches skipped — LP not locked`);
+  if (matches.length > 0) {
+    const dropped = matches.length - lockedMatches.length;
+    if (dropped > 0) console.log(`[LP LOCK] ${dropped}/${matches.length} matches skipped — LP not locked`);
+    else console.log(`[LP LOCK] All ${lockedMatches.length} matches passed LP check`);
   }
 
   // Apply price quality gate: only block coins in confirmed active decline

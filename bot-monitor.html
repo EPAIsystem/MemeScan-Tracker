@@ -550,7 +550,12 @@ async function loadData() {
     S.dailyHistory = (await Promise.all(dailyFetches)).filter(Boolean);
     S.botRunning = ctrlDoc ? (ctrlDoc.running !== false) : true;
     S.manualQueue = manualQueue.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0)).slice(0, 20);
-    // Live prices
+    // Seed prices from Firestore-stored currentPrice (written by bot each monitor tick).
+    // This works even when the browser can't reach DexScreener directly.
+    for (const pos of positions) {
+      if (pos.currentPrice && pos.currentPrice > 0) S.prices[pos.address] = pos.currentPrice;
+    }
+    // Then try to refresh via live DexScreener fetch (best-effort; may fail due to rate limits)
     const addrs = [...new Set(positions.map(p => p.address).filter(Boolean))];
     await Promise.all(addrs.map(async a => { const p = await fetchPrice(a); if (p) S.prices[a] = p; }));
     S.lastUpdated = new Date();
