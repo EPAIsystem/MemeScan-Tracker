@@ -50,22 +50,27 @@ const PRICE_HIST_REBOUND_PCT = 0.05; // 5% recovery from dip = rebound confirmed
 
 // ─── FIREBASE INIT ────────────────────────────────────────────────────────────
 let db;
+let firebaseError = null;
 try {
   const projectId   = process.env.FIREBASE_PROJECT_ID;
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  const privateKey  = (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+  const rawKey      = process.env.FIREBASE_PRIVATE_KEY || '';
+  // Handle both literal \n (pasted from JSON) and actual newlines
+  const privateKey  = rawKey.replace(/\\n/g, '\n');
 
-  if (!projectId)   throw new Error('FIREBASE_PROJECT_ID env var is missing');
-  if (!clientEmail) throw new Error('FIREBASE_CLIENT_EMAIL env var is missing');
-  if (!privateKey)  throw new Error('FIREBASE_PRIVATE_KEY env var is missing');
+  if (!projectId)   throw new Error('FIREBASE_PROJECT_ID missing');
+  if (!clientEmail) throw new Error('FIREBASE_CLIENT_EMAIL missing');
+  if (!rawKey)      throw new Error('FIREBASE_PRIVATE_KEY missing');
+  if (!privateKey.includes('BEGIN')) throw new Error('FIREBASE_PRIVATE_KEY looks wrong — does not contain BEGIN. Raw length: ' + rawKey.length + ', first 30 chars: ' + rawKey.slice(0,30));
 
-  console.log('[BOT] Firebase init — project:', projectId, 'email:', clientEmail.slice(0,20)+'...');
+  console.log('[BOT] Firebase init — project:', projectId);
   initializeApp({ credential: cert({ projectId, clientEmail, privateKey }) });
   db = getFirestore();
-  console.log('[BOT] Firebase connected');
+  console.log('[BOT] Firebase connected ✓');
 } catch(e) {
-  console.error('[BOT] Firebase init failed:', e.message);
-  process.exit(1);
+  firebaseError = e.message;
+  console.error('[BOT] Firebase init failed:', firebaseError);
+  // Do NOT exit — bot stays alive, will report error via Telegram in main()
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1628,6 +1633,16 @@ async function sendHourlySummary() {
 // ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 async function main() {
   console.log('[BOT] MemeScan PRO — 4-Strategy Bot starting...');
+
+  // Report Firebase failure to Telegram so we can diagnose without needing logs
+  if (firebaseError) {
+    await sendTelegram(`🔴 *BOT STARTED — FIREBASE ERROR*\n\n\`${firebaseError}\`\n\nBot is running WITHOUT Firestore (signal-only mode). Fix secrets then restart.`);
+    // Run in signal-only mode — skip Firestore-dependent setup
+    setInterval(() => scanAndTrade(), SCAN_INTERVAL);
+    pollTelegramCommands();
+    return;
+  }
+
   const startCfg  = await getTradingConfig();
   const startMode = (startCfg.tradingMode || 'paper').toUpperCase();
   const wallets   = await getWallets();
