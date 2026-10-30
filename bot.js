@@ -1066,8 +1066,12 @@ async function filterByLpLock(matches) {
   const toCheck = [];
 
   for (const coin of matches) {
-    // Pump.fun bonding-curve: liquidity lives in the curve contract (no LP to lock)
-    if (coin.isPumpFun) { locked.add(coin.addr); continue; }
+    // Pump.fun tokens — bonding curve OR graduated to Raydium:
+    //   - Bonding curve (dexId='pump-fun'): liquidity locked in the curve contract
+    //   - Graduated (addr ends in 'pump', now on Raydium): pump.fun enforced no dev drain
+    // LP lock check is irrelevant for both — exempt entirely.
+    const isPumpFunAddr = coin.isPumpFun || coin.addr.endsWith('pump');
+    if (isPumpFunAddr) { locked.add(coin.addr); continue; }
 
     const cached = lpLockCache.get(coin.addr);
     if (cached && Date.now() - cached.ts < LP_LOCK_TTL) {
@@ -1108,16 +1112,27 @@ async function filterByLpLock(matches) {
       const d      = JSON.parse(r.body);
       const result = d?.result || {};
 
+      const isSolana = chain === 'solana';
       for (const coin of coins) {
         // GoPlus keys EVM addresses in lowercase; Solana keeps exact case
-        const info     = result[coin.addr.toLowerCase()] || result[coin.addr] || null;
-        const isLocked = info?.lp_locked === '1' || info?.lp_burned === '1';
-        lpLockCache.set(coin.addr, { locked: isLocked, ts: Date.now() });
-        if (isLocked) {
-          locked.add(coin.addr);
+        const info = result[coin.addr.toLowerCase()] || result[coin.addr] || null;
+
+        let passes;
+        if (isSolana) {
+          // GoPlus Solana has no lp_locked/lp_burned fields (Solana LP locking works differently).
+          // For Solana: pass unless GoPlus explicitly flags it as an airdrop scam.
+          // Note: pump.fun tokens are already exempted above before reaching this point.
+          const isScam = info?.is_airdrop_scam === '1';
+          passes = !isScam;
+          if (isScam) console.log(`[LP LOCK] ❌ ${coin.symbol} (${coin.addr.slice(0,8)}…) — GoPlus: airdrop scam`);
         } else {
-          console.log(`[LP LOCK] ❌ ${coin.symbol} (${coin.addr.slice(0,8)}…) — LP not locked, skipped`);
+          // EVM chains: require LP locked or burned via third-party locker
+          passes = info?.lp_locked === '1' || info?.lp_burned === '1';
+          if (!passes) console.log(`[LP LOCK] ❌ ${coin.symbol} (${coin.addr.slice(0,8)}…) — LP not locked, skipped`);
         }
+
+        lpLockCache.set(coin.addr, { locked: passes, ts: Date.now() });
+        if (passes) locked.add(coin.addr);
       }
     } catch(e) {
       // GoPlus network error — fail open so the bot can still trade
