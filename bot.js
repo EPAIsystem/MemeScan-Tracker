@@ -12,8 +12,9 @@ try {
 }
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
-const TELEGRAM_TOKEN  = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT   = process.env.TELEGRAM_CHAT_ID;
+// Try both naming conventions (old code used TELEGRAM_TOKEN, new uses TELEGRAM_BOT_TOKEN)
+const TELEGRAM_TOKEN  = process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_TOKEN;
+const TELEGRAM_CHAT   = process.env.TELEGRAM_CHAT_ID   || process.env.TELEGRAM_CHAT;
 const POSITION_SIZE   = parseFloat(process.env.POSITION_SIZE || '100');
 const MAX_POSITIONS   = 10;
 const MIN_SCORE       = 60;
@@ -1643,6 +1644,14 @@ async function sendHourlySummary() {
 // ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 async function main() {
   console.log('[BOT] MemeScan PRO — 4-Strategy Bot starting...');
+  // Log env var presence (not values) so Fly.io logs show what's configured
+  console.log('[BOT] Env check:',
+    'TELEGRAM_TOKEN=' + (TELEGRAM_TOKEN ? '✓' : '✗ MISSING'),
+    'TELEGRAM_CHAT='  + (TELEGRAM_CHAT  ? '✓' : '✗ MISSING'),
+    'FIREBASE_PROJECT=' + (process.env.FIREBASE_PROJECT_ID ? '✓' : '✗ MISSING'),
+    'FIREBASE_EMAIL='   + (process.env.FIREBASE_CLIENT_EMAIL ? '✓' : '✗ MISSING'),
+    'FIREBASE_KEY='     + (process.env.FIREBASE_PRIVATE_KEY ? '✓' : '✗ MISSING'),
+  );
 
   // First thing: announce we're alive (before any Firestore calls)
   await sendTelegram(`🟡 *BOT STARTING...* Firebase: ${firebaseError ? '❌ ' + firebaseError : '✅ connected'}`);
@@ -1713,7 +1722,14 @@ async function main() {
   }, 30000);
 }
 
-main().catch(e => { console.error('[FATAL]', e); process.exit(1); });
+main().catch(e => {
+  console.error('[FATAL] Uncaught error in main():', e);
+  // Do NOT call process.exit — keep process alive so Fly.io doesn't roll back
+  // Try to send Telegram alert, then keep polling
+  sendTelegram(`🔴 *BOT FATAL ERROR*\n\`${e.message}\`\n\nProcess staying alive — restart manually if needed.`)
+    .catch(() => {});
+  setInterval(() => {}, 60000); // keepalive — prevents Node.js from exiting
+});
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 function fmtPrice(p) {
