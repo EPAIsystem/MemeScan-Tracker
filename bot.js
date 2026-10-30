@@ -1545,7 +1545,39 @@ async function scanForEntries() {
     }
   } catch(e) {}
 
-  console.log(`[SCAN] Fetched ${candidates.length} unique candidates via ${keywords.length} keywords`);
+  // ── DexScreener Boosted Tokens (same source as MemeScan PRO signals) ──────────
+  // MemeScan PRO uses /token-boosts/top/v1 and /token-boosts/latest/v1 to find
+  // promoted/trending coins. Without this, the bot only sees keyword matches and
+  // misses all boosted coins regardless of their names (e.g. HEXN, HYPERCHAN, etc.)
+  const boostEndpoints = ['/token-boosts/top/v1', '/token-boosts/latest/v1'];
+  for (const boostEp of boostEndpoints) {
+    try {
+      const r = await httpGet('api.dexscreener.com', boostEp);
+      const d = JSON.parse(r.body);
+      // API returns array of {chainId, tokenAddress, amount, ...}
+      const boosted = Array.isArray(d) ? d : [];
+      // Filter to Solana only, take top 25 per endpoint
+      const solanaBoosted = boosted.filter(b => b.chainId === 'solana').slice(0, 25);
+      console.log(`[SCAN] Boosted (${boostEp.split('/')[1]}): ${boosted.length} total, ${solanaBoosted.length} Solana`);
+      for (const b of solanaBoosted) {
+        const addr = b.tokenAddress || '';
+        if (!addr || seen.has(addr)) continue;
+        seen.add(addr);
+        try {
+          const r2 = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${addr}`);
+          const d2 = JSON.parse(r2.body);
+          for (const p2 of (d2.pairs || []).slice(0, 2)) {
+            const a2 = p2.baseToken?.address || '';
+            if (a2 && !seen.has(a2)) { seen.add(a2); candidates.push(p2); }
+            else if (a2 === addr) candidates.push(p2); // include even if addr already seen (different pair)
+          }
+        } catch(e) {}
+        await sleep(80); // rate limit — DexScreener allows ~10 req/s
+      }
+    } catch(e) { console.log(`[SCAN] Boosted endpoint error (${boostEp}): ${e.message}`); }
+  }
+
+  console.log(`[SCAN] Fetched ${candidates.length} unique candidates via ${keywords.length} keywords + boosts`);
 
   // Clean up expired SL blocks (older than 6h)
   const nowTs = Date.now();
