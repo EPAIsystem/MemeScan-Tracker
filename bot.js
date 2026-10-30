@@ -1527,6 +1527,8 @@ async function scanForEntries() {
     }
   } catch(e) {}
 
+  console.log(`[SCAN] Fetched ${candidates.length} unique candidates via ${keywords.length} keywords`);
+
   // Clean up expired SL blocks (older than 6h)
   const nowTs = Date.now();
   for (const [addr, ts] of recentSLCoins) {
@@ -1536,19 +1538,31 @@ async function scanForEntries() {
   // Score and match each candidate to a strategy
   const openAddrs = new Set(positions.map(p => p.address));
   const matches   = [];
+  let nearMissCount = 0;
 
   for (const pair of candidates) {
     const addr = pair.baseToken?.address || '';
     if (openAddrs.has(addr) || enteredToday.has(addr) || recentSLCoins.has(addr)) continue;
 
     const result = detectStrategy(pair, openStrategies);
-    if (result && result.score >= scoreThreshold) {
-      // Record price snapshot for trend/rebound tracking
-      const price = parseFloat(pair.priceUsd || 0);
-      recordPriceHistory(result.addr, price, result.score);
-      matches.push(result);
+    if (result) {
+      if (result.score >= scoreThreshold) {
+        // Record price snapshot for trend/rebound tracking
+        const price = parseFloat(pair.priceUsd || 0);
+        recordPriceHistory(result.addr, price, result.score);
+        matches.push(result);
+      } else {
+        nearMissCount++;
+        // Log near misses for visibility (coins that match a strategy but scored just below threshold)
+        if (result.score >= 40) {
+          console.log(`[NEAR MISS] ${result.symbol}: ${result.strategy.label} score ${result.score} (need ${scoreThreshold}) | m5:${result.m5Ch?.toFixed(1)}% m5txns:${result.m5Txns} h1:${result.ch1?.toFixed(1)}% buy:${result.buyPct?.toFixed(0)}%`);
+        }
+      }
     }
   }
+
+  // Always log scan summary so Fly.io logs show activity
+  console.log(`[SCAN] #${scanCount}: ${candidates.length} candidates → ${matches.length} above threshold, ${nearMissCount} near misses (threshold: ${scoreThreshold})`);
 
   // Sort: trending/rebounding coins first, then by score
   matches.sort((a, b) => {
@@ -1592,9 +1606,9 @@ async function scanForEntries() {
     // Check slot still available (may have been filled earlier in this loop)
     if (slotCount[coin.strategy.id] >= coin.strategy.maxSlots) continue;
 
-    alertCooldown.set(coin.addr, Date.now());
     const pos = await enterPosition(coin);
     if (!pos) continue; // null = real mode with no matching wallet for this chain
+    alertCooldown.set(coin.addr, Date.now()); // set AFTER successful entry to avoid 30-min lockout on failure
     enteredToday.add(coin.addr);
     usedThisScan.add(coin.addr);
     positions.push(pos);
