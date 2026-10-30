@@ -320,6 +320,101 @@ tbody tr:hover td { background: var(--bg3); }
 .manual-item-del:hover { color: var(--red); }
 .manual-empty { font-size: 12px; color: var(--fg3); text-align: center; padding: 8px 0; }
 
+/* ── Trading controls panel ──────────────────────────────────────────────────── */
+.trade-ctrl-panel {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 12px; padding: 16px; margin-bottom: 20px;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+}
+@media (max-width: 500px) { .trade-ctrl-panel { grid-template-columns: 1fr; } }
+
+.ctrl-block-label {
+  font-size: 10px; color: var(--fg3); text-transform: uppercase;
+  letter-spacing: .08em; font-weight: 600; margin-bottom: 8px;
+}
+
+/* Mode pill */
+.mode-pill {
+  display: flex; border-radius: 8px; overflow: hidden;
+  border: 1px solid var(--border); width: fit-content;
+}
+.mode-half {
+  padding: 7px 16px; font-size: 12px; font-weight: 600;
+  cursor: pointer; transition: background .15s, color .15s;
+  border: none; font-family: var(--sans); white-space: nowrap;
+}
+.mode-half.paper-half { background: var(--bg3); color: var(--fg3); }
+.mode-half.real-half  { background: var(--bg3); color: var(--fg3); }
+.mode-half.active-paper { background: rgba(79,110,247,.25); color: var(--accent); }
+.mode-half.active-real  { background: rgba(46,194,126,.2);  color: var(--green); }
+.mode-half:disabled { opacity: .5; cursor: not-allowed; }
+
+/* Size edit */
+.size-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.size-val {
+  font-family: var(--mono); font-size: 20px; font-weight: 500; color: var(--fg);
+}
+.size-input {
+  background: var(--bg3); border: 1px solid var(--accent); border-radius: 6px;
+  color: var(--fg); font-family: var(--mono); font-size: 16px;
+  padding: 5px 10px; width: 90px; outline: none;
+}
+.size-edit-btn {
+  background: none; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--fg3); font-size: 11px; padding: 4px 8px;
+  cursor: pointer; font-family: var(--sans);
+  transition: border-color .15s, color .15s;
+}
+.size-edit-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* Wallet cards */
+.wallet-panel {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 12px; padding: 16px; margin-bottom: 20px;
+}
+.wallet-list {
+  display: flex; flex-direction: column; gap: 8px; margin-top: 8px;
+}
+.wallet-card {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px;
+  transition: border-color .15s;
+}
+.wallet-card.active-wallet { border-color: rgba(46,194,126,.5); }
+.wallet-icon {
+  width: 32px; height: 32px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; flex-shrink: 0;
+  background: var(--bg2);
+}
+.wallet-icon.sol  { background: rgba(153,69,255,.15); }
+.wallet-icon.eth  { background: rgba(98,126,234,.15); }
+.wallet-icon.bsc  { background: rgba(243,186,47,.15); }
+.wallet-info { flex: 1; min-width: 0; }
+.wallet-label { font-size: 13px; font-weight: 600; color: var(--fg); }
+.wallet-addr  { font-size: 10px; font-family: var(--mono); color: var(--fg3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wallet-chain-tag {
+  font-size: 9px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .07em; padding: 2px 6px; border-radius: 4px;
+  background: var(--bg); color: var(--fg3); white-space: nowrap; flex-shrink: 0;
+}
+.wallet-chain-tag.sol  { background: rgba(153,69,255,.2); color: #b87cff; }
+.wallet-chain-tag.eth  { background: rgba(98,126,234,.2); color: #7e9aff; }
+.wallet-chain-tag.bsc  { background: rgba(243,186,47,.2); color: #f3ba2f; }
+.wallet-toggle {
+  border: none; border-radius: 6px; padding: 5px 10px;
+  font-size: 11px; font-weight: 600; font-family: var(--sans);
+  cursor: pointer; transition: background .15s; flex-shrink: 0;
+  white-space: nowrap;
+}
+.wallet-toggle.on  { background: rgba(46,194,126,.15); color: var(--green); border: 1px solid rgba(46,194,126,.3); }
+.wallet-toggle.off { background: var(--bg); color: var(--fg3); border: 1px solid var(--border); }
+.wallet-toggle:disabled { opacity: .4; cursor: not-allowed; }
+.wallet-empty { font-size: 12px; color: var(--fg3); padding: 8px 0; }
+
 /* ── Bot control button ──────────────────────────────────────────────────────── */
 .bot-ctrl {
   display: flex; align-items: center; gap: 7px;
@@ -411,6 +506,10 @@ const S = {
   manualAdding: false,
   closingPos: {},     // { [posId]: 'confirm' | 'closing' }
   dailyHistory: [],   // [{date, realizedPnL, trades, wins, losses}, ...]
+  control: {},        // paper_config/control fields
+  wallets: [],        // paper_config/wallets/slots docs
+  togglingMode: false,
+  editingSize: false,
 };
 
 // ── Config store ──────────────────────────────────────────────────────────────
@@ -488,6 +587,17 @@ async function fsDelete(cfg, coll, id) {
   if (!r.ok && r.status !== 404) throw new Error(`Firestore delete ${r.status}`);
 }
 
+async function fsListSubcoll(cfg, parentColl, parentId, subColl) {
+  // List all docs in a sub-collection: e.g. paper_config/wallets/slots
+  const url = `${base(cfg)}/${parentColl}/${parentId}/${subColl}?key=${cfg.apiKey}&pageSize=20`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const d = await r.json();
+    return (d.documents || []).map(parseDoc).filter(Boolean);
+  } catch { return []; }
+}
+
 async function fsSet(cfg, coll, id, fields) {
   // Build Firestore field map
   const fsFields = {};
@@ -535,6 +645,11 @@ async function loadData() {
     S.positions = positions;
     S.history = history.slice(0, 15);
     S.stats = statsDoc;
+    S.control = ctrlDoc || {};
+    S.botRunning = ctrlDoc ? (ctrlDoc.running !== false) : true;
+
+    // Load wallets (sub-collection)
+    S.wallets = await fsListSubcoll(S.config, 'paper_config', 'wallets', 'slots');
 
     // Load last 30 days of daily P&L history
     const dailyFetches = [];
@@ -548,7 +663,6 @@ async function loadData() {
       );
     }
     S.dailyHistory = (await Promise.all(dailyFetches)).filter(Boolean);
-    S.botRunning = ctrlDoc ? (ctrlDoc.running !== false) : true;
     S.manualQueue = manualQueue.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0)).slice(0, 20);
     // Seed prices from Firestore-stored currentPrice (written by bot each monitor tick).
     // This works even when the browser can't reach DexScreener directly.
@@ -755,6 +869,8 @@ function render() {
           <div class="stat-note">open now</div>
         </div>
       </div>
+
+      ${tradingControlsHTML()}
 
       ${manualQueueHTML()}
 
@@ -980,6 +1096,136 @@ async function removeManualToken(id) {
     S.manualQueue = S.manualQueue.filter(x => x._id !== id);
     render();
   } catch (e) { S.error = 'Remove failed: ' + e.message; render(); }
+}
+
+// ── Trading controls (mode toggle + wallet selector) ─────────────────────────
+function tradingControlsHTML() {
+  const mode     = S.control.tradingMode || 'paper';
+  const isPaper  = mode !== 'real';
+  const posSize  = S.control.positionSize != null ? S.control.positionSize : 100;
+  const toggling = S.togglingMode;
+
+  const modePill = `
+    <div class="ctrl-block-label">Trading Mode</div>
+    <div class="mode-pill">
+      <button class="mode-half paper-half ${isPaper ? 'active-paper' : ''}"
+        onclick="toggleMode('paper')" ${toggling ? 'disabled' : ''}>
+        📄 Paper
+      </button>
+      <button class="mode-half real-half ${!isPaper ? 'active-real' : ''}"
+        onclick="toggleMode('real')" ${toggling ? 'disabled' : ''}>
+        💰 Real
+      </button>
+    </div>`;
+
+  const sizeBlock = `
+    <div>
+      <div class="ctrl-block-label">Position Size</div>
+      ${S.editingSize
+        ? `<div class="size-row">
+            <input class="size-input" id="size-inp" type="number" min="5" step="5"
+              value="${posSize}" onkeydown="if(event.key==='Enter')saveSize()" autofocus>
+            <button class="size-edit-btn" onclick="saveSize()">Save</button>
+            <button class="size-edit-btn" onclick="S.editingSize=false;render()">✕</button>
+          </div>`
+        : `<div class="size-row">
+            <span class="size-val">$${posSize}</span>
+            <button class="size-edit-btn" onclick="S.editingSize=true;render()">✏ Edit</button>
+          </div>`}
+    </div>`;
+
+  const ctrlPanel = `
+    <div class="trade-ctrl-panel">
+      <div>${modePill}</div>
+      ${sizeBlock}
+    </div>`;
+
+  if (!S.wallets.length) return ctrlPanel;
+
+  const walletCards = S.wallets.map(w => {
+    const chain  = (w.chain || 'sol').toLowerCase();
+    const label  = w.label || w.envKey || 'Wallet';
+    const addr   = w.address || '';
+    const short  = addr.length > 12 ? addr.slice(0,6) + '…' + addr.slice(-4) : addr;
+    const active = w.active !== false;
+    const icons  = { sol: '◎', eth: 'Ξ', bsc: '⬡' };
+    return `
+      <div class="wallet-card ${active ? 'active-wallet' : ''}">
+        <div class="wallet-icon ${chain}">${icons[chain] || '💼'}</div>
+        <div class="wallet-info">
+          <div class="wallet-label">${label}</div>
+          <div class="wallet-addr" title="${addr}">${short || '—'}</div>
+        </div>
+        <div class="wallet-chain-tag ${chain}">${chain.toUpperCase()}</div>
+        <button class="wallet-toggle ${active ? 'on' : 'off'}"
+          onclick="setWalletActive('${w._id}', ${!active})">
+          ${active ? '✓ Active' : 'Inactive'}
+        </button>
+      </div>`;
+  }).join('');
+
+  return ctrlPanel + `
+    <div class="wallet-panel">
+      <div class="ctrl-block-label">Wallets</div>
+      <div class="wallet-list">${walletCards}</div>
+    </div>`;
+}
+
+async function toggleMode(newMode) {
+  if (!S.config || S.togglingMode) return;
+  if ((S.control.tradingMode || 'paper') === newMode) return;
+  S.togglingMode = true;
+  render();
+  try {
+    const existing = await fsGet(S.config, 'paper_config', 'control') || {};
+    await fsSet(S.config, 'paper_config', 'control', { ...existing, tradingMode: newMode });
+    S.control = { ...S.control, tradingMode: newMode };
+  } catch (e) {
+    S.error = 'Mode switch failed: ' + e.message;
+  }
+  S.togglingMode = false;
+  render();
+}
+
+async function saveSize() {
+  if (!S.config) return;
+  const inp = document.getElementById('size-inp');
+  const val = parseFloat(inp?.value);
+  if (!val || val < 1) return;
+  try {
+    const existing = await fsGet(S.config, 'paper_config', 'control') || {};
+    await fsSet(S.config, 'paper_config', 'control', { ...existing, positionSize: val });
+    S.control = { ...S.control, positionSize: val };
+  } catch (e) {
+    S.error = 'Save size failed: ' + e.message;
+  }
+  S.editingSize = false;
+  render();
+}
+
+async function setWalletActive(walletId, active) {
+  if (!S.config || !walletId) return;
+  // Optimistic update
+  S.wallets = S.wallets.map(w => w._id === walletId ? { ...w, active } : w);
+  render();
+  try {
+    // Sub-collection REST PATCH: paper_config/wallets/slots/{walletId}
+    const base   = `https://firestore.googleapis.com/v1/projects/${S.config.projectId}/databases/(default)/documents`;
+    const path   = `paper_config/wallets/slots/${walletId}`;
+    const url    = `${base}/${path}?key=${S.config.apiKey}&updateMask.fieldPaths=active`;
+    const body   = { fields: { active: { booleanValue: active } } };
+    const r = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+  } catch (e) {
+    // Roll back on failure
+    S.wallets = S.wallets.map(w => w._id === walletId ? { ...w, active: !active } : w);
+    S.error = 'Wallet update failed: ' + e.message;
+    render();
+  }
 }
 
 // ── Bot control ───────────────────────────────────────────────────────────────
