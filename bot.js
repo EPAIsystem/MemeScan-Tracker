@@ -773,8 +773,23 @@ async function checkDayRestart() {
 }
 
 // ─── TELEGRAM COMMAND POLLING ─────────────────────────────────────────────────
-// Polls for /restart and /status commands from the authorized chat.
-// Lightweight — runs every 30 s, uses long-poll with timeout=5.
+// On startup: skip all queued messages so we don't replay old /help /start etc.
+async function drainTelegramQueue() {
+  if (!TELEGRAM_TOKEN) return;
+  try {
+    const r = await httpGet('api.telegram.org',
+      `/bot${TELEGRAM_TOKEN}/getUpdates?offset=-1&timeout=0`);
+    const d = JSON.parse(r.body);
+    if (d.ok && d.result?.length) {
+      telegramOffset = d.result[d.result.length - 1].update_id + 1;
+      console.log('[BOT] Telegram queue drained — offset now', telegramOffset);
+    }
+  } catch(e) {
+    console.error('[BOT] Telegram drain failed:', e.message);
+  }
+}
+
+// Polls for commands from the authorized chat. Runs every 30 s.
 async function pollTelegramCommands() {
   try {
     const path = `/bot${TELEGRAM_TOKEN}/getUpdates?offset=${telegramOffset}&timeout=5&allowed_updates=${encodeURIComponent('["message"]')}`;
@@ -1652,6 +1667,9 @@ async function main() {
     'FIREBASE_EMAIL='   + (process.env.FIREBASE_CLIENT_EMAIL ? '✓' : '✗ MISSING'),
     'FIREBASE_KEY='     + (process.env.FIREBASE_PRIVATE_KEY ? '✓' : '✗ MISSING'),
   );
+
+  // Skip all queued Telegram messages so old /start /help etc. don't replay
+  await drainTelegramQueue();
 
   // First thing: announce we're alive (before any Firestore calls)
   await sendTelegram(`🟡 *BOT STARTING...* Firebase: ${firebaseError ? '❌ ' + firebaseError : '✅ connected'}`);
