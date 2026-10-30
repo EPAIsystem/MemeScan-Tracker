@@ -1,6 +1,15 @@
 const https = require('https');
-const { initializeApp, cert } = require('firebase-admin/app');
-const { getFirestore, FieldValue } = require('firebase-admin/firestore');
+
+// Wrap firebase-admin requires so a missing module doesn't crash before main()
+let initializeApp, cert, getFirestore, FieldValue;
+let _requireError = null;
+try {
+  ({ initializeApp, cert } = require('firebase-admin/app'));
+  ({ getFirestore, FieldValue } = require('firebase-admin/firestore'));
+} catch(e) {
+  _requireError = e.message;
+  console.error('[BOT] firebase-admin require failed:', _requireError);
+}
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const TELEGRAM_TOKEN  = process.env.TELEGRAM_BOT_TOKEN;
@@ -58,6 +67,7 @@ try {
   // Handle both literal \n (pasted from JSON) and actual newlines
   const privateKey  = rawKey.replace(/\\n/g, '\n');
 
+  if (_requireError) throw new Error('firebase-admin module failed to load: ' + _requireError);
   if (!projectId)   throw new Error('FIREBASE_PROJECT_ID missing');
   if (!clientEmail) throw new Error('FIREBASE_CLIENT_EMAIL missing');
   if (!rawKey)      throw new Error('FIREBASE_PRIVATE_KEY missing');
