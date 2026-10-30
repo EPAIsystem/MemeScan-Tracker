@@ -1649,8 +1649,9 @@ async function main() {
 
   if (firebaseError) {
     await sendTelegram(`🔴 *FIREBASE ERROR — bot cannot trade*\n\`${firebaseError}\`\n\nFix secrets then restart.`);
-    pollTelegramCommands();
-    return;
+    // Keep process alive so Fly.io doesn't roll back — poll Telegram every 30s
+    setInterval(() => pollTelegramCommands().catch(() => {}), 30000);
+    return; // exits main() but setInterval keeps Node.js alive
   }
 
   let startCfg, startMode, wallets;
@@ -1660,7 +1661,9 @@ async function main() {
     wallets   = await getWallets();
   } catch(e) {
     await sendTelegram(`🔴 *FIRESTORE ERROR*\n\`${e.message}\`\n\nBot cannot start — check Firebase project permissions.`);
-    process.exit(1);
+    // Keep process alive so Fly.io doesn't roll back — poll Telegram every 30s
+    setInterval(() => pollTelegramCommands().catch(() => {}), 30000);
+    return; // exits main() but setInterval keeps Node.js alive
   }
   const walletLine = wallets.length
     ? `👛 ${wallets.length} wallet(s): ${wallets.map(w => w.chain).join(', ')}`
