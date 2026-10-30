@@ -233,14 +233,17 @@ function detectStrategy(pair, openStrategies) {
   const dexId      = pair.dexId || '';
   const isPumpFun  = dexId === 'pump-fun';
 
-  // PUMP.FUN INFANT PROTECTION: coins < 20 min old are pre-pump / extreme rug risk
-  // Skip entirely — the initial hype dies in minutes and most go to 0
-  if (isPumpFun && ageMinutes < 20) return null;
+  // UNIVERSAL MINIMUM AGE: 60 minutes for ALL tokens (pump.fun or otherwise).
+  // Coins under 60 min are in their most volatile phase — initial hype spike,
+  // then immediate dump. Even a perfect-looking score at 12 min can hit SL in seconds.
+  // 60 min also eliminates YOUNG COIN MODE (< 60 min special exits), so all trades
+  // use the standard TP1/TP2/TP3 targets which are better calibrated for real moves.
+  if (ageMinutes < 60) return null;
 
-  // PUMP.FUN YOUNG COIN extra requirements (20–60 min): tighter liquidity + buy pressure
-  // Standard liq/buyPct minimums are too loose for coins this fresh
-  if (isPumpFun && ageMinutes < 60 && liq < 15000) return null;
-  if (isPumpFun && ageMinutes < 60 && buyPct < 62)  return null;
+  // PUMP.FUN YOUNG COIN extra requirements (60–90 min): tighter liquidity + buy pressure
+  // (age < 60 already blocked above, so this only applies between 60–90 min)
+  if (isPumpFun && ageMinutes < 90 && liq < 15000) return null;
+  if (isPumpFun && ageMinutes < 90 && buyPct < 62)  return null;
 
   const base = { addr, price, liq, vol24, buyPct, buys24, ch1, ch24, m5Ch, m5Txns, ageDays, ageMinutes, volMcap,
     symbol: pair.baseToken?.symbol || '???',
