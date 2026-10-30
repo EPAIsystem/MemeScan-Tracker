@@ -51,14 +51,16 @@ const PRICE_HIST_REBOUND_PCT = 0.05; // 5% recovery from dip = rebound confirmed
 // ─── FIREBASE INIT ────────────────────────────────────────────────────────────
 let db;
 try {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
-  if (!raw) throw new Error('FIREBASE_SERVICE_ACCOUNT env var is missing');
-  console.log('[BOT] Parsing service account, length:', raw.length);
-  // Fix common issue: private_key newlines double-escaped when pasted via web UI
-  const fixed = raw.replace(/\\\\n/g, '\\n');
-  const sa = JSON.parse(fixed);
-  console.log('[BOT] Service account project:', sa.project_id);
-  initializeApp({ credential: cert(sa) });
+  const projectId   = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const privateKey  = (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+
+  if (!projectId)   throw new Error('FIREBASE_PROJECT_ID env var is missing');
+  if (!clientEmail) throw new Error('FIREBASE_CLIENT_EMAIL env var is missing');
+  if (!privateKey)  throw new Error('FIREBASE_PRIVATE_KEY env var is missing');
+
+  console.log('[BOT] Firebase init — project:', projectId, 'email:', clientEmail.slice(0,20)+'...');
+  initializeApp({ credential: cert({ projectId, clientEmail, privateKey }) });
   db = getFirestore();
   console.log('[BOT] Firebase connected');
 } catch(e) {
