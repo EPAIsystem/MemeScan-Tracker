@@ -1634,18 +1634,24 @@ async function sendHourlySummary() {
 async function main() {
   console.log('[BOT] MemeScan PRO — 4-Strategy Bot starting...');
 
-  // Report Firebase failure to Telegram so we can diagnose without needing logs
+  // First thing: announce we're alive (before any Firestore calls)
+  await sendTelegram(`🟡 *BOT STARTING...* Firebase: ${firebaseError ? '❌ ' + firebaseError : '✅ connected'}`);
+
   if (firebaseError) {
-    await sendTelegram(`🔴 *BOT STARTED — FIREBASE ERROR*\n\n\`${firebaseError}\`\n\nBot is running WITHOUT Firestore (signal-only mode). Fix secrets then restart.`);
-    // Run in signal-only mode — skip Firestore-dependent setup
-    setInterval(() => scanAndTrade(), SCAN_INTERVAL);
+    await sendTelegram(`🔴 *FIREBASE ERROR — bot cannot trade*\n\`${firebaseError}\`\n\nFix secrets then restart.`);
     pollTelegramCommands();
     return;
   }
 
-  const startCfg  = await getTradingConfig();
-  const startMode = (startCfg.tradingMode || 'paper').toUpperCase();
-  const wallets   = await getWallets();
+  let startCfg, startMode, wallets;
+  try {
+    startCfg  = await getTradingConfig();
+    startMode = (startCfg.tradingMode || 'paper').toUpperCase();
+    wallets   = await getWallets();
+  } catch(e) {
+    await sendTelegram(`🔴 *FIRESTORE ERROR*\n\`${e.message}\`\n\nBot cannot start — check Firebase project permissions.`);
+    process.exit(1);
+  }
   const walletLine = wallets.length
     ? `👛 ${wallets.length} wallet(s): ${wallets.map(w => w.chain).join(', ')}`
     : `👛 No wallets configured (/wallets to set up)`;
