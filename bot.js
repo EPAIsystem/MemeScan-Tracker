@@ -1,5 +1,14 @@
 const https = require('https');
 
+// ─── SOLANA / JUPITER (real trading) ──────────────────────────────────────────
+let SolanaWeb3, bs58;
+try {
+  SolanaWeb3 = require('@solana/web3.js');
+  bs58 = require('bs58');
+} catch(e) {
+  console.warn('[BOT] @solana/web3.js or bs58 not installed — real trading disabled:', e.message);
+}
+
 // Wrap firebase-admin requires so a missing module doesn't crash before main()
 let initializeApp, cert, getFirestore, FieldValue;
 let _requireError = null;
@@ -462,27 +471,176 @@ async function checkAddFunds(cfg) {
   }
 }
 
-// ─── REAL TRADE EXECUTION STUBS ───────────────────────────────────────────────
-// These will be wired to actual chain SDKs in a future release.
-// Solana: @solana/web3.js + Jupiter aggregator
-// EVM (ETH/BSC/Base): ethers.js + 1inch or Uniswap v3 router
-// Private key loaded from Fly.io secret: process.env[wallet.envKey + '_PRIVATE_KEY']
-async function executeRealEntry(coin, wallet, posSize) {
-  const privKey = process.env[`${wallet.envKey}_PRIVATE_KEY`] || '';
-  if (!privKey) {
-    console.warn(`[REAL] ⚠️  No private key for ${wallet.label} (${wallet.envKey}_PRIVATE_KEY). Simulating.`);
+// ─── REAL TRADE EXECUTION — Solana via Jupiter ────────────────────────────────
+// Private key in Fly.io secret: process.env[wallet.envKey + '_PRIVATE_KEY']
+// Supports base58 string (Phantom export) or JSON uint8 array.
+// EVM chains (ETH/BSC/Base) remain paper-only for now.
+
+const SOL_MINT  = 'So11111111111111111111111111111111111111112'; // Wrapped SOL
+const SOL_RPC   = process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com';
+
+function parseSolanaKeypair(privKeyStr) {
+  if (!SolanaWeb3 || !bs58) throw new Error('@solana/web3.js not installed');
+  // Try base58 first (Phantom export)
+  try {
+    const decoded = bs58.decode(privKeyStr.trim());
+    return SolanaWeb3.Keypair.fromSecretKey(decoded);
+  } catch(_) {}
+  // Try JSON uint8 array
+  try {
+    return SolanaWeb3.Keypair.fromSecretKey(new Uint8Array(JSON.parse(privKeyStr)));
+  } catch(e) {
+    throw new Error(`Cannot parse Solana private key: ${e.message}`);
   }
-  console.log(`[REAL] 🟡 ENTRY STUB — ${coin.symbol} | chain: ${coin.chain} | wallet: ${wallet.label} | $${posSize}`);
-  // TODO: swap execution
-  return { txHash: 'PENDING-REAL', executedPrice: coin.price };
+}
+
+async function getSolPriceUsd() {
+  try {
+    const r = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${SOL_MINT}`);
+    const d = JSON.parse(r.body);
+    const pairs = (d.pairs || []).filter(p => p.chainId === 'solana');
+    pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+    const p = parseFloat(pairs[0]?.priceUsd || 0);
+    return p > 0 ? p : 160; // sensible fallback
+  } catch { return 160; }
+}
+
+async function jupiterQuote(inputMint, outputMint, amountLamports, slippageBps = 100) {
+  try {
+    const path = `/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}`;
+    const r = await httpGet('quote-api.jup.ag', path);
+    if (r.status !== 200) { console.error('[JUPITER] Quote HTTP', r.status); return null; }
+    return JSON.parse(r.body);
+  } catch(e) { console.error('[JUPITER] Quote error:', e.message); return null; }
+}
+
+async function jupiterGetSwapTx(quote, walletPublicKey) {
+  try {
+    const body = JSON.stringify({
+      quoteResponse: quote,
+      userPublicKey: walletPublicKey,
+      wrapAndUnwrapSol: true,
+      prioritizationFeeLamports: 5000, // ~0.000005 SOL tip for faster landing
+    });
+    const r = await new Promise((resolve) => {
+      const req = https.request({
+        hostname: 'quote-api.jup.ag',
+        path: '/v6/swap',
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        timeout: 15000,
+      }, (res) => {
+        let d = ''; res.on('data', c => d += c); res.on('end', () => resolve({ status: res.statusCode, body: d }));
+      });
+      req.on('error', () => resolve({ status: 500, body: '{}' }));
+      req.on('timeout', () => { req.destroy(); resolve({ status: 504, body: '{}' }); });
+      req.write(body); req.end();
+    });
+    if (r.status !== 200) { console.error('[JUPITER] Swap HTTP', r.status, r.body.slice(0,200)); return null; }
+    return JSON.parse(r.body).swapTransaction; // base64-encoded VersionedTransaction
+  } catch(e) { console.error('[JUPITER] Swap error:', e.message); return null; }
+}
+
+async function sendSolanaTransaction(txBase64, keypair) {
+  const { Connection, VersionedTransaction } = SolanaWeb3;
+  const connection = new Connection(SOL_RPC, 'confirmed');
+  const txBuf = Buffer.from(txBase64, 'base64');
+  const tx    = VersionedTransaction.deserialize(txBuf);
+  tx.sign([keypair]);
+  const sig = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
+  // Wait up to 45s for confirmation
+  const { value } = await connection.confirmTransaction(
+    { signature: sig, ...(await connection.getLatestBlockhash('confirmed')) },
+    'confirmed'
+  );
+  if (value.err) throw new Error(`Tx confirmed but failed on-chain: ${JSON.stringify(value.err)}`);
+  return sig;
+}
+
+async function executeRealEntry(coin, wallet, posSize) {
+  if (coin.chain !== 'solana') {
+    console.warn(`[REAL] Chain "${coin.chain}" not yet supported for real trading. Logging as paper.`);
+    return { txHash: null, executedPrice: coin.price, simulated: true };
+  }
+  if (!SolanaWeb3 || !bs58) return { txHash: null, executedPrice: coin.price, error: 'Solana SDK not installed' };
+
+  const privKeyStr = process.env[`${wallet.envKey}_PRIVATE_KEY`];
+  if (!privKeyStr) {
+    console.warn(`[REAL] ⚠️  No private key for ${wallet.label} (${wallet.envKey}_PRIVATE_KEY). Trade NOT executed.`);
+    return { txHash: null, executedPrice: coin.price, error: 'Missing private key' };
+  }
+
+  let keypair;
+  try { keypair = parseSolanaKeypair(privKeyStr); }
+  catch(e) { return { txHash: null, executedPrice: coin.price, error: e.message }; }
+
+  try {
+    const solPrice    = await getSolPriceUsd();
+    const solAmount   = posSize / solPrice;
+    const lamports    = Math.floor(solAmount * 1e9);
+    console.log(`[REAL] ENTRY ${coin.symbol} | $${posSize} = ${solAmount.toFixed(4)} SOL = ${lamports} lamports`);
+
+    const quote = await jupiterQuote(SOL_MINT, coin.addr, lamports, 150); // 1.5% slippage
+    if (!quote) return { txHash: null, executedPrice: coin.price, error: 'Jupiter quote failed' };
+
+    const tokensOut = parseFloat(quote.outAmount); // raw units (must divide by decimals later)
+    const outDecimals = parseInt(quote.outputDecimals || quote.swapInfo?.outputMint?.decimals || 6, 10);
+    const tokenAmount = tokensOut / (10 ** outDecimals);
+    console.log(`[REAL] Jupiter: ${solAmount.toFixed(4)} SOL → ${tokenAmount.toLocaleString()} ${coin.symbol}`);
+
+    const swapTx = await jupiterGetSwapTx(quote, keypair.publicKey.toBase58());
+    if (!swapTx) return { txHash: null, executedPrice: coin.price, error: 'Jupiter swap TX failed' };
+
+    const sig = await sendSolanaTransaction(swapTx, keypair);
+    console.log(`[REAL] ✅ ENTRY TX confirmed: https://solscan.io/tx/${sig}`);
+    return { txHash: sig, executedPrice: coin.price, tokenAmount, tokenDecimals: outDecimals };
+  } catch(e) {
+    console.error(`[REAL] ENTRY failed for ${coin.symbol}:`, e.message);
+    return { txHash: null, executedPrice: coin.price, error: e.message };
+  }
 }
 
 async function executeRealExit(pos, wallet, exitPrice) {
-  const privKey = process.env[`${wallet.envKey}_PRIVATE_KEY`] || '';
-  if (!privKey) console.warn(`[REAL] ⚠️  No private key for ${wallet.label}.`);
-  console.log(`[REAL] 🟡 EXIT STUB — ${pos.symbol} | chain: ${pos.chain} | wallet: ${wallet.label} | price: ${exitPrice}`);
-  // TODO: swap execution
-  return { txHash: 'PENDING-REAL', executedPrice: exitPrice };
+  if (pos.chain !== 'solana') {
+    console.warn(`[REAL] Chain "${pos.chain}" not yet supported. Exit logged as paper.`);
+    return { txHash: null, executedPrice: exitPrice, simulated: true };
+  }
+  if (!SolanaWeb3 || !bs58) return { txHash: null, executedPrice: exitPrice, error: 'Solana SDK not installed' };
+
+  const privKeyStr = process.env[`${wallet.envKey}_PRIVATE_KEY`];
+  if (!privKeyStr) {
+    console.warn(`[REAL] ⚠️  No private key for ${wallet.label}. Exit NOT executed.`);
+    return { txHash: null, executedPrice: exitPrice, error: 'Missing private key' };
+  }
+
+  let keypair;
+  try { keypair = parseSolanaKeypair(privKeyStr); }
+  catch(e) { return { txHash: null, executedPrice: exitPrice, error: e.message }; }
+
+  try {
+    // Token amount stored at entry. "remaining" fraction applies for partial exits.
+    const remaining   = pos.remaining || 1.0;
+    const totalTokens = pos.realTokenAmount || 0; // raw units set at entry
+    if (!totalTokens) {
+      console.warn(`[REAL] EXIT ${pos.symbol} — no realTokenAmount on position, cannot sell. Logging as paper.`);
+      return { txHash: null, executedPrice: exitPrice, simulated: true, error: 'No token amount stored' };
+    }
+    const tokensToSell = Math.floor(totalTokens * remaining);
+    console.log(`[REAL] EXIT ${pos.symbol} | ${tokensToSell} raw tokens (${(remaining*100).toFixed(0)}% of ${totalTokens})`);
+
+    const quote = await jupiterQuote(pos.address, SOL_MINT, tokensToSell, 200); // 2% slippage on sell
+    if (!quote) return { txHash: null, executedPrice: exitPrice, error: 'Jupiter exit quote failed' };
+
+    const swapTx = await jupiterGetSwapTx(quote, keypair.publicKey.toBase58());
+    if (!swapTx) return { txHash: null, executedPrice: exitPrice, error: 'Jupiter exit swap TX failed' };
+
+    const sig = await sendSolanaTransaction(swapTx, keypair);
+    console.log(`[REAL] ✅ EXIT TX confirmed: https://solscan.io/tx/${sig}`);
+    return { txHash: sig, executedPrice: exitPrice };
+  } catch(e) {
+    console.error(`[REAL] EXIT failed for ${pos.symbol}:`, e.message);
+    return { txHash: null, executedPrice: exitPrice, error: e.message };
+  }
 }
 
 async function getOpenPositions() {
@@ -500,12 +658,12 @@ async function enterPosition(coin, overrides = {}) {
   const ref  = db.collection('paper_positions').doc();
   const s    = coin.strategy;
   const usePartial = !!s.usePartialProfit;
-  const posSize    = overrides.size || POSITION_SIZE;
-  // Surge momentum: flag if m5 is ripping fast at entry (not applicable to moon bags)
-  const isSurge = !overrides.isMoonBag && (coin.m5Ch || 0) >= SURGE_M5_ENTRY_TRIGGER;
-
   // ── Trading mode & wallet ──────────────────────────────────────────────────
   const cfg        = await getTradingConfig();
+  // positionSize can be overridden via /setsize in Firestore; falls back to env var
+  const posSize    = overrides.size || parseFloat(cfg.positionSize) || POSITION_SIZE;
+  // Surge momentum: flag if m5 is ripping fast at entry (not applicable to moon bags)
+  const isSurge = !overrides.isMoonBag && (coin.m5Ch || 0) >= SURGE_M5_ENTRY_TRIGGER;
   const tradingMode = cfg.tradingMode || 'paper';
   const coinChain  = normaliseChain(coin.chain);
   const wallet     = await selectWalletForChain(coinChain, cfg);
@@ -553,11 +711,13 @@ async function enterPosition(coin, overrides = {}) {
     peakPrice: coin.price,
     // ── Trade mode & wallet ──
     tradingMode,
-    walletId:      wallet ? wallet.id      : null,
-    walletLabel:   wallet ? wallet.label   : null,
-    walletAddress: wallet ? wallet.address : null,
-    walletChain:   wallet ? wallet.chain   : null,
-    realTxEntry:   realTx ? realTx.txHash  : null,
+    walletId:        wallet ? wallet.id      : null,
+    walletLabel:     wallet ? wallet.label   : null,
+    walletAddress:   wallet ? wallet.address : null,
+    walletChain:     wallet ? wallet.chain   : null,
+    realTxEntry:     realTx ? realTx.txHash       : null,
+    // Raw token units received from Jupiter swap — required for executeRealExit
+    realTokenAmount: realTx ? (realTx.tokenAmount || null) : null,
   };
   await ref.set(pos);
   const newPos = { id: ref.id, ...pos };
@@ -639,17 +799,18 @@ async function updatePosition(id, data) {
 
 async function closePosition(id, data) {
   const closeData = { ...data, status: 'closed', closedAt: Date.now() };
-  // Use cached position to build history entry — avoids an extra Firestore read
-  const cached = _posCache?.find(p => p.id === id);
+  // Always update the position status first — this is the critical write
   await db.collection('paper_positions').doc(id).update(closeData);
-  if (cached) {
-    await db.collection('paper_history').add({ ...cached, ...closeData });
-  } else {
+  // Remove from cache immediately so it stops showing as open
+  if (_posCache) _posCache = _posCache.filter(p => p.id !== id);
+  // Write history entry — wrapped so a failure doesn't revert the close
+  try {
+    const cached = _posCache?.find(p => p.id === id); // already removed above, so fetch from Firestore
     const snap = await db.collection('paper_positions').doc(id).get();
     await db.collection('paper_history').add({ ...snap.data(), ...closeData });
+  } catch(e) {
+    console.warn(`[BOT] History write failed for ${id} — position is still closed:`, e.message);
   }
-  // Remove from cache immediately
-  if (_posCache) _posCache = _posCache.filter(p => p.id !== id);
 }
 
 async function getDailyStats() {
@@ -906,15 +1067,56 @@ async function pollTelegramCommands() {
         }
       }
 
+      // ── /clearall — force-close every open position ───────────────────────────
+      if (text === '/clearall') {
+        const allPos = await getOpenPositions();
+        if (!allPos.length) {
+          await sendTelegram('✅ No open positions to clear.');
+        } else {
+          await sendTelegram(`🧹 *CLEARING ALL POSITIONS* (${allPos.length} open)…`);
+          let cleared = 0;
+          for (const pos of allPos) {
+            try {
+              const price   = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
+              const exitPnl = (price - pos.entryPrice) / pos.entryPrice * (pos.size || POSITION_SIZE) * (pos.remaining || 1);
+              const pnl     = (pos.pnl || 0) + exitPnl;
+              await closePosition(pos.id, { exitPrice: price, exitReason: 'MANUAL_CLEARALL', pnl });
+              await updateDailyStats(exitPnl, exitPnl > 0, !!pos.isManual);
+              enteredToday.delete(pos.address);
+              cleared++;
+            } catch(e) {
+              console.error(`[CLEARALL] Failed to close ${pos.symbol} (${pos.id}):`, e.message);
+            }
+          }
+          await sendTelegram(`✅ *Cleared ${cleared}/${allPos.length} positions.*`);
+        }
+      }
+
+      // ── /setsize <amount> — change position size ───────────────────────────────
+      if (text.startsWith('/setsize ')) {
+        const parts  = text.split(' ');
+        const newSize = parseFloat(parts[1]);
+        if (!newSize || newSize < 1) {
+          await sendTelegram('❌ Usage: `/setsize 10` (minimum $1)');
+        } else {
+          await db.collection('paper_config').doc('control').set(
+            { positionSize: newSize }, { merge: true }
+          );
+          await sendTelegram(`✅ *Position size set to $${newSize.toFixed(2)}*\n_New trades will use this size. Existing positions are unchanged._`);
+        }
+      }
+
       // ── /help ─────────────────────────────────────────────────────────────────
       if (text === '/help') {
         await sendTelegram(
           `📋 *MemeScan Bot Commands*\n\n` +
           `/status — P&L, mode, balance\n` +
           `/mode paper — switch to paper trading\n` +
-          `/mode real — switch to real trading\n` +
+          `/mode real — switch to real (Solana) trading\n` +
           `/wallets — list connected wallets\n` +
           `/addfunds 500 — add $500 to balance\n` +
+          `/setsize 10 — set position size to $10\n` +
+          `/clearall — force-close all open positions\n` +
           `/restart — reset daily loss counter\n`
         );
       }
@@ -1159,16 +1361,39 @@ async function monitorPositions() {
   const positions = await getOpenPositions();
   if (!positions.length) return;
 
+  // ── MANUAL CLOSE REQUESTS — processed FIRST, even when bot is halted ──────
+  // This ensures "Sell Now" on the dashboard always works regardless of daily
+  // loss limit state. Without this, closeRequested was silently ignored after
+  // the daily limit return below.
+  for (const pos of positions) {
+    if (!pos.closeRequested) continue;
+    const isManual = !!pos.isManual;
+    const price    = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
+    const exitPnl  = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+    const pnl      = (pos.pnl || 0) + exitPnl;
+    await closePosition(pos.id, { exitPrice: price, exitReason: 'MANUAL_CLOSE', pnl });
+    await updateDailyStats(exitPnl, exitPnl > 0, isManual);
+    enteredToday.delete(pos.address);
+    await sendTelegram(
+      `🚫 *MANUAL CLOSE*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
+      `Exit: $${fmtPrice(price)} | P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*`
+    );
+  }
+
+  // Refresh list after manual closes
+  const remaining_positions = await getOpenPositions();
+  if (!remaining_positions.length) return;
+
   const stats = await getDailyStats();
   if (stats.realizedPnL / stats.startBalance <= DAILY_LOSS_LIMIT) {
     if (!dayHaltedToday) {
       // First time crossing the limit this session — close all and notify
       console.log('[BOT] Daily loss limit hit — closing all positions');
       dayHaltedToday = true;
-      for (const pos of positions) {
+      for (const pos of remaining_positions) {
         const price   = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
         const exitPnl = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
-        const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
+        const pnl     = (pos.pnl || 0) + exitPnl;
         await closePosition(pos.id, { exitPrice: price, exitReason: 'DAILY_LIMIT', pnl });
         await sendTelegram(`🚨 *DAILY LOSS LIMIT*\n*${pos.symbol}* closed. P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
       }
@@ -1185,23 +1410,8 @@ async function monitorPositions() {
     return;
   }
 
-  for (const pos of positions) {
+  for (const pos of remaining_positions) {
     const isManual = !!pos.isManual;
-
-    // ── MANUAL CLOSE REQUEST (user tapped "Sell Now" on dashboard) ─────────
-    if (pos.closeRequested) {
-      const price   = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
-      const exitPnl = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
-      const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
-      await closePosition(pos.id, { exitPrice: price, exitReason: 'MANUAL_CLOSE', pnl });
-      await updateDailyStats(exitPnl, exitPnl > 0, isManual);  // only the final slice (TPs already counted)
-      enteredToday.delete(pos.address);
-      await sendTelegram(
-        `🚫 *MANUAL CLOSE*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-        `Exit: $${fmtPrice(price)} | P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*`
-      );
-      continue;
-    }
 
     // Auto-close after 7 days
     if (Date.now() - pos.enteredAt > 7 * 86400000) {
