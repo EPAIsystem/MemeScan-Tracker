@@ -453,7 +453,8 @@ async function checkAddFunds(cfg) {
       addFunds: 0,
       lastFundsAddedAt: Date.now(),
     });
-    await db.collection('paper_stats').doc(today).set(
+    const { stats: _statsCol } = await getCollections();
+    await db.collection(_statsCol).doc(today).set(
       { startBalance: newBalance, fundsAdded: FieldValue.increment(amount) },
       { merge: true }
     );
@@ -646,7 +647,8 @@ async function executeRealExit(pos, wallet, exitPrice) {
 async function getOpenPositions() {
   const now = Date.now();
   if (_posCache && now - _posCacheAt < POS_TTL) return _posCache;
-  const snap  = await db.collection('paper_positions').where('status','==','open').get();
+  const { positions } = await getCollections();
+  const snap  = await db.collection(positions).where('status','==','open').get();
   _posCache   = snap.docs.map(d => ({ id: d.id, ...d.data() }));
   _posCacheAt = now;
   return _posCache;
@@ -655,7 +657,8 @@ async function getOpenPositions() {
 // ─── FIREBASE HELPERS ─────────────────────────────────────────────────────────
 
 async function enterPosition(coin, overrides = {}) {
-  const ref  = db.collection('paper_positions').doc();
+  const { positions } = await getCollections();
+  const ref  = db.collection(positions).doc();
   const s    = coin.strategy;
   const usePartial = !!s.usePartialProfit;
   // ── Trading mode & wallet ──────────────────────────────────────────────────
@@ -788,8 +791,23 @@ async function processManualQueue() {
   } catch (e) { console.error('[MANUAL QUEUE]', e.message); }
 }
 
+// ─── MODE-AWARE COLLECTION NAMES ─────────────────────────────────────────────
+// Returns the right Firestore collection names for the current trading mode.
+// All position / history / stats writes go through these so Paper and Real
+// data live in separate collections and the dashboard can switch between them.
+async function getCollections() {
+  const cfg  = await getTradingConfig();
+  const real = (cfg.tradingMode || 'paper') === 'real';
+  return {
+    positions: real ? 'real_positions' : 'paper_positions',
+    history:   real ? 'real_history'   : 'paper_history',
+    stats:     real ? 'real_stats'     : 'paper_stats',
+  };
+}
+
 async function updatePosition(id, data) {
-  await db.collection('paper_positions').doc(id).update(data);
+  const { positions } = await getCollections();
+  await db.collection(positions).doc(id).update(data);
   // Patch cache in-place so TP/SL logic sees current state without re-querying
   if (_posCache) {
     const p = _posCache.find(p => p.id === id);
@@ -798,16 +816,16 @@ async function updatePosition(id, data) {
 }
 
 async function closePosition(id, data) {
+  const { positions, history } = await getCollections();
   const closeData = { ...data, status: 'closed', closedAt: Date.now() };
   // Always update the position status first — this is the critical write
-  await db.collection('paper_positions').doc(id).update(closeData);
+  await db.collection(positions).doc(id).update(closeData);
   // Remove from cache immediately so it stops showing as open
   if (_posCache) _posCache = _posCache.filter(p => p.id !== id);
   // Write history entry — wrapped so a failure doesn't revert the close
   try {
-    const cached = _posCache?.find(p => p.id === id); // already removed above, so fetch from Firestore
-    const snap = await db.collection('paper_positions').doc(id).get();
-    await db.collection('paper_history').add({ ...snap.data(), ...closeData });
+    const snap = await db.collection(positions).doc(id).get();
+    await db.collection(history).add({ ...snap.data(), ...closeData });
   } catch(e) {
     console.warn(`[BOT] History write failed for ${id} — position is still closed:`, e.message);
   }
@@ -815,7 +833,8 @@ async function closePosition(id, data) {
 
 async function getDailyStats() {
   const today  = new Date().toISOString().slice(0, 10);
-  const doc    = await db.collection('paper_stats').doc(today).get();
+  const { stats } = await getCollections();
+  const doc    = await db.collection(stats).doc(today).get();
   // Use paperBalance from config if set; fall back to env-based default
   const cfg    = await getTradingConfig();
   const expectedBalance = parseFloat(cfg.paperBalance || 0) || (POSITION_SIZE * MAX_POSITIONS);
@@ -826,13 +845,13 @@ async function getDailyStats() {
       autoPnL: 0, autoTrades: 0, autoWins: 0,
       manualPnL: 0, manualTrades: 0, manualWins: 0,
     };
-    await db.collection('paper_stats').doc(today).set(init);
+    await db.collection(stats).doc(today).set(init);
     return init;
   }
   const data = doc.data();
   // Auto-correct startBalance if balance was topped up today
   if (data.startBalance !== expectedBalance) {
-    await db.collection('paper_stats').doc(today).update({ startBalance: expectedBalance });
+    await db.collection(stats).doc(today).update({ startBalance: expectedBalance });
     data.startBalance = expectedBalance;
     console.log(`[BOT] startBalance updated: $${data.startBalance} → $${expectedBalance}`);
   }
@@ -841,6 +860,7 @@ async function getDailyStats() {
 
 async function updateDailyStats(pnl, isWin, isManual = false) {
   const today = new Date().toISOString().slice(0,10);
+  const { stats } = await getCollections();
   const base = {
     realizedPnL: FieldValue.increment(pnl),
     trades:      FieldValue.increment(1),
@@ -856,7 +876,7 @@ async function updateDailyStats(pnl, isWin, isManual = false) {
     base.autoTrades = FieldValue.increment(1);
     base.autoWins   = FieldValue.increment(isWin ? 1 : 0);
   }
-  await db.collection('paper_stats').doc(today).set(base, { merge: true });
+  await db.collection(stats).doc(today).set(base, { merge: true });
 }
 
 // ─── PRICE FETCHER ────────────────────────────────────────────────────────────
@@ -896,11 +916,12 @@ async function checkDayRestart() {
 
     // ── Perform restart ──
     const today = new Date().toISOString().slice(0, 10);
-    const statsSnap = await db.collection('paper_stats').doc(today).get();
+    const { stats: _statsCol2 } = await getCollections();
+    const statsSnap = await db.collection(_statsCol2).doc(today).get();
     const prevPnL   = statsSnap.exists ? (statsSnap.data().realizedPnL || 0) : 0;
 
     // Zero out today's P&L; accumulate total loss across restarts for transparency
-    await db.collection('paper_stats').doc(today).set({
+    await db.collection(_statsCol2).doc(today).set({
       realizedPnL: 0, autoPnL: 0, manualPnL: 0,
       restartCount:   FieldValue.increment(1),
       cumulativeLoss: FieldValue.increment(prevPnL < 0 ? prevPnL : 0),
@@ -1166,7 +1187,8 @@ async function openSurgeReinvest(pos, exitPrice, totalPnL) {
   };
 
   // ── Moon bag ─────────────────────────────────────────────────────────────
-  const mbRef = db.collection('paper_positions').doc();
+  const { positions: _posCol } = await getCollections();
+  const mbRef = db.collection(_posCol).doc();
   const moonBagDoc = {
     ...baseDoc, size: moonBagAmt,
     tp1: exitPrice * 1.30, tp2: exitPrice * 1.80, tp3: exitPrice * 3.00,
@@ -1178,7 +1200,7 @@ async function openSurgeReinvest(pos, exitPrice, totalPnL) {
   // ── Normal TP position ────────────────────────────────────────────────────
   let normalRef = null;
   if (slotsLeft >= 2) {
-    normalRef = db.collection('paper_positions').doc();
+    normalRef = db.collection(_posCol).doc();
     const normalDoc = {
       ...baseDoc, size: normalAmt,
       tp1: exitPrice * s.tp1x, tp2: exitPrice * s.tp2x, tp3: exitPrice * s.tp3x,

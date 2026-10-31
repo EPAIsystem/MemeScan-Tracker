@@ -320,6 +320,21 @@ tbody tr:hover td { background: var(--bg3); }
 .manual-item-del:hover { color: var(--red); }
 .manual-empty { font-size: 12px; color: var(--fg3); text-align: center; padding: 8px 0; }
 
+/* ── Mode banner ─────────────────────────────────────────────────────────────── */
+.mode-banner {
+  border-radius: 8px; padding: 8px 14px;
+  font-size: 12px; font-weight: 600; text-align: center;
+  margin-bottom: 16px; letter-spacing: .04em;
+}
+.paper-banner { background: rgba(79,110,247,.1); color: var(--accent); border: 1px solid rgba(79,110,247,.25); }
+.real-banner  { background: rgba(243,150,42,.12); color: #f3962a; border: 1px solid rgba(243,150,42,.4);
+                animation: pulse-real 2.5s ease-in-out infinite; }
+@keyframes pulse-real {
+  0%,100% { box-shadow: 0 0 0 0 rgba(243,150,42,.15); }
+  50%      { box-shadow: 0 0 0 6px rgba(243,150,42,0); }
+}
+.header-real { border-bottom-color: rgba(243,150,42,.3) !important; }
+
 /* ── Trading controls panel ──────────────────────────────────────────────────── */
 .trade-ctrl-panel {
   background: var(--bg2); border: 1px solid var(--border);
@@ -510,6 +525,9 @@ const S = {
   wallets: [],        // paper_config/wallets/slots docs
   togglingMode: false,
   editingSize: false,
+  posCollection:  'paper_positions', // switches with tradingMode
+  histCollection: 'paper_history',
+  statsCollection:'paper_stats',
 };
 
 // ── Config store ──────────────────────────────────────────────────────────────
@@ -635,11 +653,17 @@ async function loadData() {
   render();
   try {
     const today = new Date().toISOString().slice(0, 10);
-    const [positions, history, statsDoc, ctrlDoc, manualQueue] = await Promise.all([
-      fsQuery(S.config, 'paper_positions', 'status', 'open'),
-      fsQuery(S.config, 'paper_history'),
-      fsGet(S.config, 'paper_stats', today),
-      fsGet(S.config, 'paper_config', 'control'),
+    // Fetch control doc first so we know the mode before loading positions
+    const ctrlDoc = await fsGet(S.config, 'paper_config', 'control');
+    const mode = (ctrlDoc?.tradingMode) || 'paper';
+    S.posCollection   = mode === 'real' ? 'real_positions'  : 'paper_positions';
+    S.histCollection  = mode === 'real' ? 'real_history'    : 'paper_history';
+    S.statsCollection = mode === 'real' ? 'real_stats'      : 'paper_stats';
+
+    const [positions, history, statsDoc, manualQueue] = await Promise.all([
+      fsQuery(S.config, S.posCollection, 'status', 'open'),
+      fsQuery(S.config, S.histCollection),
+      fsGet(S.config, S.statsCollection, today),
       fsQuery(S.config, 'paper_manual_queue'),
     ]);
     S.positions = positions;
@@ -657,7 +681,7 @@ async function loadData() {
       const d = new Date(); d.setDate(d.getDate() - i);
       const dateStr = d.toISOString().slice(0, 10);
       dailyFetches.push(
-        fsGet(S.config, 'paper_stats', dateStr)
+        fsGet(S.config, S.statsCollection, dateStr)
           .then(doc => doc && (doc.trades > 0) ? { ...doc, date: dateStr } : null)
           .catch(() => null)
       );
@@ -818,18 +842,24 @@ function render() {
     </div>`;
   }
 
+  const isRealMode = (S.control.tradingMode || 'paper') === 'real';
+
   const errHTML = S.error
     ? `<div class="err-box">⚠ ${S.error}<br><small>Check your API key and Firestore security rules.</small></div>`
     : '';
 
+  const modeBanner = isRealMode
+    ? `<div class="mode-banner real-banner">💰 REAL TRADING ACTIVE — funds are real</div>`
+    : `<div class="mode-banner paper-banner">📄 PAPER TRADING — simulated, no real funds</div>`;
+
   root.innerHTML = `
-    <div id="app">
-      <header>
+    <div id="app" data-mode="${isRealMode ? 'real' : 'paper'}">
+      <header class="${isRealMode ? 'header-real' : ''}">
         <div class="logo-row">
-          <div class="logo-icon">📊</div>
+          <div class="logo-icon">${isRealMode ? '💰' : '📊'}</div>
           <div>
             <div class="logo-name">MemeScan PRO Bot</div>
-            <div class="logo-sub">Paper Trading Dashboard</div>
+            <div class="logo-sub">${isRealMode ? 'Real Trading Dashboard' : 'Paper Trading Dashboard'}</div>
           </div>
         </div>
         <div class="header-right">
@@ -842,12 +872,13 @@ function render() {
       </header>
 
       ${errHTML}
+      ${modeBanner}
 
       <div class="stats-grid">
         <div class="stat-tile">
           <div class="stat-label">Portfolio</div>
           <div class="stat-val c-fg">$${portfolio.toFixed(2)}</div>
-          <div class="stat-note">Paper balance</div>
+          <div class="stat-note">${isRealMode ? 'Real balance' : 'Paper balance'}</div>
         </div>
         <div class="stat-tile">
           <div class="stat-label">Today's P&amp;L</div>
@@ -988,7 +1019,7 @@ async function confirmSell(posId) {
   S.closingPos[posId] = 'closing';
   render();
   try {
-    await fsSet(S.config, 'paper_positions', posId, { closeRequested: true });
+    await fsSet(S.config, S.posCollection, posId, { closeRequested: true });
     // Wait a moment then reload — bot will pick it up within 5s
     setTimeout(() => { delete S.closingPos[posId]; loadData(); }, 6000);
   } catch (e) {
@@ -1010,7 +1041,7 @@ async function toggleTP(posId, currentlyDisabled) {
   if (!S.config) return;
   const newVal = !currentlyDisabled;
   try {
-    await fsSet(S.config, 'paper_positions', posId, { tpDisabled: newVal });
+    await fsSet(S.config, S.posCollection, posId, { tpDisabled: newVal });
     loadData();
   } catch (e) {
     S.error = 'TP toggle failed: ' + e.message;
@@ -1180,11 +1211,19 @@ async function toggleMode(newMode) {
     const existing = await fsGet(S.config, 'paper_config', 'control') || {};
     await fsSet(S.config, 'paper_config', 'control', { ...existing, tradingMode: newMode });
     S.control = { ...S.control, tradingMode: newMode };
+    // Update collection pointers immediately before full reload
+    S.posCollection   = newMode === 'real' ? 'real_positions'  : 'paper_positions';
+    S.histCollection  = newMode === 'real' ? 'real_history'    : 'paper_history';
+    S.statsCollection = newMode === 'real' ? 'real_stats'      : 'paper_stats';
   } catch (e) {
     S.error = 'Mode switch failed: ' + e.message;
+    S.togglingMode = false;
+    render();
+    return;
   }
   S.togglingMode = false;
-  render();
+  // Reload everything so positions/history/stats reflect the new mode
+  await loadData();
 }
 
 async function saveSize() {
