@@ -26,7 +26,7 @@ const TELEGRAM_TOKEN  = process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_T
 const TELEGRAM_CHAT   = process.env.TELEGRAM_CHAT_ID   || process.env.TELEGRAM_CHAT;
 const POSITION_SIZE   = parseFloat(process.env.POSITION_SIZE || '100');
 const MAX_POSITIONS   = 10;
-const MIN_SCORE       = 60;
+const MIN_SCORE       = 72;  // raised from 60 — only enter high-confidence signals
 const DAILY_LOSS_LIMIT= -0.30;
 const SCAN_INTERVAL   = 15000;  // 15s — entry scanner
 const PRICE_CHECK     =  5000;  //  5s — position monitor
@@ -1741,9 +1741,10 @@ async function scanForEntries() {
   const openStrategies = STRATEGIES.filter(s => slotCount[s.id] < s.maxSlots);
   if (!openStrategies.length) return;
 
-  // ── Dynamic score threshold — fill slots aggressively when many are empty ──
-  // 6+ vacant → 45  |  3–5 vacant → 50  |  1–2 vacant → normal 60
-  const scoreThreshold = vacantSlots >= 6 ? 45 : vacantSlots >= 3 ? 50 : MIN_SCORE;
+  // ── Score threshold — never lower than MIN_SCORE regardless of vacant slots ──
+  // Resist the urge to fill slots with low-quality coins. Quality > quantity.
+  // Slight relief (−5) when 5+ slots empty, but never below MIN_SCORE.
+  const scoreThreshold = vacantSlots >= 5 ? Math.max(MIN_SCORE, MIN_SCORE - 5) : MIN_SCORE;
   if (vacantSlots >= 3) console.log(`[BOT] ${vacantSlots} slots vacant — score threshold: ${scoreThreshold}`);
 
   // Fetch candidates from DexScreener
@@ -1818,7 +1819,11 @@ async function scanForEntries() {
   }
 
   // Score and match each candidate to a strategy
-  const openAddrs = new Set(positions.map(p => p.address));
+  // Use both address and mint fields to catch duplicates regardless of which was stored
+  const openAddrs = new Set([
+    ...positions.map(p => p.address).filter(Boolean),
+    ...positions.map(p => p.mint).filter(Boolean),
+  ]);
   const matches   = [];
   let nearMissCount = 0;
 
