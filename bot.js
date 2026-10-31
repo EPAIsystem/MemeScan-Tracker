@@ -785,6 +785,81 @@ async function processManualQueue() {
         const price = parseFloat(pair.priceUsd || 0);
         if (!price) throw new Error('No price available');
 
+        // ── PRO Signal path: run bot's own scoring ──────────────────────────────
+        // Source 'memscan_pro_signal': the CA came from a forwarded PRO signal.
+        // Bot re-evaluates it with detectStrategy() — only enters if score ≥ MIN_SCORE.
+        // Source 'manual_command' or undefined: direct manual override, enters immediately.
+        if (item.source === 'memscan_pro_signal') {
+          // Build current slot counts from open positions
+          const slotCount = {};
+          for (const s of STRATEGIES) slotCount[s.id] = 0;
+          for (const p of positions) {
+            if (p.strategyId != null) slotCount[p.strategyId] = (slotCount[p.strategyId] || 0) + 1;
+          }
+          const openStrategies = STRATEGIES.filter(s => slotCount[s.id] < s.maxSlots);
+
+          // Skip: already in portfolio / on cooldown / no strategy slots
+          if (enteredToday.has(item.address) || recentSLCoins.has(item.address)) {
+            await doc.ref.update({ status: 'skipped', reason: 'cooldown', processedAt: Date.now() });
+            console.log(`[PRO-BRIDGE] ${item.address.slice(0, 8)} skipped — cooldown`);
+            continue;
+          }
+          if (!openStrategies.length) {
+            await doc.ref.update({ status: 'skipped', reason: 'no_open_strategies', processedAt: Date.now() });
+            await sendTelegram(`⏭️ PRO signal (${item.proScore}/100) skipped — all strategy slots full.`);
+            continue;
+          }
+
+          // Run bot's scoring algorithm
+          const result = detectStrategy(pair, openStrategies);
+          const botScore = result?.score ?? 0;
+
+          if (!result || botScore < MIN_SCORE) {
+            const reason = result ? `score_${botScore}_below_${MIN_SCORE}` : 'no_strategy_match';
+            await doc.ref.update({ status: 'rejected', reason, botScore, processedAt: Date.now() });
+            await sendTelegram(
+              `❌ *PRO Signal Rejected*\n` +
+              `PRO: ${item.proScore}/100 → Bot: ${botScore}/${MIN_SCORE} needed\n` +
+              `\`${item.address.slice(0, 8)}…${item.address.slice(-6)}\``
+            );
+            console.log(`[PRO-BRIDGE] ${item.address.slice(0, 8)} rejected — bot score ${botScore}`);
+            continue;
+          }
+
+          // Bot approved — enter with bot-determined strategy
+          const coin = {
+            symbol:   pair.baseToken?.symbol || '?',
+            name:     pair.baseToken?.name   || '',
+            addr:     item.address,
+            chain:    pair.chainId,
+            price,
+            score:    botScore,
+            dexUrl:   `https://dexscreener.com/${pair.chainId}/${pair.pairAddress}`,
+            strategy: result.strategy,
+            m5Ch:     result.m5Ch,
+            ageMinutes: result.ageMinutes,
+          };
+          const pos = await enterPosition(coin);
+          if (!pos) {
+            // Real mode with no matching wallet for this chain
+            await doc.ref.update({ status: 'skipped', reason: 'no_wallet', processedAt: Date.now() });
+            continue;
+          }
+          enteredToday.add(item.address);
+          await doc.ref.update({ status: 'entered', enteredPositionId: pos.id, botScore, processedAt: Date.now() });
+          positions.push(pos);
+          await sendTelegram(
+            `🤖 *PRO SIGNAL ENTRY*\n` +
+            `PRO: ${item.proScore}/100 · Bot: ${botScore}/100\n` +
+            `*${coin.symbol}* @ ${fmtPrice(price)}\n` +
+            `Strategy: ${result.strategy.label}\n` +
+            `💰 TP3: ${fmtPrice(pos.tp3)} · SL: ${fmtPrice(pos.sl)}`
+          );
+          console.log(`[PRO-BRIDGE] ${coin.symbol} entered — bot score ${botScore}, strategy ${result.strategy.label}`);
+          continue; // ← PRO path fully handled; skip standard manual section
+        }
+
+        // ── Standard manual entry (dashboard / /queue command) ──────────────────
         const coin = {
           symbol: item.symbol || pair.baseToken?.symbol || '?',
           name:   pair.baseToken?.name || '',
@@ -1018,8 +1093,9 @@ async function pollTelegramCommands() {
 
     for (const update of d.result) {
       telegramOffset = update.update_id + 1;
-      const text   = (update.message?.text || '').trim().toLowerCase();
-      const chatId = String(update.message?.chat?.id || '');
+      const text    = (update.message?.text || '').trim().toLowerCase();
+      const rawText = (update.message?.text || '').trim();          // preserve case for PRO signal parser
+      const chatId  = String(update.message?.chat?.id || '');
 
       if (chatId !== String(TELEGRAM_CHAT)) continue; // ignore strangers
 
@@ -1172,8 +1248,87 @@ async function pollTelegramCommands() {
           `/addfunds 500 — add $500 to balance\n` +
           `/setsize 10 — set position size to $10\n` +
           `/clearall — force-close all open positions\n` +
-          `/restart — reset daily loss counter\n`
+          `/restart — reset daily loss counter\n` +
+          `/queue <CA> — evaluate a contract address now\n\n` +
+          `💡 *MemeScan PRO Bridge*\n` +
+          `Forward any PRO signal here → bot auto-evaluates if PRO score ≥ 80`
         );
+      }
+
+      // ── /queue <CA> — manually queue a contract address for immediate evaluation ──
+      if (text.startsWith('/queue ')) {
+        const ca = text.split(/\s+/)[1]?.trim();
+        if (!ca || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(ca)) {
+          await sendTelegram(
+            `❌ Usage: \`/queue <contract_address>\`\n` +
+            `Example: \`/queue CvRJ8MrnBpump\`\n` +
+            `_Bot will evaluate with its own scoring (needs ≥ ${MIN_SCORE})_`
+          );
+        } else {
+          const existSnap = await db.collection('paper_manual_queue')
+            .where('address', '==', ca).where('status', '==', 'pending').get();
+          if (!existSnap.empty) {
+            await sendTelegram(`ℹ️ \`${ca.slice(0, 8)}…${ca.slice(-6)}\` is already queued.`);
+          } else {
+            await db.collection('paper_manual_queue').add({
+              address: ca, status: 'pending',
+              source: 'manual_command',
+              queuedAt: Date.now(),
+            });
+            await sendTelegram(
+              `🔍 *Queued for evaluation*\n` +
+              `\`${ca.slice(0, 8)}…${ca.slice(-6)}\`\n` +
+              `_Bot will enter only if it scores ≥ ${MIN_SCORE}_`
+            );
+          }
+        }
+      }
+
+      // ── MemeScan PRO Signal Bridge ─────────────────────────────────────────────
+      // Forward (or send) any MemeScan PRO signal to this chat.
+      // Bot queues the CA for its own evaluation when the PRO score is ≥ 80.
+      // Score < 80 is silently ignored so the chat stays clean.
+      if (rawText.includes('MEMESCAN PRO SIGNAL') || rawText.includes('MemeScan PRO')) {
+        try {
+          const scoreMatch = rawText.match(/Score:\s*(\d+)\s*\/\s*100/i);
+          const proScore   = scoreMatch ? parseInt(scoreMatch[1], 10) : 0;
+
+          if (proScore >= 80) {
+            // Extract CA — Solana base58 address, typically 43-44 chars
+            const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
+            let ca = null;
+            for (const line of lines) {
+              if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(line)) { ca = line; break; }
+            }
+
+            if (ca) {
+              const existSnap = await db.collection('paper_manual_queue')
+                .where('address', '==', ca).where('status', '==', 'pending').get();
+              if (existSnap.empty) {
+                await db.collection('paper_manual_queue').add({
+                  address: ca, status: 'pending',
+                  source: 'memscan_pro_signal',
+                  proScore,
+                  queuedAt: Date.now(),
+                });
+                await sendTelegram(
+                  `🤖 *PRO Signal → Bot Queue*\n` +
+                  `PRO: ${proScore}/100 → bot evaluating with its own scoring\n` +
+                  `CA: \`${ca.slice(0, 8)}…${ca.slice(-6)}\`\n` +
+                  `_Entry only if bot score ≥ ${MIN_SCORE}_`
+                );
+              } else {
+                await sendTelegram(`ℹ️ PRO signal (${proScore}/100) — CA already queued, bot is on it.`);
+              }
+            } else {
+              await sendTelegram(
+                `⚠️ PRO signal (${proScore}/100) found but couldn't extract the contract address.\n` +
+                `Use \`/queue <CA>\` to add it manually.`
+              );
+            }
+          }
+          // score < 80 → silent ignore
+        } catch(e) { console.error('[PRO-BRIDGE]', e.message); }
       }
     }
   } catch(e) {
