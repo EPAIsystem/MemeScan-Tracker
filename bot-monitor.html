@@ -1235,39 +1235,25 @@ function addPositionModalHTML() {
       <div class="mfield">
         <label>Contract Address (Mint) *</label>
         <input id="ap-mint" placeholder="Solana token mint address…">
-        <div class="mfield-hint">Used to fetch live price. Required for TP/SL to work.</div>
-      </div>
-
-      <div class="mfield-row">
-        <div class="mfield">
-          <label>Entry Price (USD) *</label>
-          <input id="ap-entry" type="number" step="any" min="0" placeholder="0.0000234">
-          <div class="mfield-hint">Price you paid per token</div>
-        </div>
-        <div class="mfield">
-          <label>SOL Spent *</label>
-          <input id="ap-sol" type="number" step="any" min="0" placeholder="0.05">
-          <div class="mfield-hint">How much SOL you spent</div>
-        </div>
+        <div class="mfield-hint">Used to fetch live price for TP/SL tracking</div>
       </div>
 
       <div class="mfield">
         <label>Token Amount *</label>
         <input id="ap-amount" type="number" step="any" min="0" placeholder="e.g. 1500000">
-        <div class="mfield-hint">Number of tokens you hold</div>
+        <div class="mfield-hint">Number of tokens you currently hold</div>
       </div>
 
-      <div class="mfield-row">
-        <div class="mfield">
-          <label>Stop Loss Price</label>
-          <input id="ap-sl" type="number" step="any" min="0" placeholder="auto (-20%)">
-          <div class="mfield-hint">Leave blank = entry × 0.80</div>
-        </div>
-        <div class="mfield">
-          <label>Take Profit 1</label>
-          <input id="ap-tp1" type="number" step="any" min="0" placeholder="auto (+50%)">
-          <div class="mfield-hint">Leave blank = entry × 1.50</div>
-        </div>
+      <div class="mfield">
+        <label>Entry Price (USD) — optional</label>
+        <input id="ap-entry" type="number" step="any" min="0" placeholder="Leave blank → use current price">
+        <div class="mfield-hint">If blank, today's live price is used as baseline. P&amp;L will be calculated from now.</div>
+      </div>
+
+      <div class="mfield">
+        <label>SOL Spent — optional</label>
+        <input id="ap-sol" type="number" step="any" min="0" placeholder="e.g. 0.05">
+        <div class="mfield-hint">Original cost — only needed for cost-basis tracking</div>
       </div>
 
       <div class="mfield">
@@ -1294,47 +1280,68 @@ async function submitAddPosition() {
   if (S.addPosSaving) return;
   S.addPosErr = '';
 
-  const sym    = (document.getElementById('ap-symbol')?.value || '').trim().toUpperCase();
-  const name   = (document.getElementById('ap-name')?.value   || '').trim();
-  const mint   = (document.getElementById('ap-mint')?.value   || '').trim();
-  const entry  = parseFloat(document.getElementById('ap-entry')?.value);
-  const sol    = parseFloat(document.getElementById('ap-sol')?.value);
-  const amount = parseFloat(document.getElementById('ap-amount')?.value);
-  const slVal  = document.getElementById('ap-sl')?.value;
-  const tp1Val = document.getElementById('ap-tp1')?.value;
+  const sym      = (document.getElementById('ap-symbol')?.value || '').trim().toUpperCase();
+  const name     = (document.getElementById('ap-name')?.value   || '').trim();
+  const mint     = (document.getElementById('ap-mint')?.value   || '').trim();
+  const amount   = parseFloat(document.getElementById('ap-amount')?.value);
+  const entryRaw = document.getElementById('ap-entry')?.value.trim();
+  const solRaw   = document.getElementById('ap-sol')?.value.trim();
   const walletId = document.getElementById('ap-wallet')?.value || 'wallet1';
 
   if (!sym)              { S.addPosErr = 'Symbol is required.'; render(); return; }
-  if (!mint)             { S.addPosErr = 'Contract address is required.'; render(); return; }
-  if (isNaN(entry) || entry <= 0) { S.addPosErr = 'Enter a valid entry price.'; render(); return; }
-  if (isNaN(sol)   || sol   <= 0) { S.addPosErr = 'Enter how much SOL you spent.'; render(); return; }
-  if (isNaN(amount)|| amount<= 0) { S.addPosErr = 'Enter the token amount you hold.'; render(); return; }
-
-  const sl  = slVal  && parseFloat(slVal)  > 0 ? parseFloat(slVal)  : entry * 0.80;
-  const tp1 = tp1Val && parseFloat(tp1Val) > 0 ? parseFloat(tp1Val) : entry * 1.50;
-  const tp2 = entry * 2.0;
-  const tp3 = entry * 3.0;
+  if (!mint)             { S.addPosErr = 'Contract address (mint) is required.'; render(); return; }
+  if (isNaN(amount) || amount <= 0) { S.addPosErr = 'Token amount is required.'; render(); return; }
 
   S.addPosSaving = true; render();
 
   try {
+    // Resolve entry price: use provided value OR fetch current live price
+    let entry = entryRaw ? parseFloat(entryRaw) : null;
+    if (!entry || entry <= 0) {
+      // Try to get live price from DexScreener
+      try {
+        const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+        if (r.ok) {
+          const d = await r.json();
+          const pair = d.pairs?.[0];
+          if (pair?.priceUsd) entry = parseFloat(pair.priceUsd);
+        }
+      } catch { /* ignore — entry stays null */ }
+    }
+    if (!entry || entry <= 0) {
+      // Fallback: use cached price if we already have it
+      entry = S.prices[mint] || null;
+    }
+    if (!entry || entry <= 0) {
+      S.addPosErr = 'Could not fetch current price. Please enter the entry price manually.';
+      S.addPosSaving = false; render(); return;
+    }
+
+    const sol = solRaw ? parseFloat(solRaw) : null;
+    const sl  = entry * 0.80;
+    const tp1 = entry * 1.50;
+    const tp2 = entry * 2.0;
+    const tp3 = entry * 3.0;
+    const noKnownEntry = !entryRaw; // flag so UI can note P&L is from-now
+
     const doc = {
-      symbol:     sym,
-      name:       name || sym,
-      address:    mint,
-      mint:       mint,
-      entryPrice: entry,
-      solSpent:   sol,
-      amount:     amount,
-      size:       sol * (S.prices[mint] || entry) || sol, // approx USD size
+      symbol:        sym,
+      name:          name || sym,
+      address:       mint,
+      mint:          mint,
+      entryPrice:    entry,
+      solSpent:      sol || 0,
+      amount:        amount,
+      size:          sol ? sol * entry : amount * entry,
       sl, tp1, tp2, tp3,
       walletId,
-      chain:      'solana',
-      status:     'open',
-      source:     'manual',
-      entryTime:  Date.now(),
-      remaining:  1,
-      score:      null,
+      chain:         'solana',
+      status:        'open',
+      source:        'manual',
+      entryFromNow:  noKnownEntry, // true = entry price is today's price, not original buy price
+      entryTime:     Date.now(),
+      remaining:     1,
+      score:         null,
       strategyLabel: 'MANUAL',
     };
     await fsAdd(S.config, S.posCollection, doc);
