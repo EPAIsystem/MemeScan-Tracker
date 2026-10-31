@@ -144,6 +144,18 @@ header {
 }
 @keyframes pulse-red { 0%,100% { transform: scale(1) } 50% { transform: scale(1.06) } }
 .sell-btn:disabled { opacity: .4; cursor: not-allowed; }
+.del-pos-btn {
+  background: rgba(121,136,166,.08); color: var(--fg3);
+  border: 1px solid rgba(121,136,166,.2); border-radius: 6px;
+  font-size: 13px; padding: 5px 8px; cursor: pointer; transition: background .15s;
+}
+.del-pos-btn:hover { background: rgba(121,136,166,.18); color: var(--fg2); }
+.del-pos-btn.confirm-del {
+  background: rgba(232,83,74,.15); color: var(--red);
+  border-color: rgba(232,83,74,.4); font-size: 11px; font-weight:600;
+  animation: pulse-red .4s ease;
+}
+.del-pos-btn:disabled { opacity: .4; cursor: not-allowed; }
 .tp-btn {
   background: rgba(79,110,247,.12); color: var(--blue);
   border: 1px solid rgba(79,110,247,.3); border-radius: 6px;
@@ -1054,6 +1066,7 @@ function posCard(pos) {
         <div style="display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end">
           ${tpBtn(pos)}
           ${sellBtn(pos)}
+          ${deleteBtn(pos)}
         </div>
       </div>
     </div>
@@ -1095,6 +1108,45 @@ async function confirmSell(posId) {
   } catch (e) {
     S.error = 'Sell request failed: ' + e.message;
     delete S.closingPos[posId];
+    render();
+  }
+}
+
+// ── Delete position (remove from tracking without selling) ───────────────────
+function deleteBtn(pos) {
+  const state = S.closingPos[pos._id + '_del'];
+  if (state === 'deleting') {
+    return `<button class="del-pos-btn" disabled>…</button>`;
+  }
+  if (state === 'confirm') {
+    return `<button class="del-pos-btn confirm-del" onclick="confirmDelete('${pos._id}')">Remove?</button>`;
+  }
+  return `<button class="del-pos-btn" onclick="requestDelete('${pos._id}')" title="Remove from tracking (does NOT sell tokens)">🗑</button>`;
+}
+
+function requestDelete(posId) {
+  S.closingPos[posId + '_del'] = 'confirm';
+  render();
+  setTimeout(() => {
+    if (S.closingPos[posId + '_del'] === 'confirm') {
+      delete S.closingPos[posId + '_del'];
+      render();
+    }
+  }, 4000);
+}
+
+async function confirmDelete(posId) {
+  if (!S.config || S.closingPos[posId + '_del'] === 'deleting') return;
+  S.closingPos[posId + '_del'] = 'deleting';
+  render();
+  try {
+    await fsDelete(S.config, S.posCollection, posId);
+    delete S.closingPos[posId + '_del'];
+    S.positions = S.positions.filter(p => p._id !== posId);
+    render();
+  } catch (e) {
+    S.error = 'Delete failed: ' + e.message;
+    delete S.closingPos[posId + '_del'];
     render();
   }
 }
