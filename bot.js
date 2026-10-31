@@ -231,22 +231,32 @@ function detectStrategy(pair, openStrategies) {
   // DEAD COIN GUARD: reject coins where the 1h price change is missing or effectively flat.
   //
   // ch1 === null       → DexScreener returned no h1 data (coin too new / data gap)
-  // Math.abs(ch1) < 0.5 → displays as "0.0%" on the signal — price has not moved
-  //                        meaningfully in the last hour, i.e. no real trading activity.
+  // Math.abs(ch1) < 0.5 → displays as "0.0%" on the signal — price has not moved in the last hour.
   //
-  // YOUNG COIN EXEMPTION (60–240 min old):
-  //   For 1–4 hour coins the h1 window covers the coin's ENTIRE life. A coin that
-  //   launched flat and is NOW pumping can have h1 near 0% even as m5 surges.
-  //   Allow through if m5Ch >= 2% (confirming live price action right now).
-  //   Without this, strong 1–4 hour coins are silently blocked.
+  // THREE EXEMPTIONS (flat h1 is NOT always a dead coin):
+  //
+  //   1. YOUNG COIN (60–240 min old) with strong m5:
+  //      h1 covers the coin's entire life, so a coin pumping NOW can show ~0% h1.
+  //      Allow if m5Ch ≥ 2%.
+  //
+  //   2. BOTTOM BOUNCE candidate (ch24 ≤ -10%) with stabilising h1:
+  //      A coin that dropped -25% in 24h and is now flat in h1 has STOPPED falling.
+  //      That stabilisation is the SIGNAL for a bounce — rejecting it misses BNB-type
+  //      setups that MemeScan PRO rates 80+ (oversold + buyers coming in).
+  //      Allow if buyPct ≥ 50% (buyers are still present) and liq ≥ 10000.
+  //
+  //   3. Strong m5 on any coin:
+  //      If m5Ch ≥ 3% regardless of h1, the coin is moving RIGHT NOW.
+  //
   if (ch1 === null) {
-    // Young coin with strong m5 → allow despite missing h1
-    if (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2) { /* pass through */ }
-    else return null; // no h1 data and no m5 rescue
+    const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2)
+              || (m5Ch >= 3);
+    if (!pass) return null;
   } else if (Math.abs(ch1) < 0.5) {
-    // Flat h1 — could be dead coin. Check for young coin with live m5 activity.
-    if (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2) { /* pass through */ }
-    else return null; // rounds to 0.0% h1 → dead / inactive
+    const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2) // young coin pumping
+              || (ch24 <= -10 && buyPct >= 50 && liq >= 10000)        // bottom bounce stabilising
+              || (m5Ch >= 3);                                           // actively surging now
+    if (!pass) return null;
   }
   const dexId      = pair.dexId || '';
   const isPumpFun  = dexId === 'pump-fun';
@@ -1762,16 +1772,19 @@ async function scanForEntries() {
   const keywords = [
     // classic meme
     'meme','pepe','dog','cat','inu','shib','doge','frog','chad',
-    // trending/viral
+    // trending/viral & influencer names
     'pump','moon','elon','trump','wojak','grok','ai',
-    // broader ecosystem (catches non-meme coins)
+    'ansem','alpha','bull','bear','black',
+    // broader ecosystem
     'sol','baby','floki','coin','token',
-    // catch newer launches
+    // newer launches
     'new','launch','fair',
+    // ecosystem & DeFi (always included — ANSEM-type coins won't match meme keywords)
+    'defi','swap','yield','nft','gaming','web3','dao','ape','based','surge',
   ];
-  // When urgently filling (5+ vacant), add even more diverse terms
+  // When urgently filling (5+ vacant), cast an even wider net
   if (vacantSlots >= 5) {
-    keywords.push('defi','swap','yield','nft','gaming','web3','dao','ape','based','eth');
+    keywords.push('eth','avax','bonk','wif','trump','bitcoin','hot','fire','gem','100x');
   }
   const seen = new Set();
   const candidates = [];
@@ -1809,8 +1822,8 @@ async function scanForEntries() {
       const d = JSON.parse(r.body);
       // API returns array of {chainId, tokenAddress, amount, ...}
       const boosted = Array.isArray(d) ? d : [];
-      // Filter to Solana only, take top 25 per endpoint
-      const solanaBoosted = boosted.filter(b => b.chainId === 'solana').slice(0, 25);
+      // Filter to Solana only, take top 50 per endpoint (was 25 — doubled to catch mid-range trending coins)
+      const solanaBoosted = boosted.filter(b => b.chainId === 'solana').slice(0, 50);
       console.log(`[SCAN] Boosted (${boostEp.split('/')[1]}): ${boosted.length} total, ${solanaBoosted.length} Solana`);
       for (const b of solanaBoosted) {
         const addr = b.tokenAddress || '';
@@ -1830,7 +1843,25 @@ async function scanForEntries() {
     } catch(e) { console.log(`[SCAN] Boosted endpoint error (${boostEp}): ${e.message}`); }
   }
 
-  console.log(`[SCAN] Fetched ${candidates.length} unique candidates via ${keywords.length} keywords + boosts`);
+  // ── DexScreener Top Solana Pairs (by volume) ─────────────────────────────────
+  // Catches high-volume coins that don't match any keyword and aren't in the boosted
+  // list — e.g. "ANSEM / The Black Bear" with $1M daily volume.
+  // DexScreener's /latest/dex/tokens/{chain} returns top pairs by volume for a chain.
+  // We sweep the top 30 Solana pairs to surface any coin that is genuinely active.
+  try {
+    const r = await httpGet('api.dexscreener.com', '/latest/dex/search?q=solana');
+    const d = JSON.parse(r.body);
+    const topPairs = (d.pairs || [])
+      .filter(p => p.chainId === 'solana' && p.volume?.h24 > 50000)
+      .slice(0, 30);
+    for (const p of topPairs) {
+      const a = p.baseToken?.address || '';
+      if (a && !seen.has(a)) { seen.add(a); candidates.push(p); }
+    }
+    console.log(`[SCAN] Top-volume sweep: ${topPairs.length} Solana pairs (vol > $50k)`);
+  } catch(e) { console.log(`[SCAN] Top-volume sweep error: ${e.message}`); }
+
+  console.log(`[SCAN] Fetched ${candidates.length} unique candidates via ${keywords.length} keywords + boosts + vol sweep`);
 
   // Clean up expired SL blocks (older than 6h)
   const nowTs = Date.now();
