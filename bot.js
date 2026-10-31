@@ -29,7 +29,7 @@ const MAX_POSITIONS   = 10;
 const MIN_SCORE       = 72;  // raised from 60 — only enter high-confidence signals
 const DAILY_LOSS_LIMIT= -0.30;
 const SCAN_INTERVAL   = 15000;  // 15s — entry scanner
-const PRICE_CHECK     = 10000;  // 10s — position monitor (caching fixes make Firestore reads minimal)
+const PRICE_CHECK     =  3000;  //  3s — position monitor (all hot-path reads cached; ~5,760 reads/day total)
 
 // ─── SURGE MOMENTUM MODE ──────────────────────────────────────────────────────
 // Fast-surging coins skip TP1/TP2, ride to 80%+ then full-exit.
@@ -403,6 +403,14 @@ let _tradingCfgAt  = 0;
 let _walletsCache  = null;
 let _walletsCacheAt = 0;
 const CFG_TTL      = 30000; // 30s
+
+// ─── DAILY STATS CACHE ───────────────────────────────────────────────────────
+// getDailyStats() reads Firestore on every call — caching it for 60s means
+// the monitor interval (PRICE_CHECK) no longer drives Firestore read volume.
+// updateDailyStats() busts this cache so fresh P&L is always written correctly.
+let _statsCache   = null;
+let _statsCacheAt = 0;
+const STATS_TTL   = 60000; // 60s
 
 async function getTradingConfig() {
   const now = Date.now();
@@ -851,6 +859,8 @@ async function closePosition(id, data) {
 }
 
 async function getDailyStats() {
+  const now = Date.now();
+  if (_statsCache && now - _statsCacheAt < STATS_TTL) return _statsCache;
   const today  = new Date().toISOString().slice(0, 10);
   const { stats } = await getCollections();
   const doc    = await db.collection(stats).doc(today).get();
@@ -865,6 +875,7 @@ async function getDailyStats() {
       manualPnL: 0, manualTrades: 0, manualWins: 0,
     };
     await db.collection(stats).doc(today).set(init);
+    _statsCache = init; _statsCacheAt = now;
     return init;
   }
   const data = doc.data();
@@ -874,6 +885,7 @@ async function getDailyStats() {
     data.startBalance = expectedBalance;
     console.log(`[BOT] startBalance updated: $${data.startBalance} → $${expectedBalance}`);
   }
+  _statsCache = data; _statsCacheAt = now;
   return data;
 }
 
@@ -896,6 +908,7 @@ async function updateDailyStats(pnl, isWin, isManual = false) {
     base.autoWins   = FieldValue.increment(isWin ? 1 : 0);
   }
   await db.collection(stats).doc(today).set(base, { merge: true });
+  _statsCache = null; _statsCacheAt = 0; // bust cache so next read gets fresh P&L
 }
 
 // ─── PRICE FETCHER ────────────────────────────────────────────────────────────
