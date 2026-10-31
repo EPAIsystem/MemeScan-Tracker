@@ -29,7 +29,7 @@ const MAX_POSITIONS   = 10;
 const MIN_SCORE       = 72;  // raised from 60 — only enter high-confidence signals
 const DAILY_LOSS_LIMIT= -0.30;
 const SCAN_INTERVAL   = 15000;  // 15s — entry scanner
-const PRICE_CHECK     =  5000;  //  5s — position monitor
+const PRICE_CHECK     = 10000;  // 10s — position monitor (caching fixes make Firestore reads minimal)
 
 // ─── SURGE MOMENTUM MODE ──────────────────────────────────────────────────────
 // Fast-surging coins skip TP1/TP2, ride to 80%+ then full-exit.
@@ -914,11 +914,11 @@ async function getCurrentPrice(address, chain) {
 // ─── POSITION MONITOR ────────────────────────────────────────────────────────
 // ═════════════════════════════════════════════════════════════════════════════
 async function isBotRunning() {
+  // Uses the cached getTradingConfig() — no extra Firestore read every 5s.
+  // CFG_TTL (30s) means this reflects stop/start commands within 30 seconds.
   try {
-    const doc = await db.collection('paper_config').doc('control').get();
-    if (!doc.exists) return true; // default: running if no doc yet
-    const data = doc.data();
-    return data.running !== false;
+    const cfg = await getTradingConfig();
+    return cfg.running !== false;
   } catch { return true; } // on error, don't block trading
 }
 
@@ -928,10 +928,12 @@ async function isBotRunning() {
 // in-memory state, resume trading.  Also handles real-mode restart (future).
 async function checkDayRestart() {
   try {
-    const doc = await db.collection('paper_config').doc('control').get();
-    if (!doc.exists) return false;
-    const data = doc.data();
+    // Use cached config first to avoid a Firestore read every monitor cycle.
+    // The cache TTL is 30s, so restart commands are picked up within 30 seconds.
+    const data = await getTradingConfig();
     if (!data.restartDay) return false;
+    // Invalidate cache so the flag-clear write below is reflected immediately
+    _tradingCfg = null; _tradingCfgAt = 0;
 
     // ── Perform restart ──
     const today = new Date().toISOString().slice(0, 10);
