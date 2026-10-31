@@ -498,6 +498,69 @@ tbody tr:hover td { background: var(--bg3); }
   border-radius: 9px; color: var(--red); padding: 12px 16px;
   font-size: 13px; margin-bottom: 18px; line-height: 1.5;
 }
+
+/* ── Add Position Modal ─────────────────────────────────────────────────────── */
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.72);
+  display: flex; align-items: flex-end; justify-content: center;
+  z-index: 100; padding: 0;
+  animation: fade-in .15s ease;
+}
+@keyframes fade-in { from { opacity:0 } to { opacity:1 } }
+.modal-sheet {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 18px 18px 0 0; padding: 24px 20px 36px;
+  width: 100%; max-width: 520px; max-height: 90vh; overflow-y: auto;
+  animation: slide-up .2s ease;
+}
+@keyframes slide-up { from { transform:translateY(40px); opacity:0 } to { transform:translateY(0); opacity:1 } }
+.modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 20px;
+}
+.modal-title { font-size: 16px; font-weight: 600; }
+.modal-close {
+  background: var(--bg3); border: none; color: var(--fg2);
+  border-radius: 50%; width: 30px; height: 30px;
+  font-size: 16px; cursor: pointer; display: flex; align-items: center; justify-content: center;
+}
+.modal-close:hover { color: var(--fg); }
+.mfield { margin-bottom: 14px; }
+.mfield label { display: block; font-size: 11px; color: var(--fg3); text-transform: uppercase; letter-spacing:.07em; margin-bottom:5px; font-weight:500; }
+.mfield input, .mfield select {
+  width: 100%; background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--fg); font-family: var(--mono); font-size: 13px;
+  padding: 9px 12px; outline: none; transition: border-color .15s;
+}
+.mfield input:focus, .mfield select:focus { border-color: var(--accent); }
+.mfield select { font-family: var(--sans); }
+.mfield-hint { font-size: 11px; color: var(--fg3); margin-top: 4px; }
+.mfield-row { display: flex; gap: 10px; }
+.mfield-row .mfield { flex: 1; min-width: 0; }
+.modal-err { color: var(--red); font-size: 12px; margin-bottom: 10px; }
+.modal-info {
+  background: rgba(79,110,247,.08); border: 1px solid rgba(79,110,247,.25);
+  border-radius: 8px; padding: 10px 12px; font-size: 12px; color: var(--blue);
+  margin-bottom: 16px; line-height: 1.5;
+}
+.modal-actions { display: flex; gap: 10px; margin-top: 6px; }
+.btn-save {
+  flex: 1; background: var(--accent); border: none; border-radius: 9px;
+  color: #fff; font-size: 14px; font-weight: 600; padding: 12px;
+  cursor: pointer; transition: opacity .15s;
+}
+.btn-save:disabled { opacity: .5; cursor: default; }
+.btn-cancel {
+  background: var(--bg3); border: 1px solid var(--border); border-radius: 9px;
+  color: var(--fg2); font-size: 14px; padding: 12px 18px; cursor: pointer;
+}
+.add-pos-btn {
+  display: flex; align-items: center; gap: 5px;
+  background: rgba(79,110,247,.12); border: 1px solid rgba(79,110,247,.3);
+  border-radius: 7px; color: var(--accent); font-size: 12px; font-weight: 500;
+  padding: 5px 10px; cursor: pointer; transition: background .15s;
+}
+.add-pos-btn:hover { background: rgba(79,110,247,.22); }
 </style>
 
 <div id="root"></div>
@@ -528,6 +591,9 @@ const S = {
   posCollection:  'paper_positions', // switches with tradingMode
   histCollection: 'paper_history',
   statsCollection:'paper_stats',
+  addingPosition: false,  // modal open/closed
+  addPosErr: '',          // error inside modal
+  addPosSaving: false,    // saving spinner
 };
 
 // ── Config store ──────────────────────────────────────────────────────────────
@@ -907,8 +973,12 @@ function render() {
 
       <div class="section-head">
         <span class="section-label">Open Positions</span>
-        <span class="section-meta">${S.positions.length} active</span>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span class="section-meta">${S.positions.length} active</span>
+          <button class="add-pos-btn" onclick="showAddPosition()">＋ Add</button>
+        </div>
       </div>
+      ${addPositionModalHTML()}
       ${posHTML}
 
       <div class="section-head">
@@ -1127,6 +1197,155 @@ async function removeManualToken(id) {
     S.manualQueue = S.manualQueue.filter(x => x._id !== id);
     render();
   } catch (e) { S.error = 'Remove failed: ' + e.message; render(); }
+}
+
+// ── Add Position Modal ────────────────────────────────────────────────────────
+function addPositionModalHTML() {
+  if (!S.addingPosition) return '';
+  const mode = S.control.tradingMode || 'paper';
+  const isReal = mode === 'real';
+  const walletOptions = S.wallets.length
+    ? S.wallets.map(w => `<option value="${w._id}">${w.label || w.envKey || w._id}</option>`).join('')
+    : `<option value="wallet1">wallet1</option>`;
+
+  return `
+  <div class="modal-backdrop" onclick="if(event.target===this)closeAddModal()">
+    <div class="modal-sheet" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div class="modal-title">➕ Add Manual Position</div>
+        <button class="modal-close" onclick="closeAddModal()">✕</button>
+      </div>
+
+      <div class="modal-info">
+        ${isReal
+          ? '💰 <strong>Real mode</strong> — the bot will manage this position and execute real sell trades when TP/SL is hit. Make sure the tokens are already in your wallet.'
+          : '📄 <strong>Paper mode</strong> — this is a simulated position. No real funds involved.'}
+      </div>
+
+      <div class="mfield">
+        <label>Token Symbol *</label>
+        <input id="ap-symbol" placeholder="e.g. BONK" style="text-transform:uppercase">
+      </div>
+
+      <div class="mfield">
+        <label>Token Name (optional)</label>
+        <input id="ap-name" placeholder="e.g. Bonk">
+      </div>
+
+      <div class="mfield">
+        <label>Contract Address (Mint) *</label>
+        <input id="ap-mint" placeholder="Solana token mint address…">
+        <div class="mfield-hint">Used to fetch live price. Required for TP/SL to work.</div>
+      </div>
+
+      <div class="mfield-row">
+        <div class="mfield">
+          <label>Entry Price (USD) *</label>
+          <input id="ap-entry" type="number" step="any" min="0" placeholder="0.0000234">
+          <div class="mfield-hint">Price you paid per token</div>
+        </div>
+        <div class="mfield">
+          <label>SOL Spent *</label>
+          <input id="ap-sol" type="number" step="any" min="0" placeholder="0.05">
+          <div class="mfield-hint">How much SOL you spent</div>
+        </div>
+      </div>
+
+      <div class="mfield">
+        <label>Token Amount *</label>
+        <input id="ap-amount" type="number" step="any" min="0" placeholder="e.g. 1500000">
+        <div class="mfield-hint">Number of tokens you hold</div>
+      </div>
+
+      <div class="mfield-row">
+        <div class="mfield">
+          <label>Stop Loss Price</label>
+          <input id="ap-sl" type="number" step="any" min="0" placeholder="auto (-20%)">
+          <div class="mfield-hint">Leave blank = entry × 0.80</div>
+        </div>
+        <div class="mfield">
+          <label>Take Profit 1</label>
+          <input id="ap-tp1" type="number" step="any" min="0" placeholder="auto (+50%)">
+          <div class="mfield-hint">Leave blank = entry × 1.50</div>
+        </div>
+      </div>
+
+      <div class="mfield">
+        <label>Wallet</label>
+        <select id="ap-wallet">${walletOptions}</select>
+      </div>
+
+      ${S.addPosErr ? `<div class="modal-err">⚠ ${S.addPosErr}</div>` : ''}
+
+      <div class="modal-actions">
+        <button class="btn-cancel" onclick="closeAddModal()">Cancel</button>
+        <button class="btn-save" onclick="submitAddPosition()" ${S.addPosSaving ? 'disabled' : ''}>
+          ${S.addPosSaving ? '<span class="spin" style="width:12px;height:12px;border-width:2px"></span> Saving…' : '＋ Add Position'}
+        </button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function showAddPosition() { S.addingPosition = true; S.addPosErr = ''; render(); }
+function closeAddModal()   { S.addingPosition = false; S.addPosErr = ''; render(); }
+
+async function submitAddPosition() {
+  if (S.addPosSaving) return;
+  S.addPosErr = '';
+
+  const sym    = (document.getElementById('ap-symbol')?.value || '').trim().toUpperCase();
+  const name   = (document.getElementById('ap-name')?.value   || '').trim();
+  const mint   = (document.getElementById('ap-mint')?.value   || '').trim();
+  const entry  = parseFloat(document.getElementById('ap-entry')?.value);
+  const sol    = parseFloat(document.getElementById('ap-sol')?.value);
+  const amount = parseFloat(document.getElementById('ap-amount')?.value);
+  const slVal  = document.getElementById('ap-sl')?.value;
+  const tp1Val = document.getElementById('ap-tp1')?.value;
+  const walletId = document.getElementById('ap-wallet')?.value || 'wallet1';
+
+  if (!sym)              { S.addPosErr = 'Symbol is required.'; render(); return; }
+  if (!mint)             { S.addPosErr = 'Contract address is required.'; render(); return; }
+  if (isNaN(entry) || entry <= 0) { S.addPosErr = 'Enter a valid entry price.'; render(); return; }
+  if (isNaN(sol)   || sol   <= 0) { S.addPosErr = 'Enter how much SOL you spent.'; render(); return; }
+  if (isNaN(amount)|| amount<= 0) { S.addPosErr = 'Enter the token amount you hold.'; render(); return; }
+
+  const sl  = slVal  && parseFloat(slVal)  > 0 ? parseFloat(slVal)  : entry * 0.80;
+  const tp1 = tp1Val && parseFloat(tp1Val) > 0 ? parseFloat(tp1Val) : entry * 1.50;
+  const tp2 = entry * 2.0;
+  const tp3 = entry * 3.0;
+
+  S.addPosSaving = true; render();
+
+  try {
+    const doc = {
+      symbol:     sym,
+      name:       name || sym,
+      address:    mint,
+      mint:       mint,
+      entryPrice: entry,
+      solSpent:   sol,
+      amount:     amount,
+      size:       sol * (S.prices[mint] || entry) || sol, // approx USD size
+      sl, tp1, tp2, tp3,
+      walletId,
+      chain:      'solana',
+      status:     'open',
+      source:     'manual',
+      entryTime:  Date.now(),
+      remaining:  1,
+      score:      null,
+      strategyLabel: 'MANUAL',
+    };
+    await fsAdd(S.config, S.posCollection, doc);
+    S.addingPosition = false;
+    S.addPosSaving = false;
+    await loadData();
+  } catch (e) {
+    S.addPosErr = 'Save failed: ' + e.message;
+    S.addPosSaving = false;
+    render();
+  }
 }
 
 // ── Trading controls (mode toggle + wallet selector) ─────────────────────────
