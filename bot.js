@@ -225,20 +225,29 @@ function detectStrategy(pair, openStrategies) {
   if (price <= 0)  return null;
   if (sells24 === 0 && buys24 > 10) return null; // honeypot guard
 
-  // DEAD COIN GUARD: reject any coin where the 1h price change is missing or effectively flat.
+  // Calculate age before the dead coin guard — needed for the young-coin exemption
+  const ageMinutes = (now - created) / 60000;
+
+  // DEAD COIN GUARD: reject coins where the 1h price change is missing or effectively flat.
   //
   // ch1 === null       → DexScreener returned no h1 data (coin too new / data gap)
   // Math.abs(ch1) < 0.5 → displays as "0.0%" on the signal — price has not moved
   //                        meaningfully in the last hour, i.e. no real trading activity.
-  //                        This is an UNCONDITIONAL reject — no m5Txns escape hatch —
-  //                        because a coin that rounds to 0.0% h1 has nothing to trade.
   //
-  // Root cause of the original bug: ch1 could be 0.02 or 0.04 (not integer zero),
-  // which DexScreener rounds to "0.0%" in the display but was not caught by === 0.
-  if (ch1 === null)          return null; // no h1 data from DexScreener
-  if (Math.abs(ch1) < 0.5)   return null; // rounds to 0.0% → dead / inactive token
-
-  const ageMinutes = (now - created) / 60000;
+  // YOUNG COIN EXEMPTION (60–240 min old):
+  //   For 1–4 hour coins the h1 window covers the coin's ENTIRE life. A coin that
+  //   launched flat and is NOW pumping can have h1 near 0% even as m5 surges.
+  //   Allow through if m5Ch >= 2% (confirming live price action right now).
+  //   Without this, strong 1–4 hour coins are silently blocked.
+  if (ch1 === null) {
+    // Young coin with strong m5 → allow despite missing h1
+    if (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2) { /* pass through */ }
+    else return null; // no h1 data and no m5 rescue
+  } else if (Math.abs(ch1) < 0.5) {
+    // Flat h1 — could be dead coin. Check for young coin with live m5 activity.
+    if (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2) { /* pass through */ }
+    else return null; // rounds to 0.0% h1 → dead / inactive
+  }
   const dexId      = pair.dexId || '';
   const isPumpFun  = dexId === 'pump-fun';
 
@@ -1748,10 +1757,21 @@ async function scanForEntries() {
   if (vacantSlots >= 3) console.log(`[BOT] ${vacantSlots} slots vacant — score threshold: ${scoreThreshold}`);
 
   // Fetch candidates from DexScreener
-  const keywords = ['meme','pepe','dog','cat','inu','moon','elon','baby','pump','shib'];
-  // When urgently filling (5+ vacant), cast a wider net
+  // Diverse keyword set — covers meme coins, AI tokens, trending names, and general Solana ecosystem.
+  // 1–4 hour coins appear in these results as long as they have volume/activity.
+  const keywords = [
+    // classic meme
+    'meme','pepe','dog','cat','inu','shib','doge','frog','chad',
+    // trending/viral
+    'pump','moon','elon','trump','wojak','grok','ai',
+    // broader ecosystem (catches non-meme coins)
+    'sol','baby','floki','coin','token',
+    // catch newer launches
+    'new','launch','fair',
+  ];
+  // When urgently filling (5+ vacant), add even more diverse terms
   if (vacantSlots >= 5) {
-    keywords.push('sol','grok','ai','doge','floki','frog','chad','coin','trump','wojak');
+    keywords.push('defi','swap','yield','nft','gaming','web3','dao','ape','based','eth');
   }
   const seen = new Set();
   const candidates = [];
@@ -1824,7 +1844,8 @@ async function scanForEntries() {
     ...positions.map(p => p.address).filter(Boolean),
     ...positions.map(p => p.mint).filter(Boolean),
   ]);
-  const matches   = [];
+  const matches          = [];
+  const watchingCoins    = []; // near-miss coins for the periodic monitoring report
   let nearMissCount = 0;
 
   for (const pair of candidates) {
@@ -1840,9 +1861,13 @@ async function scanForEntries() {
         matches.push(result);
       } else {
         nearMissCount++;
-        // Log near misses for visibility (coins that match a strategy but scored just below threshold)
+        // Log near misses for visibility
         if (result.score >= 40) {
           console.log(`[NEAR MISS] ${result.symbol}: ${result.strategy.label} score ${result.score} (need ${scoreThreshold}) | m5:${result.m5Ch?.toFixed(1)}% m5txns:${result.m5Txns} h1:${result.ch1?.toFixed(1)}% buy:${result.buyPct?.toFixed(0)}%`);
+        }
+        // Collect top near-misses for the periodic watching report (score 60–71)
+        if (result.score >= 60) {
+          watchingCoins.push(result);
         }
       }
     }
@@ -1850,6 +1875,42 @@ async function scanForEntries() {
 
   // Always log scan summary so Fly.io logs show activity
   console.log(`[SCAN] #${scanCount}: ${candidates.length} candidates → ${matches.length} above threshold, ${nearMissCount} near misses (threshold: ${scoreThreshold})`);
+
+  // ── PERIODIC "WATCHING" REPORT — every 60 scans (~15 min) ───────────────────
+  // Tells Telegram what the bot is monitoring but has NOT entered yet.
+  // Score 60–71 = on radar, almost qualifying. Score ≥ 72 = entered (separate message).
+  // This answers: "are those 3 coins qualified or just monitoring?" — here they are NOT.
+  if (scanCount % 60 === 0) {
+    // Sort near-miss candidates by score descending, dedupe by symbol
+    const seenSymbols = new Set();
+    const topWatch = watchingCoins
+      .sort((a, b) => b.score - a.score)
+      .filter(c => { if (seenSymbols.has(c.symbol)) return false; seenSymbols.add(c.symbol); return true; })
+      .slice(0, 3);
+
+    if (topWatch.length > 0) {
+      const ageStr = c => c.ageMinutes < 60
+        ? `${Math.round(c.ageMinutes)}min`
+        : `${(c.ageMinutes / 60).toFixed(1)}h`;
+      const lines = topWatch.map(c =>
+        `• *${c.symbol}* — ${c.strategy.label} · Score: *${c.score}/100*\n` +
+        `  Age: ${ageStr(c)} | m5: ${c.m5Ch>0?'+':''}${c.m5Ch.toFixed(1)}% | h1: ${c.ch1!=null?(c.ch1>0?'+':'')+c.ch1.toFixed(1)+'%':'—'} | Buy: ${c.buyPct.toFixed(0)}%\n` +
+        `  _(needs ${scoreThreshold} to enter — watching)_`
+      );
+      await sendTelegram(
+        `👀 *MONITORING — NOT ENTERING*\n\n` +
+        `These coins match a strategy but score < ${scoreThreshold}:\n\n` +
+        lines.join('\n\n') +
+        `\n\n_To enter automatically, they must score ≥ ${scoreThreshold}_`
+      ).catch(() => {});
+    } else if (matches.length === 0) {
+      // Only send "quiet scan" message if nothing qualified this round either
+      await sendTelegram(
+        `🔎 *SCAN UPDATE* — No coins at score ≥ ${scoreThreshold} this window\n` +
+        `${candidates.length} scanned · ${nearMissCount} near misses · monitoring continues`
+      ).catch(() => {});
+    }
+  }
 
   // Sort: trending/rebounding coins first, then by score
   matches.sort((a, b) => {
@@ -1916,17 +1977,23 @@ async function scanForEntries() {
           `🎯 TP2: $${fmtPrice(coin.price * s.tp2x)} (+${((s.tp2x-1)*100).toFixed(0)}%) → 30%\n` +
           `🎯 TP3: $${fmtPrice(coin.price * s.tp3x)} (+${((s.tp3x-1)*100).toFixed(0)}%) → 20%\n`;
 
-    const pumpBadge = coin.isPumpFun ? `🎪 Pump.fun${isYoung?' · YOUNG COIN':''}\n` : '';
+    const pumpBadge  = coin.isPumpFun ? `🎪 Pump.fun${isYoung?' · YOUNG COIN':''}\n` : '';
+    const modeHeader = pos.tradingMode === 'real'
+      ? `💰 *BOT ENTERED — REAL TRADE*`
+      : `✅ *BOT ENTERED — PAPER TRADE*`;
+    // Note: "BOT ENTERED" = the bot has already bought this position.
+    //       This is NOT a suggestion or monitoring alert.
+    //       Compare with "👀 MONITORING" messages which are NOT entered.
     await sendTelegram(
-      `📊 *PAPER TRADE ENTRY*\n\n` +
+      `${modeHeader}\n\n` +
       `*${coin.symbol}* — ${coin.name}\n` +
       `${s.label} · Score: *${coin.score}/100*\n` +
       `${pumpBadge}` +
       `💡 ${s.desc}\n\n` +
       `💵 Entry: $${fmtPrice(coin.price)}\n` +
-      `💰 Position: $${pos.size}${pos.tradingMode === 'real' ? ` 💰 REAL` : ` (paper)`}${pos.walletLabel ? ` · ${pos.walletLabel}` : ''}\n` +
+      `💰 Position: $${pos.size}${pos.walletLabel ? ` · ${pos.walletLabel}` : ''}\n` +
       `📊 Buy%: ${coin.buyPct.toFixed(0)}% | Liq: $${(coin.liq/1000).toFixed(0)}k\n` +
-      `📈 Age: ${ageLabel} | m5: ${coin.m5Ch>0?'+':''}${coin.m5Ch.toFixed(1)}% | h1: ${coin.ch1>0?'+':''}${coin.ch1.toFixed(1)}%\n\n` +
+      `📈 Age: ${ageLabel} | m5: ${coin.m5Ch>0?'+':''}${coin.m5Ch.toFixed(1)}% | h1: ${coin.ch1!=null?(coin.ch1>0?'+':'')+coin.ch1.toFixed(1)+'%':'<1h'}\n\n` +
       tpInfo +
       `🛑 SL: $${fmtPrice(coin.price * s.slx)} | Trail: ${s.initialTrailPct}% → floors at 5%\n\n` +
       `\`${coin.addr}\`\n🔗 [Chart](${coin.dexUrl})`
