@@ -22,8 +22,9 @@ try {
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 // Try both naming conventions (old code used TELEGRAM_TOKEN, new uses TELEGRAM_BOT_TOKEN)
-const TELEGRAM_TOKEN  = process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_TOKEN;
-const TELEGRAM_CHAT   = process.env.TELEGRAM_CHAT_ID   || process.env.TELEGRAM_CHAT;
+// .trim() removes accidental whitespace/newlines from copy-pasted Fly.io secrets
+const TELEGRAM_TOKEN  = (process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_TOKEN  || '').trim();
+const TELEGRAM_CHAT   = (process.env.TELEGRAM_CHAT_ID   || process.env.TELEGRAM_CHAT   || '').trim();
 const POSITION_SIZE   = parseFloat(process.env.POSITION_SIZE || '100');
 const MAX_POSITIONS   = 10;
 const MIN_SCORE       = 50;  // floor = base score of any detected pattern; effectively "enter anything that matches a strategy"
@@ -1376,8 +1377,31 @@ async function pollTelegramCommands() {
   try {
     const path = `/bot${TELEGRAM_TOKEN}/getUpdates?offset=${telegramOffset}&timeout=5&allowed_updates=${encodeURIComponent('["message"]')}`;
     const r = await httpGet('api.telegram.org', path);
-    const d = JSON.parse(r.body);
-    if (!d.ok || !d.result?.length) return;
+
+    // ── Diagnose poll failures visibly in Telegram, not just console ────────────
+    if (r.status !== 200) {
+      console.error(`[TELEGRAM-POLL] HTTP ${r.status} — ${r.body.slice(0, 200)}`);
+      if (r.status === 401 || r.status === 403) {
+        await sendTelegram(`⚠️ Telegram poll error: HTTP ${r.status} — bot token may be invalid. Check TELEGRAM_BOT_TOKEN secret.`).catch(() => {});
+      }
+      return;
+    }
+
+    let d;
+    try { d = JSON.parse(r.body); }
+    catch(parseErr) {
+      console.error('[TELEGRAM-POLL] Non-JSON response:', r.body.slice(0, 200));
+      return;
+    }
+    if (!d.ok) {
+      console.error('[TELEGRAM-POLL] Telegram error:', d.description || JSON.stringify(d));
+      // Only alert on auth errors — transient errors are normal
+      if (d.error_code === 401 || d.error_code === 403) {
+        await sendTelegram(`⚠️ Telegram API error ${d.error_code}: ${d.description}\nCheck TELEGRAM_BOT_TOKEN secret.`).catch(() => {});
+      }
+      return;
+    }
+    if (!d.result?.length) return;
 
     for (const update of d.result) {
       telegramOffset = update.update_id + 1;
@@ -1386,7 +1410,17 @@ async function pollTelegramCommands() {
       const rawText = (update.message?.text || '').trim();          // preserve case for PRO signal parser
       const chatId  = String(update.message?.chat?.id || '');
 
-      if (chatId !== String(TELEGRAM_CHAT)) continue; // ignore strangers
+      // ── chatId mismatch guard — log once so Fly.io logs show the mismatch ────
+      if (chatId !== TELEGRAM_CHAT) {
+        if (chatId) console.log(`[CMD] Ignored msg from chatId=${chatId} (expected=${TELEGRAM_CHAT})`);
+        continue;
+      }
+
+      // ── /ping — simplest possible command test ───────────────────────────────
+      if (text === '/ping') {
+        await sendTelegram(`🏓 *pong* — commands working ✅\nChat ID: \`${chatId}\`\nOffset: ${telegramOffset}`);
+        continue;
+      }
 
       if (text === '/restart' || text === '/restart_day') {
         if (dayHaltedToday) {
@@ -1412,16 +1446,23 @@ async function pollTelegramCommands() {
           ? `+$${stats.realizedPnL.toFixed(2)}`
           : `-$${Math.abs(stats.realizedPnL).toFixed(2)}`;
         const pct     = ((stats.realizedPnL / stats.startBalance) * 100).toFixed(1);
-        const state   = dayHaltedToday ? '🚨 HALTED (daily limit)' : '✅ Running';
+        const botPaused = cfg.running === false;
+        const state   = botPaused        ? '⏸ PAUSED (running=false in DB)'
+                      : dayHaltedToday   ? '🚨 HALTED (daily limit)'
+                      : '✅ Running';
         const posSize = parseFloat(cfg.positionSize) || POSITION_SIZE;
+        const pausedNote = botPaused
+          ? `\n⚠️ _Bot is PAUSED — set running=true in Firebase to resume_`
+          : '';
         await sendTelegram(
           `📊 *STATUS*\n\n` +
           `${state} · *${mode} mode*\n` +
           `Daily P&L: *${pnlStr}* (${pct}%)\n` +
           `Balance: $${(cfg.paperBalance || POSITION_SIZE * MAX_POSITIONS).toFixed(2)}\n` +
           `Position size: *$${posSize.toFixed(2)}*\n` +
-          `Limit: ${(DAILY_LOSS_LIMIT * 100).toFixed(0)}%\n\n` +
-          `_/setsize 3 · /mode paper|real · /wallets · /clearreal · /restart_`
+          `Limit: ${(DAILY_LOSS_LIMIT * 100).toFixed(0)}%\n` +
+          `Scan #: ${scanCount}${pausedNote}\n\n` +
+          `_/ping · /setsize 3 · /mode paper|real · /wallets · /clearreal · /restart_`
         );
       }
 
@@ -2765,6 +2806,23 @@ async function scanForEntries() {
   // Always log scan summary so Fly.io logs show activity
   console.log(`[SCAN] #${scanCount}: ${candidates.length} candidates → ${matches.length} above threshold, ${nearMissCount} near misses (threshold: ${scoreThreshold})`);
 
+  // ── Periodic heartbeat (every 20 scans ≈ 5 min) ─────────────────────────────
+  // Sends to Telegram so you can see the bot is actually scanning.
+  // Uses scanCount from outer scope (incremented in main setInterval).
+  if (scanCount % 20 === 0) {
+    const openPositions = await getOpenPositions().catch(() => []);
+    const cfg = await getTradingConfig().catch(() => ({}));
+    const mode = (cfg.tradingMode || 'paper').toUpperCase();
+    const paused = cfg.running === false ? ' ⏸PAUSED' : '';
+    const halted = dayHaltedToday ? ' 🚨HALTED' : '';
+    await sendTelegram(
+      `🔍 *Scan #${scanCount}*${paused}${halted}\n` +
+      `Mode: *${mode}* · Open positions: ${openPositions.length}/${MAX_POSITIONS}\n` +
+      `${candidates.length} candidates → ${matches.length} matched → ${lockedMatches.length} LP OK → ${qualityMatches.length} quality\n` +
+      `${nearMissCount} near-misses (score 40-${scoreThreshold - 1})`
+    ).catch(() => {});
+  }
+
   // ── PERIODIC "WATCHING" REPORT — every 60 scans (~15 min) ───────────────────
   // Tells Telegram what the bot is monitoring but has NOT entered yet.
   // Score ≥ 60 = on radar (strong signal, monitoring). Score ≥ MIN_SCORE = entered (separate message).
@@ -2996,9 +3054,14 @@ async function sendHourlySummary() {
 async function main() {
   console.log('[BOT] MemeScan PRO — 4-Strategy Bot starting...');
   // Log env var presence (not values) so Fly.io logs show what's configured
+  // Mask TELEGRAM_CHAT: show first 3 + last 3 chars so we can spot whitespace issues
+  // without exposing the full ID in logs (it's not a secret but good hygiene)
+  const chatMask = TELEGRAM_CHAT.length >= 6
+    ? TELEGRAM_CHAT.slice(0, 3) + '…' + TELEGRAM_CHAT.slice(-3) + ` (${TELEGRAM_CHAT.length} chars)`
+    : `"${TELEGRAM_CHAT}" (${TELEGRAM_CHAT.length} chars)`;
   console.log('[BOT] Env check:',
     'TELEGRAM_TOKEN=' + (TELEGRAM_TOKEN ? '✓' : '✗ MISSING'),
-    'TELEGRAM_CHAT='  + (TELEGRAM_CHAT  ? '✓' : '✗ MISSING'),
+    'TELEGRAM_CHAT='  + (TELEGRAM_CHAT  ? chatMask : '✗ MISSING'),
     'FIREBASE_PROJECT=' + (process.env.FIREBASE_PROJECT_ID ? '✓' : '✗ MISSING'),
     'FIREBASE_EMAIL='   + (process.env.FIREBASE_CLIENT_EMAIL ? '✓' : '✗ MISSING'),
     'FIREBASE_KEY='     + (process.env.FIREBASE_PRIVATE_KEY ? '✓' : '✗ MISSING'),
