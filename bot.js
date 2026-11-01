@@ -764,6 +764,23 @@ async function executeRealEntry(coin, wallet, posSize) {
     const lamports    = Math.floor(solAmount * 1e9);
     console.log(`[REAL] ENTRY ${coin.symbol} | $${posSize} = ${solAmount.toFixed(4)} SOL = ${lamports} lamports`);
 
+    // ── PRE-FLIGHT: check wallet balance before attempting swap ───────────
+    try {
+      const { Connection } = SolanaWeb3;
+      const conn = new Connection(SOL_RPC, 'confirmed');
+      const walletBalance = await conn.getBalance(keypair.publicKey); // in lamports
+      const JITO_TIP_BUFFER = 0.005 * 1e9; // 0.005 SOL reserved for Jito tip + fees
+      if (walletBalance < lamports + JITO_TIP_BUFFER) {
+        const balSol   = (walletBalance / 1e9).toFixed(4);
+        const needSol  = ((lamports + JITO_TIP_BUFFER) / 1e9).toFixed(4);
+        const balUsd   = ((walletBalance / 1e9) * solPrice).toFixed(2);
+        console.warn(`[REAL] ⚠️  Insufficient balance: have ${balSol} SOL ($${balUsd}), need ${needSol} SOL for $${posSize} + fees`);
+        return { txHash: null, executedPrice: coin.price, error: `Insufficient SOL: have $${balUsd}, need $${posSize} + fees` };
+      }
+    } catch(balErr) {
+      console.warn(`[REAL] Balance check failed (proceeding): ${balErr.message}`);
+    }
+
     const quote = await jupiterQuote(SOL_MINT, coin.addr, lamports, 150); // 1.5% slippage
     if (!quote) return { txHash: null, executedPrice: coin.price, error: 'Jupiter quote failed' };
 
@@ -924,10 +941,22 @@ async function enterPosition(coin, overrides = {}) {
   const coinChain  = normaliseChain(coin.chain);
   const wallet     = await selectWalletForChain(coinChain, cfg);
 
-  // Real mode: execute swap (stub for now)
+  // Real mode: execute swap
   let realTx = null;
   if (tradingMode === 'real' && wallet) {
     realTx = await executeRealEntry(coin, wallet, posSize);
+    // If the on-chain tx failed (no hash), abort entirely — do NOT create a ghost position
+    if (!realTx || !realTx.txHash) {
+      const reason = realTx?.error || 'Transaction not executed';
+      console.warn(`[REAL] ⛔ Entry TX failed for ${coin.symbol}: ${reason}. No position created.`);
+      await sendTelegram(
+        `⛔ *REAL ENTRY FAILED — No Position Opened*\n\n` +
+        `*${coin.symbol}*\n` +
+        `Reason: ${reason}\n\n` +
+        `_Your wallet balance is unchanged. Switch to /mode paper to paper-trade instead._`
+      ).catch(() => {});
+      return null;
+    }
   } else if (tradingMode === 'real' && !wallet) {
     console.warn(`[REAL] No wallet configured for chain "${coinChain}" — skipping ${coin.symbol}`);
     return null; // can't enter a real trade without a wallet
