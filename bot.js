@@ -333,6 +333,12 @@ function detectStrategy(pair, openStrategies) {
         if (ch1 > 20)  score += 12; else if (ch1 > 8) score += 6;
         if (liq > 30000) score += 8; else if (liq > 15000) score += 4;
         if (volMcap > 1) score += 10; else if (volMcap > 0.4) score += 5;
+        // Range-spike guard: if 1h is a big spike but 24h is flat/modest,
+        // the coin is likely ranging and we're buying the top of a local spike.
+        // True breakouts have 24h trend that SUPPORTS the 1h move.
+        const ch24pos1 = Math.max(ch24, 0);
+        if      (ch1 > 30 && ch24pos1 < 20) score -= 35; // spike in flat day = range top
+        else if (ch1 > 20 && ch24pos1 < 8)  score -= 20; // moderate spike, very weak 24h
       }
     }
 
@@ -353,6 +359,10 @@ function detectStrategy(pair, openStrategies) {
         if (liq > 20000) score += 6;  else if (liq > 8000) score += 3;
         // Penalty: volume/mcap ratio too extreme = possible wash trading
         if (volMcap > 10) score -= 10;
+        // Range-spike guard: same as id 1 — 1h spike without 24h support = range top
+        const ch24pos2 = Math.max(ch24, 0);
+        if      (ch1 > 30 && ch24pos2 < 20) score -= 35;
+        else if (ch1 > 20 && ch24pos2 < 8)  score -= 20;
       }
     }
 
@@ -2797,6 +2807,28 @@ async function scanForEntries() {
 
     // id 0 (Bottom Bounce) and id 3 (Old Recovery): NO pullback gate.
     // The 24h decline already confirmed the drawdown — enter when momentum turns positive.
+
+    // ── RANGE-TOP GUARD (id 1 / id 2 only) ─────────────────────────────────────
+    // If the bot has seen this coin ≥5 times AND its current price is in the top
+    // 20% of the observed price range, the coin is ranging — we're about to buy
+    // the top of a spike that will retrace.  Skip and wait for a lower entry.
+    if (coin.strategy.id === 1 || coin.strategy.id === 2) {
+      const hist = priceHistory.get(coin.addr) || [];
+      if (hist.length >= 5) {
+        const prices  = hist.map(h => h.price);
+        const minP    = Math.min(...prices);
+        const maxP    = Math.max(...prices);
+        const rangeSize = maxP - minP;
+        if (rangeSize > minP * 0.08) { // meaningful oscillation (>8% swing observed)
+          const posInRange = (coin.price - minP) / rangeSize;
+          if (posInRange > 0.80) {
+            console.log(`[RANGE-TOP] ${coin.symbol} — price in top ${(posInRange*100).toFixed(0)}% of range ($${fmtPrice(minP)}–$${fmtPrice(maxP)}) — skipping range-top entry`);
+            usedThisScan.add(coin.addr);
+            continue;
+          }
+        }
+      }
+    }
 
     // Reserve coin BEFORE the async enterPosition call — a concurrent scan tick
     // starting during the Firestore await would otherwise find the coin absent
