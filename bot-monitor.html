@@ -270,6 +270,41 @@ header {
 .pnl-pct  { font-size: 11px; color: var(--fg2); }
 .pos-ts   { font-size: 10px; color: var(--fg3); text-align: right; }
 
+/* ── Position expand panel ───────────────────────────────────────────────────── */
+.pos-expand-toggle {
+  width: 100%; border: none; background: none; cursor: pointer;
+  color: var(--fg3); font-size: 10px; text-align: center;
+  padding: 6px 0 0; letter-spacing: .06em; text-transform: uppercase;
+  display: flex; align-items: center; justify-content: center; gap: 5px;
+}
+.pos-expand-toggle:hover { color: var(--fg2); }
+.pos-detail {
+  margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
+}
+.pos-detail-row {
+  display: flex; justify-content: space-between; font-size: 11px;
+  color: var(--fg2); margin-bottom: 6px;
+}
+.pos-detail-row span:last-child { font-family: var(--mono); color: var(--fg); }
+.chart-links {
+  display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px;
+}
+.chart-link {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 7px 12px; border-radius: 8px; font-size: 12px; font-weight: 600;
+  text-decoration: none; border: 1px solid var(--border);
+  background: var(--bg3); color: var(--fg); transition: border-color .15s, background .15s;
+  white-space: nowrap;
+}
+.chart-link:hover { background: var(--bg2); border-color: var(--accent); color: var(--accent); }
+.chart-link.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.chart-link.primary:hover { opacity: .88; color: #fff; }
+.pos-addr {
+  font-family: var(--mono); font-size: 9px; color: var(--fg3);
+  word-break: break-all; margin-top: 10px; line-height: 1.5;
+  cursor: pointer; user-select: all;
+}
+
 /* ── History table ───────────────────────────────────────────────────────────── */
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 11px; margin-bottom: 30px; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; min-width: 480px; }
@@ -595,6 +630,7 @@ const S = {
   manualQueue: [],    // items in paper_manual_queue
   manualAdding: false,
   closingPos: {},     // { [posId]: 'confirm' | 'closing' }
+  expandedPos: new Set(), // set of posIds currently expanded
   dailyHistory: [],   // [{date, realizedPnL, trades, wins, losses}, ...]
   control: {},        // paper_config/control fields
   wallets: [],        // paper_config/wallets/slots docs
@@ -1043,6 +1079,24 @@ function render() {
     </div>`;
 }
 
+function chartLinks(pos) {
+  const addr  = pos.address || '';
+  const chain = (pos.chain || 'solana').toLowerCase();
+  const isSol = chain === 'solana';
+  const dsChain = isSol ? 'solana' : chain === 'bsc' ? 'bsc' : 'ethereum';
+  const gtChain = isSol ? 'solana' : chain === 'bsc' ? 'bsc' : 'eth';
+  const dsUrl  = `https://dexscreener.com/${dsChain}/${addr}`;
+  const gtUrl  = `https://www.geckoterminal.com/${gtChain}/pools/${addr}`;
+  const beUrl  = isSol ? `https://birdeye.so/token/${addr}?chain=solana` : null;
+  const pfUrl  = isSol ? `https://pump.fun/${addr}` : null;
+  return `<div class="chart-links">
+    <a class="chart-link primary" href="${dsUrl}" target="_blank">📊 DexScreener</a>
+    <a class="chart-link" href="${gtUrl}" target="_blank">🦎 GeckoTerminal</a>
+    ${beUrl ? `<a class="chart-link" href="${beUrl}" target="_blank">🐦 Birdeye</a>` : ''}
+    ${pfUrl ? `<a class="chart-link" href="${pfUrl}" target="_blank">🔥 Pump.fun</a>` : ''}
+  </div>`;
+}
+
 function posCard(pos) {
   const pnl  = livePnl(pos);
   const pct  = livePct(pos);
@@ -1050,6 +1104,22 @@ function posCard(pos) {
   const cur  = S.prices[pos.address];
   const isProfit = pnl != null && pnl >= 0;
   const cardClass = pnl == null ? '' : isProfit ? 'profit' : 'loss';
+  const expanded = S.expandedPos && S.expandedPos.has(pos._id);
+  const ageMs = pos.enteredAt ? Date.now() - pos.enteredAt : 0;
+  const ageStr = ageMs > 3600000 ? `${(ageMs/3600000).toFixed(1)}h` : `${Math.floor(ageMs/60000)}m`;
+
+  const detailPanel = expanded ? `
+    <div class="pos-detail">
+      <div class="pos-detail-row"><span>Chain</span><span>${(pos.chain||'solana').toUpperCase()}</span></div>
+      <div class="pos-detail-row"><span>Strategy</span><span>${pos.strategyLabel || pos.catLabel || '—'}</span></div>
+      <div class="pos-detail-row"><span>Score</span><span>${pos.score || '—'}/100</span></div>
+      <div class="pos-detail-row"><span>Age in trade</span><span>${ageStr}</span></div>
+      <div class="pos-detail-row"><span>Size</span><span>$${pos.size}</span></div>
+      <div class="pos-detail-row"><span>SL (current)</span><span style="color:var(--red)">${fmtPrice(pos.currentSL || pos.sl)}</span></div>
+      <div class="pos-detail-row"><span>TP1 / TP2 / TP3</span><span>${fmtPrice(pos.tp1)} · ${fmtPrice(pos.tp2)} · ${fmtPrice(pos.tp3)}</span></div>
+      ${chartLinks(pos)}
+      <div class="pos-addr" title="Tap to select address">${pos.address || ''}</div>
+    </div>` : '';
 
   return `<div class="pos-card ${cardClass}">
     <div class="pos-head">
@@ -1106,7 +1176,20 @@ function posCard(pos) {
         </div>
       </div>
     </div>
+
+    ${detailPanel}
+    <button class="pos-expand-toggle" onclick="toggleExpand('${pos._id}')">
+      ${expanded ? '▲ less' : '▼ charts & details'}
+    </button>
   </div>`;
+}
+
+// ── Expand / collapse position detail ────────────────────────────────────────
+function toggleExpand(posId) {
+  if (!S.expandedPos) S.expandedPos = new Set();
+  if (S.expandedPos.has(posId)) S.expandedPos.delete(posId);
+  else S.expandedPos.add(posId);
+  render();
 }
 
 // ── Individual position sell ──────────────────────────────────────────────────
