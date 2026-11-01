@@ -754,6 +754,20 @@ async function executeRealEntry(coin, wallet, posSize) {
     const quote = await jupiterQuote(SOL_MINT, coin.addr, lamports, 150); // 1.5% slippage
     if (!quote) return { txHash: null, executedPrice: coin.price, error: 'Jupiter quote failed' };
 
+    // ── PRICE IMPACT GUARD — protect capital from thin liquidity ──────────
+    const MAX_ENTRY_IMPACT = 0.015; // 1.5% — abort if our buy moves price more than this
+    const impactEntry = parseFloat(quote.priceImpactPct || 0);
+    if (impactEntry > MAX_ENTRY_IMPACT) {
+      const impactStr = (impactEntry * 100).toFixed(2);
+      console.warn(`[REAL] ⛔ ENTRY BLOCKED — price impact ${impactStr}% > ${MAX_ENTRY_IMPACT * 100}% threshold for ${coin.symbol}`);
+      await sendTelegram(
+        `⛔ *ENTRY BLOCKED — High Price Impact*\n\n` +
+        `*${coin.symbol}* — our $${posSize} buy would move price by *${impactStr}%*\n` +
+        `Liquidity too thin. Skipping to protect capital.`
+      );
+      return { txHash: null, executedPrice: coin.price, error: `Price impact too high: ${impactStr}%` };
+    }
+
     const tokensOut = parseFloat(quote.outAmount); // raw units (must divide by decimals later)
     const outDecimals = parseInt(quote.outputDecimals || quote.swapInfo?.outputMint?.decimals || 6, 10);
     const tokenAmount = tokensOut / (10 ** outDecimals);
@@ -801,6 +815,19 @@ async function executeRealExit(pos, wallet, exitPrice) {
 
     const quote = await jupiterQuote(pos.address, SOL_MINT, tokensToSell, 200); // 2% slippage on sell
     if (!quote) return { txHash: null, executedPrice: exitPrice, error: 'Jupiter exit quote failed' };
+
+    // ── PRICE IMPACT GUARD on exit — warn if selling into thin liquidity ──
+    const MAX_EXIT_IMPACT = 0.02; // 2% — warn and log but still exit (must sell)
+    const impactExit = parseFloat(quote.priceImpactPct || 0);
+    if (impactExit > MAX_EXIT_IMPACT) {
+      const impactStr = (impactExit * 100).toFixed(2);
+      console.warn(`[REAL] ⚠️  EXIT high impact ${impactStr}% for ${pos.symbol} — proceeding (must exit)`);
+      await sendTelegram(
+        `⚠️ *HIGH IMPACT EXIT — ${pos.symbol}*\n\n` +
+        `Selling into thin liquidity — price impact *${impactStr}%*\n` +
+        `Proceeding anyway (position must close).`
+      );
+    }
 
     const swapTx = await jupiterGetSwapTx(quote, keypair.publicKey.toBase58());
     if (!swapTx) return { txHash: null, executedPrice: exitPrice, error: 'Jupiter exit swap TX failed' };
