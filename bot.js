@@ -533,11 +533,39 @@ const SOL_RPC   = process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com
 // public mempool. This prevents front-running and sandwich attacks entirely —
 // bots cannot see the transaction to attack it because it never enters the mempool.
 //
-// Tip: we pay a small SOL tip to Jito on top of the normal priority fee.
-// 10000 lamports ≈ $0.002 at $200/SOL — negligible for our position sizes.
-// Increase to 50000–100000 during high-competition periods.
-const JITO_BLOCK_ENGINE = 'mainnet.block-engine.jito.labs.io';
-const JITO_TIP_LAMPORTS = parseInt(process.env.JITO_TIP_LAMPORTS || '10000', 10);
+// Tip is set dynamically: the bot queries Jito's live tip floor API every 30s
+// and pays the 75th-percentile of recent winning bundles — enough to beat 75%
+// of competing bots without overpaying during quiet periods.
+// Hard floor: 10,000 lamports | Hard cap: 500,000 lamports (~$0.10 at $200/SOL)
+const JITO_BLOCK_ENGINE   = 'mainnet.block-engine.jito.labs.io';
+const JITO_TIP_FLOOR_HOST = 'bundles.jito.wtf';
+const JITO_TIP_MIN        = 10_000;   // always pay at least this
+const JITO_TIP_MAX        = 500_000;  // never pay more than this (~$0.10)
+const JITO_TIP_TTL        = 30_000;   // refresh tip floor every 30s
+let _jitoTip    = JITO_TIP_MIN;       // starts at floor; updated by fetchJitoTip()
+let _jitoTipAt  = 0;
+
+// Fetches Jito's live tip floor and sets _jitoTip to the 75th percentile.
+// Called automatically before every bundle submission.
+async function fetchJitoTip() {
+  const now = Date.now();
+  if (now - _jitoTipAt < JITO_TIP_TTL) return; // still fresh
+  _jitoTipAt = now;
+  try {
+    const r = await httpGet(JITO_TIP_FLOOR_HOST, '/api/v1/bundles/tip_floor');
+    const data = JSON.parse(r.body);
+    // API returns an array; take the first (most recent) entry
+    const entry = Array.isArray(data) ? data[0] : data;
+    // Use 75th percentile — beats 75% of competing bots right now
+    const p75 = entry?.landed_tips_75th_percentile || JITO_TIP_MIN;
+    _jitoTip = Math.max(JITO_TIP_MIN, Math.min(JITO_TIP_MAX, Math.ceil(p75)));
+    console.log(`[JITO] Tip floor updated: ${_jitoTip} lamports (p75=${p75})`);
+  } catch(e) {
+    console.log(`[JITO] Tip floor fetch failed — using ${_jitoTip}: ${e.message}`);
+    // Keep last known value; don't reset to floor (avoids under-tipping during API hiccups)
+  }
+}
+
 // 8 known Jito tip accounts — one is chosen at random per bundle
 const JITO_TIP_ACCOUNTS = [
   '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
@@ -627,6 +655,10 @@ async function sendViaJitoBundle(swapTxBase64, keypair) {
   const { Connection, VersionedTransaction, Transaction, SystemProgram, PublicKey } = SolanaWeb3;
   const connection = new Connection(SOL_RPC, 'confirmed');
 
+  // 0. Refresh the dynamic tip (no-op if still fresh within 30s)
+  await fetchJitoTip();
+  const tipLamports = _jitoTip;
+
   // 1. Sign the Jupiter swap transaction
   const swapBuf = Buffer.from(swapTxBase64, 'base64');
   const swapTx  = VersionedTransaction.deserialize(swapBuf);
@@ -641,7 +673,7 @@ async function sendViaJitoBundle(swapTxBase64, keypair) {
   tipTx.add(SystemProgram.transfer({
     fromPubkey: keypair.publicKey,
     toPubkey:   tipAcctPubkey,
-    lamports:   JITO_TIP_LAMPORTS,
+    lamports:   tipLamports,
   }));
   tipTx.sign(keypair);
 
@@ -681,7 +713,7 @@ async function sendViaJitoBundle(swapTxBase64, keypair) {
   const parsed = JSON.parse(jitoResult.body);
   if (parsed.error) throw new Error(`Jito bundle rejected: ${parsed.error.message || JSON.stringify(parsed.error)}`);
   const bundleId = parsed.result;
-  console.log(`[JITO] Bundle submitted: ${bundleId}`);
+  console.log(`[JITO] Bundle submitted: ${bundleId} | tip: ${tipLamports} lamports`);
 
   // 5. Derive the swap tx signature from the signed transaction
   const sig = bs58.encode(Buffer.from(swapTx.signatures[0]));
