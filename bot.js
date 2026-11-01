@@ -778,7 +778,9 @@ async function executeRealEntry(coin, wallet, posSize) {
 
     const sig = await sendViaJitoBundle(swapTx, keypair);
     console.log(`[REAL] ✅ ENTRY TX confirmed (Jito): https://solscan.io/tx/${sig}`);
-    return { txHash: sig, executedPrice: coin.price, tokenAmount, tokenDecimals: outDecimals };
+    const entryImpactPct = parseFloat(quote.priceImpactPct || 0) * 100;
+    const jitoTipUsd     = (_jitoTip / 1e9) * solPrice;
+    return { txHash: sig, executedPrice: coin.price, tokenAmount, tokenDecimals: outDecimals, entryImpactPct, jitoTipUsd };
   } catch(e) {
     console.error(`[REAL] ENTRY failed for ${coin.symbol}:`, e.message);
     return { txHash: null, executedPrice: coin.price, error: e.message };
@@ -834,7 +836,10 @@ async function executeRealExit(pos, wallet, exitPrice) {
 
     const sig = await sendViaJitoBundle(swapTx, keypair);
     console.log(`[REAL] ✅ EXIT TX confirmed (Jito): https://solscan.io/tx/${sig}`);
-    return { txHash: sig, executedPrice: exitPrice };
+    const exitImpactPct = parseFloat(quote.priceImpactPct || 0) * 100;
+    const solPriceExit  = await getSolPriceUsd();
+    const jitoTipUsd    = (_jitoTip / 1e9) * solPriceExit;
+    return { txHash: sig, executedPrice: exitPrice, exitImpactPct, jitoTipUsd };
   } catch(e) {
     console.error(`[REAL] EXIT failed for ${pos.symbol}:`, e.message);
     return { txHash: null, executedPrice: exitPrice, error: e.message };
@@ -880,6 +885,15 @@ function simulateFillPrice(rawPrice, positionSize, liquidityUsd, isBuy) {
     : (1 - DEX_FEE - slippage);
 
   return rawPrice * costFactor;
+}
+
+// Returns the dollar cost of the fee/slippage haircut on an exit fill.
+// paper mode only — for real mode, use jitoTipUsd + exitImpactPct from the tx.
+function calcExitFeeUsd(pos, rawPrice, fillPrice, fraction) {
+  if (!rawPrice || rawPrice <= 0) return 0;
+  const frac = fraction != null ? fraction : (pos.remaining || 1);
+  // Cost = dollars we lost vs fair value: position_value * (1 - fillPrice/rawPrice)
+  return pos.size * frac * Math.max(0, 1 - fillPrice / rawPrice);
 }
 
 async function enterPosition(coin, overrides = {}) {
@@ -956,8 +970,16 @@ async function enterPosition(coin, overrides = {}) {
     realTxEntry:     realTx ? realTx.txHash       : null,
     // Raw token units received from Jupiter swap — required for executeRealExit
     realTokenAmount: realTx ? (realTx.tokenAmount || null) : null,
+    // Fee tracking
+    entryImpactPct:  realTx?.entryImpactPct ?? null,
+    entryJitoTipUsd: realTx?.jitoTipUsd ?? null,
+    entryFeeUsd:     tradingMode === 'paper'
+      ? (effectiveEntry - rawEntryPrice) / rawEntryPrice * posSize
+      : (realTx?.jitoTipUsd || 0) + ((realTx?.entryImpactPct || 0) / 100 * posSize),
   };
   await ref.set(pos);
+  // Accumulate capital deployed + entry fee into daily stats (fire-and-forget)
+  updateDailyStatsEntry(posSize, pos.entryFeeUsd).catch(e => console.warn('[FEE]', e.message));
   const newPos = { id: ref.id, ...pos };
   if (_posCache) _posCache.push(newPos);
   return newPos;
@@ -1158,6 +1180,7 @@ async function getDailyStats() {
       realizedPnL: 0, trades: 0, wins: 0, losses: 0,
       autoPnL: 0, autoTrades: 0, autoWins: 0,
       manualPnL: 0, manualTrades: 0, manualWins: 0,
+      dailyFees: 0, grossProfit: 0, grossLoss: 0, capitalDeployed: 0,
     };
     await db.collection(stats).doc(today).set(init);
     _statsCache = init; _statsCacheAt = now;
@@ -1174,7 +1197,7 @@ async function getDailyStats() {
   return data;
 }
 
-async function updateDailyStats(pnl, isWin, isManual = false) {
+async function updateDailyStats(pnl, isWin, isManual = false, exitFeeUsd = 0) {
   const today = new Date().toISOString().slice(0,10);
   const { stats } = await getCollections();
   const base = {
@@ -1182,6 +1205,9 @@ async function updateDailyStats(pnl, isWin, isManual = false) {
     trades:      FieldValue.increment(1),
     wins:        FieldValue.increment(isWin ? 1 : 0),
     losses:      FieldValue.increment(isWin ? 0 : 1),
+    dailyFees:   FieldValue.increment(exitFeeUsd),
+    grossProfit: FieldValue.increment(pnl > 0 ? pnl : 0),
+    grossLoss:   FieldValue.increment(pnl < 0 ? Math.abs(pnl) : 0),
   };
   if (isManual) {
     base.manualPnL    = FieldValue.increment(pnl);
@@ -1194,6 +1220,16 @@ async function updateDailyStats(pnl, isWin, isManual = false) {
   }
   await db.collection(stats).doc(today).set(base, { merge: true });
   _statsCache = null; _statsCacheAt = 0; // bust cache so next read gets fresh P&L
+}
+
+async function updateDailyStatsEntry(posSize, entryFeeUsd) {
+  const today = new Date().toISOString().slice(0,10);
+  const { stats } = await getCollections();
+  await db.collection(stats).doc(today).set({
+    capitalDeployed: FieldValue.increment(posSize),
+    dailyFees:       FieldValue.increment(entryFeeUsd),
+  }, { merge: true });
+  _statsCache = null; _statsCacheAt = 0;
 }
 
 // ─── PRICE FETCHER ────────────────────────────────────────────────────────────
@@ -1344,6 +1380,27 @@ async function pollTelegramCommands() {
         );
       }
 
+      if (text === '/stats') {
+        const stats       = await getDailyStats();
+        const grossProfit = stats.grossProfit    || 0;
+        const grossLoss   = stats.grossLoss      || 0;
+        const fees        = stats.dailyFees      || 0;
+        const netRevenue  = grossProfit - grossLoss - fees;
+        const capital     = stats.capitalDeployed || 0;
+        const winRate     = stats.trades > 0 ? ((stats.wins/stats.trades)*100).toFixed(0) : '—';
+        await sendTelegram(
+          `📈 *DAILY REVENUE REPORT*\n\n` +
+          `✅ Gross profit:  +$${grossProfit.toFixed(2)}\n` +
+          `❌ Gross loss:    -$${grossLoss.toFixed(2)}\n` +
+          `💸 Fees paid:     -$${fees.toFixed(2)}\n` +
+          `─────────────────────\n` +
+          `🏆 Net revenue:   ${netRevenue>=0?'+':''}$${netRevenue.toFixed(2)}\n\n` +
+          `💼 Capital deployed: $${capital.toFixed(2)}\n` +
+          `📊 Trades: ${stats.trades} · Win rate: ${winRate}% (${stats.wins}W/${stats.losses}L)\n` +
+          `💰 Running P&L: ${stats.realizedPnL>=0?'+':''}$${stats.realizedPnL.toFixed(2)}`
+        );
+      }
+
       // ── /mode paper  or  /mode real ──────────────────────────────────────────
       if (text.startsWith('/mode ')) {
         const newMode = text.split(' ')[1]?.trim();
@@ -1422,7 +1479,7 @@ async function pollTelegramCommands() {
               const exitPnl = (price - pos.entryPrice) / pos.entryPrice * (pos.size || POSITION_SIZE) * (pos.remaining || 1);
               const pnl     = (pos.pnl || 0) + exitPnl;
               await closePosition(pos.id, { exitPrice: price, exitReason: 'MANUAL_CLEARALL', pnl });
-              await updateDailyStats(exitPnl, exitPnl > 0, !!pos.isManual);
+              await updateDailyStats(exitPnl, exitPnl > 0, !!pos.isManual, 0);
               enteredToday.delete(pos.address);
               cleared++;
             } catch(e) {
@@ -1452,6 +1509,7 @@ async function pollTelegramCommands() {
         await sendTelegram(
           `📋 *MemeScan Bot Commands*\n\n` +
           `/status — P&L, mode, balance\n` +
+          `/stats — daily revenue: profit, losses, fees, net\n` +
           `/mode paper — switch to paper trading\n` +
           `/mode real — switch to real (Solana) trading\n` +
           `/wallets — list connected wallets\n` +
@@ -1743,7 +1801,7 @@ function priceQualityLabel(addr) {
 //
 // Mutates coin._pulledBackPct / coin._bouncedPct so the Telegram entry message
 // can mention the pullback details when returning true.
-function checkSurgePullback(coin) {
+function checkSurgePullback(coin, pullbackMin = SURGE_PULLBACK_MIN, bounceConfirm = SURGE_BOUNCE_CONFIRM) {
   const addr  = coin.addr;
   const price = coin.price;
   const now   = Date.now();
@@ -1788,15 +1846,15 @@ function checkSurgePullback(coin) {
     return false;
   }
 
-  // ── PULLBACK ZONE (5–35% below peak) ─────────────────────────────────────────
-  if (dropFromPeak >= SURGE_PULLBACK_MIN) {
+  // ── PULLBACK ZONE ─────────────────────────────────────────────────────────────
+  if (dropFromPeak >= pullbackMin) {
     entry.pullbackDetected = true;
     if (price < entry.pullbackLow) entry.pullbackLow = price; // track the deepest dip
 
     // ── BOUNCE CONFIRMATION: recovering from pullback low ─────────────────────
     if (entry.pullbackLow < Infinity) {
       const bounceFromLow = (price - entry.pullbackLow) / entry.pullbackLow;
-      if (bounceFromLow >= SURGE_BOUNCE_CONFIRM) {
+      if (bounceFromLow >= bounceConfirm) {
         // Bounce confirmed — enter now!
         coin._pulledBackPct = (dropFromPeak  * 100).toFixed(1);
         coin._bouncedPct    = (bounceFromLow * 100).toFixed(1);
@@ -1804,15 +1862,15 @@ function checkSurgePullback(coin) {
         surgeWatchlist.delete(addr);
         return true; // ✅ enter position
       }
-      console.log(`[SURGE-WATCH] ${coin.symbol} — pullback ${(dropFromPeak*100).toFixed(1)}% | bounce ${(bounceFromLow*100).toFixed(1)}% (need ${(SURGE_BOUNCE_CONFIRM*100).toFixed(0)}%)`);
+      console.log(`[SURGE-WATCH] ${coin.symbol} — pullback ${(dropFromPeak*100).toFixed(1)}% | bounce ${(bounceFromLow*100).toFixed(1)}% (need ${(bounceConfirm*100).toFixed(0)}%)`);
     } else {
       console.log(`[SURGE-WATCH] ${coin.symbol} — in pullback ${(dropFromPeak*100).toFixed(1)}% below peak — tracking low`);
     }
     return false;
   }
 
-  // ── SMALL DIP (0–5% below peak): not yet in pullback zone ────────────────────
-  console.log(`[SURGE-WATCH] ${coin.symbol} — ${(dropFromPeak*100).toFixed(1)}% below peak — waiting for ≥${(SURGE_PULLBACK_MIN*100).toFixed(0)}% pullback`);
+  // ── SMALL DIP: not yet in pullback zone ──────────────────────────────────────
+  console.log(`[SURGE-WATCH] ${coin.symbol} — ${(dropFromPeak*100).toFixed(1)}% below peak — waiting for ≥${(pullbackMin*100).toFixed(0)}% pullback`);
   return false;
 }
 
@@ -1923,14 +1981,17 @@ async function monitorPositions() {
     if (!pos.closeRequested) continue;
     const isManual = !!pos.isManual;
     const price    = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
-    const exitPnl  = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+    const exitFillPriceManual = pos.tradingMode === 'paper'
+      ? simulateFillPrice(price, pos.size * pos.remaining, pos.liquidityAtEntry || 0, false)
+      : price;
+    const exitPnl  = (exitFillPriceManual - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
     const pnl      = (pos.pnl || 0) + exitPnl;
-    await closePosition(pos.id, { exitPrice: price, exitReason: 'MANUAL_CLOSE', pnl });
-    await updateDailyStats(exitPnl, exitPnl > 0, isManual);
+    await closePosition(pos.id, { exitPrice: exitFillPriceManual, exitReason: 'MANUAL_CLOSE', pnl });
+    await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPriceManual, pos.remaining));
     enteredToday.delete(pos.address);
     await sendTelegram(
       `🚫 *MANUAL CLOSE*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-      `Exit: $${fmtPrice(price)} | P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*`
+      `Exit: $${fmtPrice(exitFillPriceManual)} | P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*`
     );
   }
 
@@ -1970,11 +2031,14 @@ async function monitorPositions() {
     // Auto-close after 7 days
     if (Date.now() - pos.enteredAt > 7 * 86400000) {
       const price   = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
-      const exitPnl = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+      const exitFillPriceExp = pos.tradingMode === 'paper'
+        ? simulateFillPrice(price, pos.size * pos.remaining, pos.liquidityAtEntry || 0, false)
+        : price;
+      const exitPnl = (exitFillPriceExp - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
       const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
-      await closePosition(pos.id, { exitPrice: price, exitReason: 'EXPIRED', pnl });
-      await updateDailyStats(exitPnl, exitPnl > 0, isManual);
-      await sendTelegram(`⏰ *EXPIRED* — *${pos.symbol}*\nExit: $${fmtPrice(price)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
+      await closePosition(pos.id, { exitPrice: exitFillPriceExp, exitReason: 'EXPIRED', pnl });
+      await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPriceExp, pos.remaining));
+      await sendTelegram(`⏰ *EXPIRED* — *${pos.symbol}*\nExit: $${fmtPrice(exitFillPriceExp)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
       enteredToday.delete(pos.address);
       continue;
     }
@@ -2034,7 +2098,7 @@ async function monitorPositions() {
         const exitPnl = fillGain * pos.size * pos.remaining;
         const pnl     = (pos.pnl || 0) + exitPnl;
         await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'SURGE_EXIT', pnl });
-        await updateDailyStats(exitPnl, true, isManual);
+        await updateDailyStats(exitPnl, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
         enteredToday.delete(pos.address);
         await sendTelegram(
           `🚀 *SURGE EXIT — FULL POSITION*\n\n` +
@@ -2074,7 +2138,7 @@ async function monitorPositions() {
             const exitPnl = fillGain * pos.size * pos.remaining;
             const pnl     = (pos.pnl || 0) + exitPnl;
             await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'SURGE_STALE_PROFIT', pnl });
-            await updateDailyStats(exitPnl, true, isManual);
+            await updateDailyStats(exitPnl, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
             enteredToday.delete(pos.address);
             await sendTelegram(
               `⏱ *SURGE FADED — QUICK EXIT*\n\n` +
@@ -2097,7 +2161,7 @@ async function monitorPositions() {
             const exitPnl = fillGain * pos.size * pos.remaining;
             const pnl     = (pos.pnl || 0) + exitPnl;
             await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'SURGE_STALE_LOSS', pnl });
-            await updateDailyStats(exitPnl, false, isManual);
+            await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
             enteredToday.delete(pos.address);
             await sendTelegram(
               `⏱ *SURGE STALE — EXIT WITH LOSS*\n\n` +
@@ -2125,7 +2189,7 @@ async function monitorPositions() {
         const exitPnl = fillGain * pos.size * pos.remaining;
         const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
         await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'RUG_DETECTED', pnl });
-        await updateDailyStats(exitPnl, exitPnl > 0, isManual);
+        await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
         recentSLCoins.set(pos.address, Date.now()); // block re-entry for 6h
         const dropPct = ((price / currentPeak - 1) * 100).toFixed(0);
         await sendTelegram(
@@ -2151,7 +2215,7 @@ async function monitorPositions() {
         const exitPnl = fillGain * pos.size * pos.remaining;
         const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial TP exits
         await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'STOP_LOSS', pnl });
-        await updateDailyStats(exitPnl, false, isManual);
+        await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
         recentSLCoins.set(pos.address, Date.now()); // block re-entry for 6h — prevents triple entries
         await sendTelegram(
           `🛑 *STOP LOSS HIT*\n\n` +
@@ -2191,7 +2255,7 @@ async function monitorPositions() {
           const newRec   = (pos.recoveredAmount || 0) + proceeds;
           updates = { partialStage:1, remaining: pos.remaining - frac,
             recoveredAmount: newRec, pnl: (pos.pnl || 0) + partPnL };
-          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
+          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, frac));
           alertMsg = `🔥 *YOUNG COIN — 30% SOLD (+10%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
             `⚡ Quick exit: coin is <1h old\n` +
             `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
@@ -2205,7 +2269,7 @@ async function monitorPositions() {
           const newRec   = (pos.recoveredAmount || 0) + proceeds;
           updates = { partialStage:2, remaining: pos.remaining - frac,
             recoveredAmount: newRec, pnl: (pos.pnl || 0) + partPnL };
-          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
+          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, frac));
           alertMsg = `🔥 *YOUNG COIN — 30% MORE SOLD (+20%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
             `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
             `🎯 Riding 40% — next exit at +30%\n🔗 [Chart](${pos.dexUrl})`;
@@ -2222,7 +2286,7 @@ async function monitorPositions() {
             pnl: (pos.pnl || 0) + partPnL,
             // Tighten SL to 5% after final quick exit — protect the last 10%
             currentSL: price * 0.95, initialTrailPct: 8 };
-          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
+          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, frac));
           alertMsg = `🔥 *YOUNG COIN — FINAL QUICK EXIT (+30%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
             `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
             `🎯 10% remains on tight 5% trailing SL — ride or die!\n🔗 [Chart](${pos.dexUrl})`;
@@ -2237,7 +2301,7 @@ async function monitorPositions() {
           const newRec   = (pos.recoveredAmount || 0) + proceeds;
           updates = { partialStage:1, remaining: pos.remaining - frac,
             recoveredAmount: newRec, pnl: (pos.pnl || 0) + partPnL };
-          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
+          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, frac));
           alertMsg = `⚡ *STAGE 1 — 25% SOLD (+50%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
             `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
             `🎯 Recovered $${newRec.toFixed(2)} / $${target.toFixed(2)} — riding 75%\n🔗 [Chart](${pos.dexUrl})`;
@@ -2251,7 +2315,7 @@ async function monitorPositions() {
           const fr       = newRec >= target;
           updates = { partialStage:2, remaining: pos.remaining - frac,
             recoveredAmount: newRec, freeRide: fr, pnl: (pos.pnl || 0) + partPnL };
-          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
+          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, frac));
           alertMsg = `⚡ *STAGE 2 — 30% SOLD (+100%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
             `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
             `🎯 Recovered $${newRec.toFixed(2)}${fr?' ✅ FREE RIDE!':''}\n🔗 [Chart](${pos.dexUrl})`;
@@ -2264,7 +2328,7 @@ async function monitorPositions() {
           const newRec   = (pos.recoveredAmount || 0) + proceeds;
           updates = { partialStage:3, remaining: pos.remaining - frac,
             recoveredAmount: newRec, freeRide: true, pnl: (pos.pnl || 0) + partPnL };
-          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
+          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, frac));
           alertMsg = `🚀 *STAGE 3 — FREE RIDE (+200%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
             `💰 Total recovered: $${newRec.toFixed(2)} | Remaining ${((pos.remaining-frac)*100).toFixed(0)}% is pure profit\n🔗 [Chart](${pos.dexUrl})`;
           Object.assign(pos, updates);
@@ -2280,7 +2344,7 @@ async function monitorPositions() {
         const partPnL = fillGain * pos.size * 0.50;
         updates = { tp1Hit:true, remaining: pos.remaining - 0.50,
           currentSL: pos.entryPrice * 1.01, trailingActive:true, pnl: (pos.pnl || 0) + partPnL };
-        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
+        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, 0.50));
         alertMsg = `✅ *TP1 HIT — 50% SOLD*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
           `Entry: $${fmtPrice(pos.entryPrice)} → $${fmtPrice(exitFillPrice)}\n` +
           `💰 +$${partPnL.toFixed(2)} | SL → breakeven\n🔗 [Chart](${pos.dexUrl})`;
@@ -2290,7 +2354,7 @@ async function monitorPositions() {
         const partPnL = fillGain * pos.size * 0.30;
         updates = { tp2Hit:true, remaining: pos.remaining - 0.30,
           currentSL: pos.tp1 * 0.99, pnl: (pos.pnl || 0) + partPnL };
-        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual);
+        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, 0.30));
         alertMsg = `🎯 *TP2 HIT — 30% SOLD*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
           `💰 +$${partPnL.toFixed(2)} | SL → TP1 level\n🔗 [Chart](${pos.dexUrl})`;
         Object.assign(pos, updates);
@@ -2298,7 +2362,7 @@ async function monitorPositions() {
       else if (pos.tp1Hit && pos.tp2Hit && price >= pos.tp3) {
         const partPnL = fillGain * pos.size * pos.remaining;
         await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason:'TP3', pnl: (pos.pnl || 0) + partPnL });
-        await updateDailyStats(partPnL, true, isManual);
+        await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
         enteredToday.delete(pos.address);
         await sendTelegram(`🏆 *TP3 — FULL EXIT*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
           `Entry: $${fmtPrice(pos.entryPrice)} → $${fmtPrice(exitFillPrice)}\n` +
@@ -2705,6 +2769,17 @@ async function scanForEntries() {
       }
     }
 
+    // Bottom Bounce (id 0) and Old Recovery (id 3) are already at a 24h low,
+    // so use softer thresholds: 3% pullback + 2% bounce confirms the intraday
+    // direction without requiring an unrealistic dip from an already-depressed price.
+    if (coin.strategy.id === 0 || coin.strategy.id === 3) {
+      const shouldEnter = checkSurgePullback(coin, 0.03, 0.02);
+      if (!shouldEnter) {
+        usedThisScan.add(coin.addr);
+        continue;
+      }
+    }
+
     // Reserve coin BEFORE the async enterPosition call — a concurrent scan tick
     // starting during the Firestore await would otherwise find the coin absent
     // from enteredToday and enter it a second time. Roll back if entry fails.
@@ -2780,13 +2855,24 @@ async function sendHourlySummary() {
   positions.forEach(p => { if (p.strategyId != null) slotCount[p.strategyId]++; });
   const winRate = stats.trades > 0 ? ((stats.wins/stats.trades)*100).toFixed(0) : '—';
 
+  const grossProfit = stats.grossProfit    || 0;
+  const grossLoss   = stats.grossLoss      || 0;
+  const fees        = stats.dailyFees      || 0;
+  const netRevenue  = grossProfit - grossLoss - fees;
+  const capital     = stats.capitalDeployed || 0;
+
   let slotLines = STRATEGIES.map(s =>
     `  ${s.label}: ${slotCount[s.id]}/${s.maxSlots}`
   ).join('\n');
 
   await sendTelegram(
     `📊 *MEMESCAN — HOURLY*\n\n` +
-    `💰 Daily P&L: *${stats.realizedPnL>=0?'+':''}$${stats.realizedPnL.toFixed(2)}*\n` +
+    `✅ Gross profit:  +$${grossProfit.toFixed(2)}\n` +
+    `❌ Gross loss:    -$${grossLoss.toFixed(2)}\n` +
+    `💸 Fees paid:     -$${fees.toFixed(2)}\n` +
+    `─────────────────────\n` +
+    `🏆 Net revenue:   ${netRevenue>=0?'+':''}$${netRevenue.toFixed(2)}\n` +
+    `💼 Capital used:  $${capital.toFixed(2)}\n\n` +
     `📈 Win rate: ${winRate}% (${stats.wins}W/${stats.losses}L)\n` +
     `🔓 Positions: ${positions.length}/${MAX_POSITIONS}\n\n` +
     `*Slots:*\n${slotLines}`
