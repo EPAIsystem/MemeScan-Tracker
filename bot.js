@@ -26,7 +26,7 @@ const TELEGRAM_TOKEN  = process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_T
 const TELEGRAM_CHAT   = process.env.TELEGRAM_CHAT_ID   || process.env.TELEGRAM_CHAT;
 const POSITION_SIZE   = parseFloat(process.env.POSITION_SIZE || '100');
 const MAX_POSITIONS   = 10;
-const MIN_SCORE       = 72;  // raised from 60 — only enter high-confidence signals
+const MIN_SCORE       = 50;  // floor = base score of any detected pattern; effectively "enter anything that matches a strategy"
 const DAILY_LOSS_LIMIT= -0.30;
 const SCAN_INTERVAL   = 15000;  // 15s — entry scanner
 const PRICE_CHECK     =  3000;  //  3s — position monitor (all hot-path reads cached; ~5,760 reads/day total)
@@ -2596,9 +2596,9 @@ async function scanForEntries() {
   // ── Trending cross-reference ──────────────────────────────────────────────
   // Merge pump.fun + Birdeye (refreshed every 5 min) with DexScreener boosts
   // (already fetched above) into one per-scan map: addr → platform count.
-  // trendCount 0 → use base scoreThreshold (72)
-  // trendCount 1 → threshold drops to 65
-  // trendCount 2+ → threshold drops to 57
+  // trendCount 0 → use base scoreThreshold (MIN_SCORE)
+  // trendCount 1 → threshold drops by 4
+  // trendCount 2+ → threshold drops by 8
   await fetchTrendingAddrs();
   const scanTrendingMap = new Map(trendingAddrs); // start from pump.fun + Birdeye
   for (const a of dexBoostAddrs) {
@@ -2630,10 +2630,14 @@ async function scanForEntries() {
     const result = detectStrategy(pair, openStrategies);
     if (result) {
       // Tiered threshold: trending presence lowers the bar
-      // Base: 72 | On 1 platform: 65 | On 2+ platforms: 57
+      // Base: MIN_SCORE | On 1 platform: −4 | On 2+ platforms: −8 (always relative to base)
       const addrLower  = (result.addr || '').toLowerCase();
       const trendCount = scanTrendingMap.get(addrLower) || 0;
-      const effectiveThreshold = trendCount >= 2 ? 57 : trendCount === 1 ? 65 : scoreThreshold;
+      const effectiveThreshold = trendCount >= 2
+        ? Math.max(30, scoreThreshold - 8)
+        : trendCount === 1
+        ? Math.max(34, scoreThreshold - 4)
+        : scoreThreshold;
 
       if (result.score >= effectiveThreshold) {
         if (trendCount > 0) result._trendingPlatforms = trendCount; // attach badge for Telegram
@@ -2661,7 +2665,7 @@ async function scanForEntries() {
 
   // ── PERIODIC "WATCHING" REPORT — every 60 scans (~15 min) ───────────────────
   // Tells Telegram what the bot is monitoring but has NOT entered yet.
-  // Score 60–71 = on radar, almost qualifying. Score ≥ 72 = entered (separate message).
+  // Score ≥ 60 = on radar (strong signal, monitoring). Score ≥ MIN_SCORE = entered (separate message).
   // This answers: "are those 3 coins qualified or just monitoring?" — here they are NOT.
   if (scanCount % 60 === 0) {
     // Sort near-miss candidates by score descending, dedupe by symbol
