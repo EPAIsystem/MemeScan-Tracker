@@ -2742,47 +2742,61 @@ async function scanForEntries() {
     if (slotCount[coin.strategy.id] >= coin.strategy.maxSlots) continue;
 
     // ── PULLBACK GATE — wait for a dip before entering, not at the peak ────────
-    // Applied to SURGE_CATCH (id 2) and ACTIVE MOMENTUM (id 1).
-    // Uses the same checkSurgePullback() state machine for both:
-    //   ≥5% dip from peak → track lowest point → ≥3% bounce from that low → enter.
-    // This means we buy AFTER the pullback recovery, not at the top of a surge.
+    // Applied to SURGE_CATCH (id 2) and ACTIVE MOMENTUM (id 1) only.
+    // Bottom Bounce (id 0) and Old Recovery (id 3) are EXEMPT: their 24h drop
+    // IS the pullback — adding another intraday dip gate double-filters them and
+    // prevents any entries after a bot restart (surgeWatchlist is empty on deploy).
     //
-    // EXPLOSIVE BYPASS for Active Momentum:
-    //   If m5 > 8% AND h1 > 25% AND buyPct > 70%, the trend is so strong that
-    //   a normal pullback may never come. Enter immediately to avoid missing the move.
+    // Three ways through for id 1 / id 2:
+    //   A) EXPLOSIVE BYPASS (id 1 only): m5 > 8% AND h1 > 25% AND buyPct > 70%
+    //      — trend so strong a pullback may never come; enter immediately.
+    //   B) MOMENTUM BYPASS: coin has been watched ≥5 min with m5 rising (>2%)
+    //      and solid buy pressure (>62%) — handles "bot restarted mid-move" case
+    //      where the watchlist was empty and the pullback cycle can't complete.
+    //   C) FULL PULLBACK CYCLE: ≥5% dip from peak → ≥3% bounce from that low.
+
     if (coin.strategy.id === 2) {
-      const shouldEnter = checkSurgePullback(coin);
-      if (!shouldEnter) {
-        usedThisScan.add(coin.addr); // don't reprocess the same coin twice this scan
-        // NOT added to enteredToday — must remain visible in future scan ticks
-        continue;
+      const watchEntry = surgeWatchlist.get(coin.addr);
+      const watchedMs  = watchEntry ? (Date.now() - watchEntry.watchedSince) : 0;
+      const isMomentumBypass = watchedMs > 5 * 60 * 1000
+        && (coin.m5Ch || 0) > 2 && (coin.buyPct || 0) > 62;
+      if (isMomentumBypass) {
+        console.log(`[SURGE-WATCH] ${coin.symbol} — MOMENTUM BYPASS (watched ${Math.round(watchedMs/60000)}min, m5:${coin.m5Ch?.toFixed(1)}%, buy:${coin.buyPct?.toFixed(0)}%) — entering`);
+        coin._momentumBypass = true;
+      } else {
+        const shouldEnter = checkSurgePullback(coin);
+        if (!shouldEnter) {
+          usedThisScan.add(coin.addr); // don't reprocess same coin twice this scan
+          continue;
+        }
       }
     }
 
     if (coin.strategy.id === 1) {
       const isExplosive = (coin.m5Ch || 0) >= 8 && (coin.ch1 || 0) >= 25 && (coin.buyPct || 0) >= 70;
-      if (!isExplosive) {
-        const shouldEnter = checkSurgePullback(coin);
-        if (!shouldEnter) {
-          usedThisScan.add(coin.addr);
-          continue;
-        }
-      } else {
+      if (isExplosive) {
         console.log(`[AM-WATCH] ${coin.symbol} — EXPLOSIVE entry bypass (m5:${coin.m5Ch?.toFixed(1)}% h1:${coin.ch1?.toFixed(1)}% buy:${coin.buyPct?.toFixed(0)}%) — entering immediately`);
-        coin._explosiveEntry = true; // badge in Telegram
+        coin._explosiveEntry = true;
+      } else {
+        const watchEntry = surgeWatchlist.get(coin.addr);
+        const watchedMs  = watchEntry ? (Date.now() - watchEntry.watchedSince) : 0;
+        const isMomentumBypass = watchedMs > 5 * 60 * 1000
+          && (coin.m5Ch || 0) > 2 && (coin.buyPct || 0) > 62;
+        if (isMomentumBypass) {
+          console.log(`[AM-WATCH] ${coin.symbol} — MOMENTUM BYPASS (watched ${Math.round(watchedMs/60000)}min, m5:${coin.m5Ch?.toFixed(1)}%, buy:${coin.buyPct?.toFixed(0)}%) — entering`);
+          coin._momentumBypass = true;
+        } else {
+          const shouldEnter = checkSurgePullback(coin);
+          if (!shouldEnter) {
+            usedThisScan.add(coin.addr);
+            continue;
+          }
+        }
       }
     }
 
-    // Bottom Bounce (id 0) and Old Recovery (id 3) are already at a 24h low,
-    // so use softer thresholds: 3% pullback + 2% bounce confirms the intraday
-    // direction without requiring an unrealistic dip from an already-depressed price.
-    if (coin.strategy.id === 0 || coin.strategy.id === 3) {
-      const shouldEnter = checkSurgePullback(coin, 0.03, 0.02);
-      if (!shouldEnter) {
-        usedThisScan.add(coin.addr);
-        continue;
-      }
-    }
+    // id 0 (Bottom Bounce) and id 3 (Old Recovery): NO pullback gate.
+    // The 24h decline already confirmed the drawdown — enter when momentum turns positive.
 
     // Reserve coin BEFORE the async enterPosition call — a concurrent scan tick
     // starting during the Firestore await would otherwise find the coin absent
