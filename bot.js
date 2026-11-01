@@ -2171,7 +2171,13 @@ async function monitorPositions() {
           );
         }
       } else {
-        newSL = price * (1 - calcTrailPct(pos.initialTrailPct, gainPct) / 100);
+        let trailPct = calcTrailPct(pos.initialTrailPct, gainPct);
+        // SURGE_CATCH profit lock: once ≥20% gain, clamp trail to 5%
+        // Slippery coins spike fast and reverse hard — hold the gain tight
+        if (pos.strategyId === 2 && gain >= 0.20 && !pos.surgeMomentum) {
+          trailPct = Math.min(trailPct, 5);
+        }
+        newSL = price * (1 - trailPct / 100);
       }
       const currentSL = updates.currentSL ?? pos.currentSL;
       // Only write if SL moved ≥ 0.5% — prevents thousands of tiny writes per day

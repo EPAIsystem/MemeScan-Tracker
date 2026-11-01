@@ -250,6 +250,7 @@ header {
   color: var(--fg2); white-space: nowrap;
 }
 .pos-score { font-family: var(--mono); font-size: 10px; color: var(--fg3); margin-top: 4px; }
+.pos-age   { font-size: 11px; color: var(--yellow); font-weight: 600; margin-top: 3px; letter-spacing: 0.02em; }
 
 .price-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 13px; }
 .price-block { }
@@ -881,6 +882,17 @@ function fmtDate(ts) {
          d.toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit' });
 }
 
+function fmtAge(ms) {
+  if (ms < 60000)      return '<1m';
+  if (ms < 3600000)    return `${Math.floor(ms/60000)}m`;
+  const h = Math.floor(ms/3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  if (ms < 86400000)   return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  const d = Math.floor(ms/86400000);
+  const hr = Math.floor((ms % 86400000) / 3600000);
+  return hr > 0 ? `${d}d ${hr}h` : `${d}d`;
+}
+
 function livePnl(pos) {
   const cur = S.prices[pos.address];
   if (!cur) return null;
@@ -1107,15 +1119,15 @@ function posCard(pos) {
   const isProfit = pnl != null && pnl >= 0;
   const cardClass = pnl == null ? '' : isProfit ? 'profit' : 'loss';
   const expanded = S.expandedPos && S.expandedPos.has(pos._id);
-  const ageMs = pos.enteredAt ? Date.now() - pos.enteredAt : 0;
-  const ageStr = ageMs > 3600000 ? `${(ageMs/3600000).toFixed(1)}h` : `${Math.floor(ageMs/60000)}m`;
+  const ageMs  = pos.enteredAt ? Date.now() - pos.enteredAt : 0;
+  const ageStr = fmtAge(ageMs);
 
   const detailPanel = `
     <div class="pos-detail">
       <div class="pos-detail-row"><span>Chain</span><span>${(pos.chain||'solana').toUpperCase()}</span></div>
       <div class="pos-detail-row"><span>Strategy</span><span>${pos.strategyLabel || pos.catLabel || '—'}</span></div>
       <div class="pos-detail-row"><span>Score</span><span>${pos.score || '—'}/100</span></div>
-      <div class="pos-detail-row"><span>Age in trade</span><span>${ageStr}</span></div>
+      <div class="pos-detail-row"><span>Age in trade</span><span class="pos-age" data-entered-at="${pos.enteredAt || ''}">${ageStr}</span></div>
       <div class="pos-detail-row"><span>Size</span><span>$${pos.size}</span></div>
       ${pos.liquidityAtEntry ? `<div class="pos-detail-row"><span>Liq at entry</span><span>$${(pos.liquidityAtEntry/1000).toFixed(0)}k</span></div>` : ''}
       ${pos.rawEntryPrice ? `<div class="pos-detail-row"><span>Raw price (pre-fee)</span><span>${fmtPrice(pos.rawEntryPrice)}</span></div>` : ''}
@@ -1135,6 +1147,7 @@ function posCard(pos) {
         <span class="cat-badge">${pos.strategyLabel || pos.catLabel || ''}</span>
         ${pos.youngCoin ? `<span style="font-size:10px;background:rgba(255,100,0,0.25);color:#ff8c42;border:1px solid rgba(255,140,66,0.4);border-radius:4px;padding:1px 5px;margin-left:3px;">🔥 YOUNG</span>` : ''}
         <div class="pos-score">Score ${pos.score || '—'}/100</div>
+        ${pos.enteredAt ? `<div class="pos-age" data-entered-at="${pos.enteredAt}" title="Time since entry">⏱ ${ageStr}</div>` : ''}
       </div>
     </div>
 
@@ -1736,4 +1749,15 @@ S.config = loadCfg();
 render();
 if (S.config) loadData();
 setInterval(() => { if (S.config && !S.loading) loadData(); }, 60000);
+
+// ── Live age clock — updates every 30s without a full re-render ───────────────
+// Header chip has title="Time since entry"; detail-panel span does not.
+setInterval(() => {
+  document.querySelectorAll('.pos-age[data-entered-at]').forEach(el => {
+    const ts = parseInt(el.dataset.enteredAt, 10);
+    if (!ts) return;
+    const age = fmtAge(Date.now() - ts);
+    el.textContent = el.title ? '⏱ ' + age : age;
+  });
+}, 30000);
 </script>
