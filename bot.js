@@ -67,6 +67,16 @@ const PRICE_HIST_MAX    = 20;   // keep last 20 scan snapshots per coin
 const PRICE_HIST_TREND  = 3;    // consecutive rising points = confirmed uptrend
 const PRICE_HIST_REBOUND_PCT = 0.05; // 5% recovery from dip = rebound confirmed
 
+// ─── SURGE_CATCH PULLBACK WATCHLIST ──────────────────────────────────────────
+// Instead of entering at the peak of a surge, the bot tracks each SURGE_CATCH
+// candidate, waits for a pullback (≥5% below peak), then enters when the price
+// bounces back ≥3% from its pullback low — catching the second wave.
+const surgeWatchlist        = new Map(); // addr → { symbol, peakPrice, pullbackLow, pullbackDetected, watchedSince }
+const SURGE_PULLBACK_MIN    = 0.05;     // ≥5% drop from peak = in pullback zone
+const SURGE_PULLBACK_MAX    = 0.35;     // >35% drop = dump — abandon watchlist entry
+const SURGE_BOUNCE_CONFIRM  = 0.03;     // 3% recovery from pullback low = entry signal
+const SURGE_WATCH_EXPIRY_MS = 25 * 60 * 1000; // 25 min max watch window
+
 // ─── FIREBASE INIT ────────────────────────────────────────────────────────────
 let db;
 let firebaseError = null;
@@ -100,7 +110,7 @@ const STRATEGIES = [
   {
     id: 0,
     label: '📉 BOTTOM BOUNCE',
-    maxSlots: 3,
+    maxSlots: 1,
     desc: 'Oversold token reversing from its bottom',
     // ── Entry criteria ──
     maxCh24: -10,       // was falling — 24h must be negative (e.g. -10% to -90%)
@@ -119,7 +129,7 @@ const STRATEGIES = [
   {
     id: 1,
     label: '⚡ ACTIVE MOMENTUM',
-    maxSlots: 3,
+    maxSlots: 2,
     desc: 'Price ticking every 5-15 min — strong live activity',
     // ── Entry criteria ──
     minM5Txns: 15,       // busy last 5 min
@@ -137,7 +147,7 @@ const STRATEGIES = [
   {
     id: 2,
     label: '🚀 SURGE CATCH',
-    maxSlots: 2,
+    maxSlots: 6,
     desc: 'Any token actively surging RIGHT NOW — catch it mid-flight, not after',
     // ── Entry criteria — use m5 as primary signal, not h1 ──
     // h1 is a lagging indicator — the surge may already be over by then
@@ -157,7 +167,7 @@ const STRATEGIES = [
   {
     id: 3,
     label: '📈 OLD RECOVERY',
-    maxSlots: 2,
+    maxSlots: 1,
     desc: 'Established coin climbing back steadily',
     // ── Entry criteria ──
     minAgeDays: 15,
@@ -1562,6 +1572,93 @@ function priceQualityLabel(addr) {
   return '➡️ STABLE';
 }
 
+// ─── SURGE_CATCH PULLBACK GATE ────────────────────────────────────────────────
+// Called for every SURGE_CATCH candidate in the entry loop.
+// Returns true → enter now.  false → keep watching (or discard if dumped).
+//
+// State machine per coin (stored in surgeWatchlist):
+//   1. FIRST SIGHT: add to watchlist at current price (the peak) — don't enter yet.
+//   2. RISING FURTHER: update peak price, reset pullback tracking.
+//   3. PULLBACK (5–35% below peak): track pullback low.
+//   4. BOUNCE (3%+ recovery from pullback low): enter the position.
+//   5. DUMP (>35% below peak): discard — not a pullback, a collapse.
+//   6. EXPIRY (25 min): discard — surge faded, no good entry appeared.
+//
+// Mutates coin._pulledBackPct / coin._bouncedPct so the Telegram entry message
+// can mention the pullback details when returning true.
+function checkSurgePullback(coin) {
+  const addr  = coin.addr;
+  const price = coin.price;
+  const now   = Date.now();
+
+  let entry = surgeWatchlist.get(addr);
+
+  // ── FIRST SIGHT ──────────────────────────────────────────────────────────────
+  if (!entry) {
+    surgeWatchlist.set(addr, {
+      symbol:           coin.symbol,
+      peakPrice:        price,
+      pullbackLow:      Infinity,
+      pullbackDetected: false,
+      watchedSince:     now,
+    });
+    console.log(`[SURGE-WATCH] ${coin.symbol} — added at $${fmtPrice(price)}, waiting for pullback`);
+    return false; // don't enter on first sight — wait for the dip
+  }
+
+  // ── EXPIRY CHECK ─────────────────────────────────────────────────────────────
+  if (now - entry.watchedSince > SURGE_WATCH_EXPIRY_MS) {
+    surgeWatchlist.delete(addr);
+    console.log(`[SURGE-WATCH] ${coin.symbol} — expired after 25 min without pullback entry`);
+    return false;
+  }
+
+  // ── STILL RISING: update peak ─────────────────────────────────────────────────
+  if (price >= entry.peakPrice) {
+    entry.peakPrice        = price;
+    entry.pullbackLow      = Infinity;
+    entry.pullbackDetected = false;
+    console.log(`[SURGE-WATCH] ${coin.symbol} — new peak $${fmtPrice(price)}, still surging`);
+    return false;
+  }
+
+  const dropFromPeak = (entry.peakPrice - price) / entry.peakPrice;
+
+  // ── DUMP GUARD: too deep, not a healthy pullback ──────────────────────────────
+  if (dropFromPeak > SURGE_PULLBACK_MAX) {
+    surgeWatchlist.delete(addr);
+    console.log(`[SURGE-WATCH] ${coin.symbol} — dumped ${(dropFromPeak*100).toFixed(1)}% from peak — aborting watch`);
+    return false;
+  }
+
+  // ── PULLBACK ZONE (5–35% below peak) ─────────────────────────────────────────
+  if (dropFromPeak >= SURGE_PULLBACK_MIN) {
+    entry.pullbackDetected = true;
+    if (price < entry.pullbackLow) entry.pullbackLow = price; // track the deepest dip
+
+    // ── BOUNCE CONFIRMATION: recovering from pullback low ─────────────────────
+    if (entry.pullbackLow < Infinity) {
+      const bounceFromLow = (price - entry.pullbackLow) / entry.pullbackLow;
+      if (bounceFromLow >= SURGE_BOUNCE_CONFIRM) {
+        // Bounce confirmed — enter now!
+        coin._pulledBackPct = (dropFromPeak  * 100).toFixed(1);
+        coin._bouncedPct    = (bounceFromLow * 100).toFixed(1);
+        console.log(`[SURGE-WATCH] ${coin.symbol} — BOUNCE ✅ pulled back ${coin._pulledBackPct}% then bounced ${coin._bouncedPct}% — ENTERING`);
+        surgeWatchlist.delete(addr);
+        return true; // ✅ enter position
+      }
+      console.log(`[SURGE-WATCH] ${coin.symbol} — pullback ${(dropFromPeak*100).toFixed(1)}% | bounce ${(bounceFromLow*100).toFixed(1)}% (need ${(SURGE_BOUNCE_CONFIRM*100).toFixed(0)}%)`);
+    } else {
+      console.log(`[SURGE-WATCH] ${coin.symbol} — in pullback ${(dropFromPeak*100).toFixed(1)}% below peak — tracking low`);
+    }
+    return false;
+  }
+
+  // ── SMALL DIP (0–5% below peak): not yet in pullback zone ────────────────────
+  console.log(`[SURGE-WATCH] ${coin.symbol} — ${(dropFromPeak*100).toFixed(1)}% below peak — waiting for ≥${(SURGE_PULLBACK_MIN*100).toFixed(0)}% pullback`);
+  return false;
+}
+
 // ─── LP LOCK FILTER (GoPlus batch check) ─────────────────────────────────────
 // Filters a list of strategy matches, returning only those with confirmed
 // locked or burned LP. Pump.fun bonding-curve tokens are exempt (their curve
@@ -2337,6 +2434,19 @@ async function scanForEntries() {
     // Check slot still available (may have been filled earlier in this loop)
     if (slotCount[coin.strategy.id] >= coin.strategy.maxSlots) continue;
 
+    // ── SURGE_CATCH pullback gate — don't enter at the peak ──────────────────
+    // When a coin first qualifies for SURGE_CATCH we add it to surgeWatchlist
+    // and wait.  Entry fires only after a ≥5% pullback + ≥3% bounce recovery.
+    // Other strategies (id ≠ 2) enter immediately as normal.
+    if (coin.strategy.id === 2) {
+      const shouldEnter = checkSurgePullback(coin);
+      if (!shouldEnter) {
+        usedThisScan.add(coin.addr); // don't reprocess the same coin twice this scan
+        // NOT added to enteredToday — must remain visible in future scan ticks
+        continue;
+      }
+    }
+
     // Reserve coin BEFORE the async enterPosition call — a concurrent scan tick
     // starting during the Firestore await would otherwise find the coin absent
     // from enteredToday and enter it a second time. Roll back if entry fails.
@@ -2366,7 +2476,10 @@ async function scanForEntries() {
           `🎯 TP2: $${fmtPrice(coin.price * s.tp2x)} (+${((s.tp2x-1)*100).toFixed(0)}%) → 30%\n` +
           `🎯 TP3: $${fmtPrice(coin.price * s.tp3x)} (+${((s.tp3x-1)*100).toFixed(0)}%) → 20%\n`;
 
-    const pumpBadge  = coin.isPumpFun ? `🎪 Pump.fun${isYoung?' · YOUNG COIN':''}\n` : '';
+    const pumpBadge     = coin.isPumpFun ? `🎪 Pump.fun${isYoung?' · YOUNG COIN':''}\n` : '';
+    const pullbackBadge = coin._pulledBackPct
+      ? `📉 Pullback entry: -${coin._pulledBackPct}% → +${coin._bouncedPct}% bounce\n`
+      : '';
     const modeHeader = pos.tradingMode === 'real'
       ? `💰 *BOT ENTERED — REAL TRADE*`
       : `✅ *BOT ENTERED — PAPER TRADE*`;
@@ -2378,6 +2491,7 @@ async function scanForEntries() {
       `*${coin.symbol}* — ${coin.name}\n` +
       `${s.label} · Score: *${coin.score}/100*\n` +
       `${pumpBadge}` +
+      `${pullbackBadge}` +
       `💡 ${s.desc}\n\n` +
       `💵 Entry: $${fmtPrice(coin.price)}\n` +
       `💰 Position: $${pos.size}${pos.walletLabel ? ` · ${pos.walletLabel}` : ''}\n` +
