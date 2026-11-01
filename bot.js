@@ -383,6 +383,9 @@ const alertCooldown = new Map();
 // Block re-entry for 6h after SL or rug — prevents the triple-entry bug
 // (address → timestamp of SL/rug close)
 const recentSLCoins = new Map();
+// Guards against concurrent-tick races: positions currently being closed
+// (added before the async Firestore write; cleared when done)
+const closingNow    = new Set();
 const SL_BLOCK_MS   = 6 * 60 * 60 * 1000; // 6 hours
 let scanCount = 0;
 // Daily loss limit state — set true when limit hit, cleared on /restart
@@ -920,10 +923,12 @@ async function updatePosition(id, data) {
 async function closePosition(id, data) {
   const { positions, history } = await getCollections();
   const closeData = { ...data, status: 'closed', closedAt: Date.now() };
-  // Always update the position status first — this is the critical write
-  await db.collection(positions).doc(id).update(closeData);
-  // Remove from cache immediately so it stops showing as open
+  // Remove from cache BEFORE the async Firestore write so a concurrent monitor
+  // tick that starts during the await doesn't see this position as still open
+  // and fire a second close / duplicate notification.
   if (_posCache) _posCache = _posCache.filter(p => p.id !== id);
+  // Always update the position status — this is the critical write
+  await db.collection(positions).doc(id).update(closeData);
   // Write history entry — wrapped so a failure doesn't revert the close
   try {
     const snap = await db.collection(positions).doc(id).get();
@@ -1696,37 +1701,51 @@ async function monitorPositions() {
     // If price crashes >40% from peak in a single 5s tick AND we were profitable,
     // exit immediately before it goes to near-zero
     if (currentPeak > pos.entryPrice * 1.15 && price < currentPeak * 0.60) {
-      const exitPnl = gain * pos.size * pos.remaining;
-      const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
-      await closePosition(pos.id, { exitPrice: price, exitReason: 'RUG_DETECTED', pnl });
-      await updateDailyStats(exitPnl, exitPnl > 0, isManual);
-      recentSLCoins.set(pos.address, Date.now()); // block re-entry for 6h
-      const dropPct = ((price / currentPeak - 1) * 100).toFixed(0);
-      await sendTelegram(
-        `⚠️ *RUG DETECTED — EMERGENCY EXIT*\n\n` +
-        `*${pos.symbol}* ${pos.strategyLabel}\n` +
-        `📉 Dropped *${dropPct}%* from peak in one tick\n` +
-        `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(price)}\n` +
-        `📊 P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*\n🔗 [Chart](${pos.dexUrl})`
-      );
-      console.log(`[BOT] RUG_DETECTED ${pos.symbol}: peak $${fmtPrice(currentPeak)} → now $${fmtPrice(price)} (${dropPct}%)`);
+      // Guard against concurrent monitor ticks closing the same position twice
+      if (closingNow.has(pos.id)) continue;
+      closingNow.add(pos.id);
+      try {
+        const exitPnl = gain * pos.size * pos.remaining;
+        const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
+        await closePosition(pos.id, { exitPrice: price, exitReason: 'RUG_DETECTED', pnl });
+        await updateDailyStats(exitPnl, exitPnl > 0, isManual);
+        recentSLCoins.set(pos.address, Date.now()); // block re-entry for 6h
+        const dropPct = ((price / currentPeak - 1) * 100).toFixed(0);
+        await sendTelegram(
+          `⚠️ *RUG DETECTED — EMERGENCY EXIT*\n\n` +
+          `*${pos.symbol}* ${pos.strategyLabel}\n` +
+          `📉 Dropped *${dropPct}%* from peak in one tick\n` +
+          `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(price)}\n` +
+          `📊 P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*\n🔗 [Chart](${pos.dexUrl})`
+        );
+        console.log(`[BOT] RUG_DETECTED ${pos.symbol}: peak $${fmtPrice(currentPeak)} → now $${fmtPrice(price)} (${dropPct}%)`);
+      } finally {
+        closingNow.delete(pos.id);
+      }
       continue;
     }
 
     // ── STOP LOSS ──────────────────────────────────────────────────────────
     if (price <= pos.currentSL) {
-      const exitPnl = gain * pos.size * pos.remaining;
-      const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial TP exits
-      await closePosition(pos.id, { exitPrice: price, exitReason: 'STOP_LOSS', pnl });
-      await updateDailyStats(exitPnl, false, isManual);
-      recentSLCoins.set(pos.address, Date.now()); // block re-entry for 6h — prevents triple entries
-      await sendTelegram(
-        `🛑 *STOP LOSS HIT*\n\n` +
-        `*${pos.symbol}* ${pos.strategyLabel}\n` +
-        `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(price)}\n` +
-        `🛑 SL: $${fmtPrice(pos.currentSL)} | Trail: ${calcTrailPct(pos.initialTrailPct, gainPct).toFixed(1)}%\n` +
-        `📊 P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*\n🔗 [Chart](${pos.dexUrl})`
-      );
+      // Guard against concurrent monitor ticks closing the same position twice
+      if (closingNow.has(pos.id)) continue;
+      closingNow.add(pos.id);
+      try {
+        const exitPnl = gain * pos.size * pos.remaining;
+        const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial TP exits
+        await closePosition(pos.id, { exitPrice: price, exitReason: 'STOP_LOSS', pnl });
+        await updateDailyStats(exitPnl, false, isManual);
+        recentSLCoins.set(pos.address, Date.now()); // block re-entry for 6h — prevents triple entries
+        await sendTelegram(
+          `🛑 *STOP LOSS HIT*\n\n` +
+          `*${pos.symbol}* ${pos.strategyLabel}\n` +
+          `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(price)}\n` +
+          `🛑 SL: $${fmtPrice(pos.currentSL)} | Trail: ${calcTrailPct(pos.initialTrailPct, gainPct).toFixed(1)}%\n` +
+          `📊 P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*\n🔗 [Chart](${pos.dexUrl})`
+        );
+      } finally {
+        closingNow.delete(pos.id);
+      }
       continue;
     }
 
@@ -2155,11 +2174,17 @@ async function scanForEntries() {
     // Check slot still available (may have been filled earlier in this loop)
     if (slotCount[coin.strategy.id] >= coin.strategy.maxSlots) continue;
 
-    const pos = await enterPosition(coin);
-    if (!pos) continue; // null = real mode with no matching wallet for this chain
-    alertCooldown.set(coin.addr, Date.now()); // set AFTER successful entry to avoid 30-min lockout on failure
+    // Reserve coin BEFORE the async enterPosition call — a concurrent scan tick
+    // starting during the Firestore await would otherwise find the coin absent
+    // from enteredToday and enter it a second time. Roll back if entry fails.
     enteredToday.add(coin.addr);
     usedThisScan.add(coin.addr);
+    const pos = await enterPosition(coin);
+    if (!pos) {
+      enteredToday.delete(coin.addr); // no position created — release the reservation
+      continue; // null = real mode with no matching wallet for this chain
+    }
+    alertCooldown.set(coin.addr, Date.now()); // set AFTER successful entry to avoid 30-min lockout on failure
     positions.push(pos);
     slotCount[coin.strategy.id]++;
 
