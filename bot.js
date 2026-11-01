@@ -1381,6 +1381,7 @@ async function pollTelegramCommands() {
 
     for (const update of d.result) {
       telegramOffset = update.update_id + 1;
+      try { // ── per-message guard: one bad command won't kill the rest ─────────
       const text    = (update.message?.text || '').trim().toLowerCase();
       const rawText = (update.message?.text || '').trim();          // preserve case for PRO signal parser
       const chatId  = String(update.message?.chat?.id || '');
@@ -1412,13 +1413,15 @@ async function pollTelegramCommands() {
           : `-$${Math.abs(stats.realizedPnL).toFixed(2)}`;
         const pct     = ((stats.realizedPnL / stats.startBalance) * 100).toFixed(1);
         const state   = dayHaltedToday ? '🚨 HALTED (daily limit)' : '✅ Running';
+        const posSize = parseFloat(cfg.positionSize) || POSITION_SIZE;
         await sendTelegram(
           `📊 *STATUS*\n\n` +
           `${state} · *${mode} mode*\n` +
           `Daily P&L: *${pnlStr}* (${pct}%)\n` +
           `Balance: $${(cfg.paperBalance || POSITION_SIZE * MAX_POSITIONS).toFixed(2)}\n` +
+          `Position size: *$${posSize.toFixed(2)}*\n` +
           `Limit: ${(DAILY_LOSS_LIMIT * 100).toFixed(0)}%\n\n` +
-          `_Commands: /mode paper|real · /wallets · /addfunds <$> · /restart_`
+          `_/setsize 3 · /mode paper|real · /wallets · /clearreal · /restart_`
         );
       }
 
@@ -1532,9 +1535,33 @@ async function pollTelegramCommands() {
         }
       }
 
-      // ── /setsize <amount> — change position size ───────────────────────────────
+      // ── /clearreal — wipe ghost real-mode positions (no real tx behind them) ───
+      if (text === '/clearreal') {
+        const snap = await db.collection('real_positions').where('status', '==', 'open').get();
+        if (snap.empty) {
+          await sendTelegram('✅ No open real positions found — nothing to clear.');
+        } else {
+          const batch = db.batch();
+          snap.docs.forEach(doc => batch.delete(doc.ref));
+          await batch.commit();
+          await sendTelegram(
+            `🗑 *Cleared ${snap.size} ghost real position(s)*\n\n` +
+            `These were positions with no confirmed on-chain transaction.\n` +
+            `Your actual wallet balance is *unchanged*.\n\n` +
+            `_Switch to real mode with /mode real and run /status to confirm._`
+          );
+        }
+      }
+
+      // ── /setsize — show current size or update it ─────────────────────────────
+      if (text === '/setsize') {
+        // No argument: show current size
+        const cfg  = await getTradingConfig();
+        const size = parseFloat(cfg.positionSize) || POSITION_SIZE;
+        await sendTelegram(`📏 *Current position size:* $${size.toFixed(2)}\nUse \`/setsize 10\` to change.`);
+      }
       if (text.startsWith('/setsize ')) {
-        const parts  = text.split(' ');
+        const parts   = text.split(' ');
         const newSize = parseFloat(parts[1]);
         if (!newSize || newSize < 1) {
           await sendTelegram('❌ Usage: `/setsize 10` (minimum $1)');
@@ -1542,6 +1569,7 @@ async function pollTelegramCommands() {
           await db.collection('paper_config').doc('control').set(
             { positionSize: newSize }, { merge: true }
           );
+          _tradingCfg = null; // bust cache so new size is picked up immediately
           await sendTelegram(`✅ *Position size set to $${newSize.toFixed(2)}*\n_New trades will use this size. Existing positions are unchanged._`);
         }
       }
@@ -1584,6 +1612,7 @@ async function pollTelegramCommands() {
           `/addfunds 500 — add $500 to balance\n` +
           `/setsize 10 — set position size to $10\n` +
           `/clearall — force-close all open positions\n` +
+          `/clearreal — delete ghost real-mode positions\n` +
           `/restart — reset daily loss counter\n` +
           `/queue <CA> — evaluate a contract address now\n\n` +
           `💡 *MemeScan PRO Bridge*\n` +
@@ -1665,6 +1694,11 @@ async function pollTelegramCommands() {
           }
           // score < 80 → silent ignore
         } catch(e) { console.error('[PRO-BRIDGE]', e.message); }
+      } // closes PRO bridge if block
+
+      } catch(cmdErr) { // ── end per-message guard ────────────────────────────
+        console.error(`[CMD] Error on update ${update.update_id}:`, cmdErr.message);
+        await sendTelegram(`❌ Command error — please retry`).catch(() => {});
       }
     }
   } catch(e) {
