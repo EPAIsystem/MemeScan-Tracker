@@ -280,7 +280,9 @@ header {
 .pos-expand-toggle:hover { color: var(--fg2); }
 .pos-detail {
   margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
+  display: none; /* hidden by default; toggled via .pos-card.expanded class */
 }
+.pos-card.expanded .pos-detail { display: block; }
 .pos-detail-row {
   display: flex; justify-content: space-between; font-size: 11px;
   color: var(--fg2); margin-bottom: 6px;
@@ -1108,20 +1110,22 @@ function posCard(pos) {
   const ageMs = pos.enteredAt ? Date.now() - pos.enteredAt : 0;
   const ageStr = ageMs > 3600000 ? `${(ageMs/3600000).toFixed(1)}h` : `${Math.floor(ageMs/60000)}m`;
 
-  const detailPanel = expanded ? `
+  const detailPanel = `
     <div class="pos-detail">
       <div class="pos-detail-row"><span>Chain</span><span>${(pos.chain||'solana').toUpperCase()}</span></div>
       <div class="pos-detail-row"><span>Strategy</span><span>${pos.strategyLabel || pos.catLabel || '—'}</span></div>
       <div class="pos-detail-row"><span>Score</span><span>${pos.score || '—'}/100</span></div>
       <div class="pos-detail-row"><span>Age in trade</span><span>${ageStr}</span></div>
       <div class="pos-detail-row"><span>Size</span><span>$${pos.size}</span></div>
+      ${pos.liquidityAtEntry ? `<div class="pos-detail-row"><span>Liq at entry</span><span>$${(pos.liquidityAtEntry/1000).toFixed(0)}k</span></div>` : ''}
+      ${pos.rawEntryPrice ? `<div class="pos-detail-row"><span>Raw price (pre-fee)</span><span>${fmtPrice(pos.rawEntryPrice)}</span></div>` : ''}
       <div class="pos-detail-row"><span>SL (current)</span><span style="color:var(--red)">${fmtPrice(pos.currentSL || pos.sl)}</span></div>
       <div class="pos-detail-row"><span>TP1 / TP2 / TP3</span><span>${fmtPrice(pos.tp1)} · ${fmtPrice(pos.tp2)} · ${fmtPrice(pos.tp3)}</span></div>
       ${chartLinks(pos)}
       <div class="pos-addr" title="Tap to select address">${pos.address || ''}</div>
-    </div>` : '';
+    </div>`;
 
-  return `<div class="pos-card ${cardClass}">
+  return `<div class="pos-card ${cardClass}${expanded ? ' expanded' : ''}" data-posid="${pos._id}">
     <div class="pos-head">
       <div>
         <div class="pos-sym">${pos.symbol || '?'}</div>
@@ -1185,11 +1189,17 @@ function posCard(pos) {
 }
 
 // ── Expand / collapse position detail ────────────────────────────────────────
+// Uses direct DOM class toggle — no full re-render needed, works reliably on mobile.
 function toggleExpand(posId) {
   if (!S.expandedPos) S.expandedPos = new Set();
-  if (S.expandedPos.has(posId)) S.expandedPos.delete(posId);
-  else S.expandedPos.add(posId);
-  render();
+  const card = document.querySelector(`[data-posid="${posId}"]`);
+  if (!card) return;
+  const isNowExpanded = card.classList.toggle('expanded');
+  if (isNowExpanded) S.expandedPos.add(posId);
+  else S.expandedPos.delete(posId);
+  // Update button text in-place
+  const btn = card.querySelector('.pos-expand-toggle');
+  if (btn) btn.textContent = isNowExpanded ? '▲ less' : '▼ charts & details';
 }
 
 // ── Individual position sell ──────────────────────────────────────────────────
