@@ -1796,6 +1796,70 @@ async function monitorPositions() {
       continue;
     }
 
+    // ── SURGE_CATCH STALE EXIT — rotate slots for fresh surges ────────────
+    // If a SURGE_CATCH position (strategyId 2) hasn't auto-switched to surge
+    // mode (surgeMomentum) and the initial move has faded, free the slot.
+    //   • Gain < 30% (surge fizzled) + profitable + age ≥ 10 min → exit, take profit
+    //   • At a loss + age ≥ 15 min → exit, accept the small loss
+    // If gain ≥ 30% the surge is still alive — leave it to ride (auto-switch
+    // will kick in at 40% or normal TPs will handle it).
+    if (pos.strategyId === 2 && !pos.isMoonBag && !pos.surgeMomentum) {
+      const ageMs               = Date.now() - pos.enteredAt;
+      const STALE_PROFIT_MS     = 10 * 60 * 1000; // 10 min — exit if profitable & faded
+      const STALE_LOSS_MS       = 15 * 60 * 1000; // 15 min — exit even at a loss
+      const SURGE_ACTIVE_THRESH = 0.30;            // ≥30% gain → surge still live, hold
+
+      const surgeStillLive = gain >= SURGE_ACTIVE_THRESH;
+
+      if (!surgeStillLive) {
+        if (ageMs >= STALE_PROFIT_MS && gain > 0) {
+          // Profitable but surge faded — take profit, free the slot
+          if (closingNow.has(pos.id)) continue;
+          closingNow.add(pos.id);
+          try {
+            const exitPnl = fillGain * pos.size * pos.remaining;
+            const pnl     = (pos.pnl || 0) + exitPnl;
+            await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'SURGE_STALE_PROFIT', pnl });
+            await updateDailyStats(exitPnl, true, isManual);
+            enteredToday.delete(pos.address);
+            await sendTelegram(
+              `⏱ *SURGE FADED — QUICK EXIT*\n\n` +
+              `*${pos.symbol}* ${pos.strategyLabel}\n` +
+              `📊 Held ${Math.round(ageMs/60000)}min — surge didn't continue\n` +
+              `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
+              `💰 P&L: *+$${pnl.toFixed(2)}* (+${gainPct.toFixed(1)}%) | Slot freed\n🔗 [Chart](${pos.dexUrl})`
+            );
+          } finally {
+            closingNow.delete(pos.id);
+          }
+          continue;
+        }
+
+        if (ageMs >= STALE_LOSS_MS && gain < 0) {
+          // At a loss and going nowhere — cut it, free the slot
+          if (closingNow.has(pos.id)) continue;
+          closingNow.add(pos.id);
+          try {
+            const exitPnl = fillGain * pos.size * pos.remaining;
+            const pnl     = (pos.pnl || 0) + exitPnl;
+            await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'SURGE_STALE_LOSS', pnl });
+            await updateDailyStats(exitPnl, false, isManual);
+            enteredToday.delete(pos.address);
+            await sendTelegram(
+              `⏱ *SURGE STALE — EXIT WITH LOSS*\n\n` +
+              `*${pos.symbol}* ${pos.strategyLabel}\n` +
+              `📉 ${gainPct.toFixed(1)}% after ${Math.round(ageMs/60000)}min — no recovery\n` +
+              `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
+              `💸 P&L: *$${pnl.toFixed(2)}* | Slot freed for new surges\n🔗 [Chart](${pos.dexUrl})`
+            );
+          } finally {
+            closingNow.delete(pos.id);
+          }
+          continue;
+        }
+      }
+    }
+
     // ── RUG DETECTION — EMERGENCY EXIT ────────────────────────────────────
     // If price crashes >40% from peak in a single 5s tick AND we were profitable,
     // exit immediately before it goes to near-zero

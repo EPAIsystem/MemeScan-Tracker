@@ -982,7 +982,7 @@ function render() {
         <td>${fmtPrice(t.exitPrice)}</td>
         <td class="${pct >= 0 ? 'c-green' : 'c-red'}">${pct != null ? fmtPct(pct) : '—'}</td>
         <td class="${pnl >= 0 ? 'c-green' : 'c-red'}">${fmtPnl(pnl)}</td>
-        <td style="color:${t.exitReason==='RUG_DETECTED'?'#ff6b35':t.exitReason==='MANUAL_CLOSE'?'#a78bfa':'var(--fg2)'}">${t.exitReason || '—'}</td>
+        <td style="color:${t.exitReason==='RUG_DETECTED'?'#ff6b35':t.exitReason==='MANUAL_CLOSE'?'#a78bfa':t.exitReason==='SURGE_STALE_PROFIT'?'#34d399':t.exitReason==='SURGE_STALE_LOSS'?'#f87171':'var(--fg2)'}">${t.exitReason==='SURGE_STALE_PROFIT'?'⏱ STALE PROFIT':t.exitReason==='SURGE_STALE_LOSS'?'⏱ STALE LOSS':t.exitReason || '—'}</td>
         <td style="color:var(--fg3)">${fmtDate(t.closedAt)}</td>
       </tr>`;
     }).join('');
