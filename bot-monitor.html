@@ -656,7 +656,10 @@ function saveCfg(c) {
 }
 
 // ── Firebase Anonymous Auth ───────────────────────────────────────────────────
-let _idToken = null, _refreshToken = null, _tokenExpiry = 0;
+// Persist refresh token so the same anonymous UID is reused across page loads.
+// Without this, every reload creates a new anonymous user in Firebase.
+let _idToken = null, _tokenExpiry = 0;
+let _refreshToken = (() => { try { return localStorage.getItem('mscan_rt') || null; } catch { return null; } })();
 
 async function getIdToken(apiKey) {
   if (_idToken && Date.now() < _tokenExpiry - 60000) return _idToken;
@@ -670,10 +673,11 @@ async function getIdToken(apiKey) {
         const d = await r.json();
         _idToken = d.id_token; _refreshToken = d.refresh_token;
         _tokenExpiry = Date.now() + parseInt(d.expires_in) * 1000;
+        try { localStorage.setItem('mscan_rt', _refreshToken); } catch {}
         return _idToken;
       }
     }
-    // Sign in anonymously
+    // First-ever load — sign in anonymously and persist the refresh token
     const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${apiKey}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ returnSecureToken: true })
@@ -682,6 +686,7 @@ async function getIdToken(apiKey) {
     const d = await r.json();
     _idToken = d.idToken; _refreshToken = d.refreshToken;
     _tokenExpiry = Date.now() + parseInt(d.expiresIn) * 1000;
+    try { localStorage.setItem('mscan_rt', _refreshToken); } catch {}
     return _idToken;
   } catch { return null; }
 }
