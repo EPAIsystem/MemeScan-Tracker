@@ -61,6 +61,9 @@ const GOPLUS_CHAIN_MAP = {
 const lpLockCache = new Map();   // addr → { locked: bool, ts: number }
 const LP_LOCK_TTL = 30 * 60 * 1000; // 30-min cache — GoPlus data changes rarely
 
+// ─── WATCHING SNAPSHOT (for /watching command) ────────────────────────────────
+let watchingCoinsSnapshot = []; // updated each scan; holds near-miss coins for on-demand reporting
+
 // ─── PRICE HISTORY TRACKER ────────────────────────────────────────────────────
 const priceHistory = new Map(); // addr → [{price, score, ts}, ...]
 const PRICE_HIST_MAX    = 20;   // keep last 20 scan snapshots per coin
@@ -359,10 +362,10 @@ function detectStrategy(pair, openStrategies) {
         if (liq > 20000) score += 6;  else if (liq > 8000) score += 3;
         // Penalty: volume/mcap ratio too extreme = possible wash trading
         if (volMcap > 10) score -= 10;
-        // Range-spike guard: same as id 1 — 1h spike without 24h support = range top
-        const ch24pos2 = Math.max(ch24, 0);
-        if      (ch1 > 30 && ch24pos2 < 20) score -= 35;
-        else if (ch1 > 20 && ch24pos2 < 8)  score -= 20;
+        // NOTE: No range-spike scoring penalty for Surge Catch.
+        // A genuine surge WILL have high ch1 relative to ch24 — penalising that ratio
+        // directly blocks the pattern this strategy is designed to catch.
+        // Range-top protection is handled in the entry loop via priceHistory.
       }
     }
 
@@ -1514,12 +1517,38 @@ async function pollTelegramCommands() {
         }
       }
 
+      // ── /watching — show near-miss coins currently being monitored ──────────────
+      if (text === '/watching') {
+        if (!watchingCoinsSnapshot || watchingCoinsSnapshot.length === 0) {
+          await sendTelegram(`👀 *WATCHING* — No near-miss coins right now\n\n_Bot is scanning; coins that score close to the entry threshold will appear here._`);
+        } else {
+          const seenSym = new Set();
+          const top = watchingCoinsSnapshot
+            .sort((a, b) => b.score - a.score)
+            .filter(c => { if (seenSym.has(c.symbol)) return false; seenSym.add(c.symbol); return true; })
+            .slice(0, 6);
+          const ageStr = c => c.ageMinutes < 60
+            ? `${Math.round(c.ageMinutes)}min`
+            : `${(c.ageMinutes / 60).toFixed(1)}h`;
+          const lines = top.map(c =>
+            `• *${c.symbol}* — ${c.strategy.label} · Score: *${c.score}/100*\n` +
+            `  Age: ${ageStr(c)} | m5: ${c.m5Ch>0?'+':''}${c.m5Ch.toFixed(1)}% | h1: ${c.ch1!=null?(c.ch1>0?'+':'')+c.ch1.toFixed(1)+'%':'—'} | Buy: ${c.buyPct.toFixed(0)}%`
+          );
+          await sendTelegram(
+            `👀 *WATCHING — NOT ENTERING*\n\n` +
+            lines.join('\n\n') +
+            `\n\n_Needs score ≥ ${MIN_SCORE} to enter automatically_`
+          );
+        }
+      }
+
       // ── /help ─────────────────────────────────────────────────────────────────
       if (text === '/help') {
         await sendTelegram(
           `📋 *MemeScan Bot Commands*\n\n` +
           `/status — P&L, mode, balance\n` +
           `/stats — daily revenue: profit, losses, fees, net\n` +
+          `/watching — coins being monitored (near threshold)\n` +
           `/mode paper — switch to paper trading\n` +
           `/mode real — switch to real (Solana) trading\n` +
           `/wallets — list connected wallets\n` +
@@ -2662,7 +2691,7 @@ async function scanForEntries() {
           const trendNote = trendCount > 0 ? ` [trending:${trendCount}]` : '';
           console.log(`[NEAR MISS] ${result.symbol}: ${result.strategy.label} score ${result.score} (need ${effectiveThreshold}${trendNote}) | m5:${result.m5Ch?.toFixed(1)}% m5txns:${result.m5Txns} h1:${result.ch1?.toFixed(1)}% buy:${result.buyPct?.toFixed(0)}%`);
         }
-        // Collect near-misses for watching report: score ≥60, or trending with score ≥50
+        // Collect near-misses for on-demand /watching command: score ≥60, or trending with score ≥50
         if (result.score >= 60 || (trendCount > 0 && result.score >= 50)) {
           watchingCoins.push(result);
         }
@@ -2677,37 +2706,8 @@ async function scanForEntries() {
   // Tells Telegram what the bot is monitoring but has NOT entered yet.
   // Score ≥ 60 = on radar (strong signal, monitoring). Score ≥ MIN_SCORE = entered (separate message).
   // This answers: "are those 3 coins qualified or just monitoring?" — here they are NOT.
-  if (scanCount % 60 === 0) {
-    // Sort near-miss candidates by score descending, dedupe by symbol
-    const seenSymbols = new Set();
-    const topWatch = watchingCoins
-      .sort((a, b) => b.score - a.score)
-      .filter(c => { if (seenSymbols.has(c.symbol)) return false; seenSymbols.add(c.symbol); return true; })
-      .slice(0, 3);
-
-    if (topWatch.length > 0) {
-      const ageStr = c => c.ageMinutes < 60
-        ? `${Math.round(c.ageMinutes)}min`
-        : `${(c.ageMinutes / 60).toFixed(1)}h`;
-      const lines = topWatch.map(c =>
-        `• *${c.symbol}* — ${c.strategy.label} · Score: *${c.score}/100*\n` +
-        `  Age: ${ageStr(c)} | m5: ${c.m5Ch>0?'+':''}${c.m5Ch.toFixed(1)}% | h1: ${c.ch1!=null?(c.ch1>0?'+':'')+c.ch1.toFixed(1)+'%':'—'} | Buy: ${c.buyPct.toFixed(0)}%\n` +
-        `  _(needs ${scoreThreshold} to enter — watching)_`
-      );
-      await sendTelegram(
-        `👀 *MONITORING — NOT ENTERING*\n\n` +
-        `These coins match a strategy but score < ${scoreThreshold}:\n\n` +
-        lines.join('\n\n') +
-        `\n\n_To enter automatically, they must score ≥ ${scoreThreshold}_`
-      ).catch(() => {});
-    } else if (matches.length === 0) {
-      // Only send "quiet scan" message if nothing qualified this round either
-      await sendTelegram(
-        `🔎 *SCAN UPDATE* — No coins at score ≥ ${scoreThreshold} this window\n` +
-        `${candidates.length} scanned · ${nearMissCount} near misses · monitoring continues`
-      ).catch(() => {});
-    }
-  }
+  // Periodic scan report suppressed — use /watching command for on-demand monitoring status
+  watchingCoinsSnapshot = [...watchingCoins]; // keep latest for /watching command
 
   // Sort: trending/rebounding coins first, then by score
   matches.sort((a, b) => {
