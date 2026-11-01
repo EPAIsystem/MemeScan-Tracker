@@ -2673,16 +2673,35 @@ async function scanForEntries() {
     // Check slot still available (may have been filled earlier in this loop)
     if (slotCount[coin.strategy.id] >= coin.strategy.maxSlots) continue;
 
-    // ── SURGE_CATCH pullback gate — don't enter at the peak ──────────────────
-    // When a coin first qualifies for SURGE_CATCH we add it to surgeWatchlist
-    // and wait.  Entry fires only after a ≥5% pullback + ≥3% bounce recovery.
-    // Other strategies (id ≠ 2) enter immediately as normal.
+    // ── PULLBACK GATE — wait for a dip before entering, not at the peak ────────
+    // Applied to SURGE_CATCH (id 2) and ACTIVE MOMENTUM (id 1).
+    // Uses the same checkSurgePullback() state machine for both:
+    //   ≥5% dip from peak → track lowest point → ≥3% bounce from that low → enter.
+    // This means we buy AFTER the pullback recovery, not at the top of a surge.
+    //
+    // EXPLOSIVE BYPASS for Active Momentum:
+    //   If m5 > 8% AND h1 > 25% AND buyPct > 70%, the trend is so strong that
+    //   a normal pullback may never come. Enter immediately to avoid missing the move.
     if (coin.strategy.id === 2) {
       const shouldEnter = checkSurgePullback(coin);
       if (!shouldEnter) {
         usedThisScan.add(coin.addr); // don't reprocess the same coin twice this scan
         // NOT added to enteredToday — must remain visible in future scan ticks
         continue;
+      }
+    }
+
+    if (coin.strategy.id === 1) {
+      const isExplosive = (coin.m5Ch || 0) >= 8 && (coin.ch1 || 0) >= 25 && (coin.buyPct || 0) >= 70;
+      if (!isExplosive) {
+        const shouldEnter = checkSurgePullback(coin);
+        if (!shouldEnter) {
+          usedThisScan.add(coin.addr);
+          continue;
+        }
+      } else {
+        console.log(`[AM-WATCH] ${coin.symbol} — EXPLOSIVE entry bypass (m5:${coin.m5Ch?.toFixed(1)}% h1:${coin.ch1?.toFixed(1)}% buy:${coin.buyPct?.toFixed(0)}%) — entering immediately`);
+        coin._explosiveEntry = true; // badge in Telegram
       }
     }
 
@@ -2722,6 +2741,9 @@ async function scanForEntries() {
     const pullbackBadge = coin._pulledBackPct
       ? `📉 Pullback entry: -${coin._pulledBackPct}% → +${coin._bouncedPct}% bounce\n`
       : '';
+    const explosiveBadge = coin._explosiveEntry
+      ? `⚡ Explosive trend — immediate entry (m5:+${coin.m5Ch?.toFixed(1)}% h1:+${coin.ch1?.toFixed(1)}%)\n`
+      : '';
     const modeHeader = pos.tradingMode === 'real'
       ? `💰 *BOT ENTERED — REAL TRADE*`
       : `✅ *BOT ENTERED — PAPER TRADE*`;
@@ -2735,6 +2757,7 @@ async function scanForEntries() {
       `${pumpBadge}` +
       `${trendBadge}` +
       `${pullbackBadge}` +
+      `${explosiveBadge}` +
       `💡 ${s.desc}\n\n` +
       `💵 Entry: $${fmtPrice(coin.price)}\n` +
       `💰 Position: $${pos.size}${pos.walletLabel ? ` · ${pos.walletLabel}` : ''}\n` +
