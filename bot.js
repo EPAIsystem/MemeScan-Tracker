@@ -2573,12 +2573,11 @@ async function main() {
     ? `👛 ${wallets.length} wallet(s): ${wallets.map(w => w.chain).join(', ')}`
     : `👛 No wallets configured (/wallets to set up)`;
 
+  const slotLines = STRATEGIES.map(s => `${s.label}: ${s.maxSlots} slot${s.maxSlots !== 1 ? 's' : ''}`).join('\n');
+
   await sendTelegram(
     `✅ *MemeScan PRO — 4-STRATEGY BOT LIVE*\n\n` +
-    `📉 Bottom Bounce: 3 slots\n` +
-    `⚡ Active Momentum: 3 slots\n` +
-    `🚀 Surge Catch: 2 slots\n` +
-    `📈 Old Recovery: 2 slots\n\n` +
+    `${slotLines}\n\n` +
     `💰 $${POSITION_SIZE}/position · 🛑 Daily limit: 30%\n` +
     `🎛 Mode: *${startMode}*\n` +
     `${walletLine}\n` +
