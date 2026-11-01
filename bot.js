@@ -425,6 +425,14 @@ let _statsCache   = null;
 let _statsCacheAt = 0;
 const STATS_TTL   = 60000; // 60s
 
+// ─── TRENDING CACHE ───────────────────────────────────────────────────────────
+// addr (lowercase) → count of trending platforms it appears on (pump.fun + Birdeye)
+// DexScreener boost addresses are merged in per-scan inside scanForEntries().
+// Refreshed every 5 min; stale cache is used rather than blocking a scan.
+let trendingAddrs     = new Map();
+let trendingLastFetch = 0;
+const TRENDING_TTL_MS = 5 * 60 * 1000; // refresh every 5 min
+
 async function getTradingConfig() {
   const now = Date.now();
   if (_tradingCfg && now - _tradingCfgAt < CFG_TTL) return _tradingCfg;
@@ -520,6 +528,28 @@ async function checkAddFunds(cfg) {
 const SOL_MINT  = 'So11111111111111111111111111111111111111112'; // Wrapped SOL
 const SOL_RPC   = process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com';
 
+// ─── JITO BUNDLE CONFIG ──────────────────────────────────────────────────────
+// Jito bundles submit transactions directly to the block leader, bypassing the
+// public mempool. This prevents front-running and sandwich attacks entirely —
+// bots cannot see the transaction to attack it because it never enters the mempool.
+//
+// Tip: we pay a small SOL tip to Jito on top of the normal priority fee.
+// 10000 lamports ≈ $0.002 at $200/SOL — negligible for our position sizes.
+// Increase to 50000–100000 during high-competition periods.
+const JITO_BLOCK_ENGINE = 'mainnet.block-engine.jito.labs.io';
+const JITO_TIP_LAMPORTS = parseInt(process.env.JITO_TIP_LAMPORTS || '10000', 10);
+// 8 known Jito tip accounts — one is chosen at random per bundle
+const JITO_TIP_ACCOUNTS = [
+  '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
+  'HFqU5x63VTqvB6pMFUFbTYPMoqnsmjQVFgFGSJ5noTW5',
+  'Cw8CFyM9FkoMi7K9DP1KMHJuq3A9SvivXoK8wL9K7T3e',
+  'ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1sMaC9jNkiN',
+  'DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh',
+  'ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt',
+  'DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL',
+  '3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT',
+];
+
 function parseSolanaKeypair(privKeyStr) {
   if (!SolanaWeb3 || !bs58) throw new Error('@solana/web3.js not installed');
   // Try base58 first (Phantom export)
@@ -582,19 +612,87 @@ async function jupiterGetSwapTx(quote, walletPublicKey) {
   } catch(e) { console.error('[JUPITER] Swap error:', e.message); return null; }
 }
 
-async function sendSolanaTransaction(txBase64, keypair) {
-  const { Connection, VersionedTransaction } = SolanaWeb3;
+// ─── JITO BUNDLE SENDER ──────────────────────────────────────────────────────
+// Sends a Jupiter swap transaction as a 2-tx Jito bundle:
+//   tx[0] — the Jupiter swap (provided as base64 from Jupiter API)
+//   tx[1] — a SOL tip transfer to a random Jito tip account
+//
+// Both transactions are signed with the same keypair and submitted together to
+// the Jito block engine. The bundle bypasses the public mempool entirely, which
+// prevents front-running and sandwich attacks.
+//
+// On success, returns the base58 transaction signature of the swap tx.
+// On failure, throws — caller should log and surface as paper trade fallback.
+async function sendViaJitoBundle(swapTxBase64, keypair) {
+  const { Connection, VersionedTransaction, Transaction, SystemProgram, PublicKey } = SolanaWeb3;
   const connection = new Connection(SOL_RPC, 'confirmed');
-  const txBuf = Buffer.from(txBase64, 'base64');
-  const tx    = VersionedTransaction.deserialize(txBuf);
-  tx.sign([keypair]);
-  const sig = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
-  // Wait up to 45s for confirmation
+
+  // 1. Sign the Jupiter swap transaction
+  const swapBuf = Buffer.from(swapTxBase64, 'base64');
+  const swapTx  = VersionedTransaction.deserialize(swapBuf);
+  swapTx.sign([keypair]);
+
+  // 2. Build tip transaction (legacy tx — plain SOL transfer to Jito tip account)
+  const tipAcctPubkey = new PublicKey(
+    JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]
+  );
+  const { blockhash } = await connection.getLatestBlockhash('confirmed');
+  const tipTx = new Transaction({ recentBlockhash: blockhash, feePayer: keypair.publicKey });
+  tipTx.add(SystemProgram.transfer({
+    fromPubkey: keypair.publicKey,
+    toPubkey:   tipAcctPubkey,
+    lamports:   JITO_TIP_LAMPORTS,
+  }));
+  tipTx.sign(keypair);
+
+  // 3. Serialize both as base58 (Jito bundle API format)
+  const swapSerialized = bs58.encode(Buffer.from(swapTx.serialize()));
+  const tipSerialized  = bs58.encode(Buffer.from(tipTx.serialize()));
+
+  // 4. Submit bundle to Jito block engine
+  const body = JSON.stringify({
+    jsonrpc: '2.0', id: 1,
+    method: 'sendBundle',
+    params: [[swapSerialized, tipSerialized]],
+  });
+
+  const jitoResult = await new Promise((resolve) => {
+    const req = https.request({
+      hostname: JITO_BLOCK_ENGINE,
+      path: '/api/v1/bundles',
+      method: 'POST',
+      headers: {
+        'Content-Type':   'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+      timeout: 15000,
+    }, (res) => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => resolve({ status: res.statusCode, body: d }));
+    });
+    req.on('error',   () => resolve({ status: 500, body: '{}' }));
+    req.on('timeout', () => { req.destroy(); resolve({ status: 504, body: '{}' }); });
+    req.write(body); req.end();
+  });
+
+  if (jitoResult.status !== 200) {
+    throw new Error(`Jito bundle HTTP ${jitoResult.status}: ${jitoResult.body.slice(0, 200)}`);
+  }
+  const parsed = JSON.parse(jitoResult.body);
+  if (parsed.error) throw new Error(`Jito bundle rejected: ${parsed.error.message || JSON.stringify(parsed.error)}`);
+  const bundleId = parsed.result;
+  console.log(`[JITO] Bundle submitted: ${bundleId}`);
+
+  // 5. Derive the swap tx signature from the signed transaction
+  const sig = bs58.encode(Buffer.from(swapTx.signatures[0]));
+
+  // 6. Confirm the swap transaction (Jito bundles typically land in 1-3 slots ≈ 0.4–1.2s)
   const { value } = await connection.confirmTransaction(
     { signature: sig, ...(await connection.getLatestBlockhash('confirmed')) },
     'confirmed'
   );
-  if (value.err) throw new Error(`Tx confirmed but failed on-chain: ${JSON.stringify(value.err)}`);
+  if (value.err) throw new Error(`Jito bundle landed but swap tx failed on-chain: ${JSON.stringify(value.err)}`);
+
   return sig;
 }
 
@@ -632,8 +730,8 @@ async function executeRealEntry(coin, wallet, posSize) {
     const swapTx = await jupiterGetSwapTx(quote, keypair.publicKey.toBase58());
     if (!swapTx) return { txHash: null, executedPrice: coin.price, error: 'Jupiter swap TX failed' };
 
-    const sig = await sendSolanaTransaction(swapTx, keypair);
-    console.log(`[REAL] ✅ ENTRY TX confirmed: https://solscan.io/tx/${sig}`);
+    const sig = await sendViaJitoBundle(swapTx, keypair);
+    console.log(`[REAL] ✅ ENTRY TX confirmed (Jito): https://solscan.io/tx/${sig}`);
     return { txHash: sig, executedPrice: coin.price, tokenAmount, tokenDecimals: outDecimals };
   } catch(e) {
     console.error(`[REAL] ENTRY failed for ${coin.symbol}:`, e.message);
@@ -675,8 +773,8 @@ async function executeRealExit(pos, wallet, exitPrice) {
     const swapTx = await jupiterGetSwapTx(quote, keypair.publicKey.toBase58());
     if (!swapTx) return { txHash: null, executedPrice: exitPrice, error: 'Jupiter exit swap TX failed' };
 
-    const sig = await sendSolanaTransaction(swapTx, keypair);
-    console.log(`[REAL] ✅ EXIT TX confirmed: https://solscan.io/tx/${sig}`);
+    const sig = await sendViaJitoBundle(swapTx, keypair);
+    console.log(`[REAL] ✅ EXIT TX confirmed (Jito): https://solscan.io/tx/${sig}`);
     return { txHash: sig, executedPrice: exitPrice };
   } catch(e) {
     console.error(`[REAL] EXIT failed for ${pos.symbol}:`, e.message);
@@ -2193,6 +2291,58 @@ async function monitorPositions() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// ─── TRENDING FETCHER ─────────────────────────────────────────────────────────
+// Fetches top 200 trending coins from pump.fun and Birdeye every 5 min.
+// Builds trendingAddrs: Map<addr_lowercase, platform_count>.
+// DexScreener boosts are merged separately per scan (already fetched there).
+// ─────────────────────────────────────────────────────────────────────────────
+async function fetchTrendingAddrs() {
+  const now = Date.now();
+  if (now - trendingLastFetch < TRENDING_TTL_MS) return; // still fresh — skip
+  trendingLastFetch = now; // claim the slot immediately to prevent concurrent fetches
+
+  const fresh = new Map();
+
+  // ── Platform 1: pump.fun — top 200 most recently traded coins ──────────────
+  try {
+    const r = await httpGet(
+      'frontend-api.pump.fun',
+      '/coins?offset=0&limit=200&sort=last_trade_unix_time&order=DESC'
+    );
+    const coins = JSON.parse(r.body);
+    const list  = Array.isArray(coins) ? coins : [];
+    for (const c of list) {
+      const addr = (c.mint || '').toLowerCase();
+      if (addr) fresh.set(addr, (fresh.get(addr) || 0) + 1);
+    }
+    console.log(`[TRENDING] pump.fun: ${list.length} trending coins`);
+  } catch(e) { console.log(`[TRENDING] pump.fun error: ${e.message}`); }
+
+  // ── Platform 2: Birdeye — top 200 trending tokens on Solana ─────────────────
+  const birdeyeKey = process.env.BIRDEYE_KEY || '';
+  if (birdeyeKey) {
+    try {
+      const r = await httpGet(
+        'public-api.birdeye.so',
+        '/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=200&chain=solana',
+        { 'X-API-KEY': birdeyeKey }
+      );
+      const d      = JSON.parse(r.body);
+      const tokens = d?.data?.tokens || (Array.isArray(d?.data) ? d.data : []);
+      for (const t of tokens) {
+        const addr = (t.address || '').toLowerCase();
+        if (addr) fresh.set(addr, (fresh.get(addr) || 0) + 1);
+      }
+      console.log(`[TRENDING] Birdeye: ${tokens.length} trending coins`);
+    } catch(e) { console.log(`[TRENDING] Birdeye error: ${e.message}`); }
+  } else {
+    console.log('[TRENDING] Birdeye: no API key — skipping');
+  }
+
+  trendingAddrs = fresh;
+  console.log(`[TRENDING] Cache updated: ${fresh.size} unique trending addrs (pump.fun + Birdeye)`);
+}
+
 // ─── SCANNER ─────────────────────────────────────────────────────────────────
 // ═════════════════════════════════════════════════════════════════════════════
 async function scanForEntries() {
@@ -2242,7 +2392,8 @@ async function scanForEntries() {
     keywords.push('eth','avax','bonk','wif','trump','bitcoin','hot','fire','gem','100x');
   }
   const seen = new Set();
-  const candidates = [];
+  const candidates    = [];
+  const dexBoostAddrs = new Set(); // DexScreener boosted token addresses — merged into trending map below
 
   for (const kw of keywords) {
     try {
@@ -2284,6 +2435,7 @@ async function scanForEntries() {
         const addr = b.tokenAddress || '';
         if (!addr || seen.has(addr)) continue;
         seen.add(addr);
+        dexBoostAddrs.add(addr.toLowerCase()); // track for trending cross-reference
         try {
           const r2 = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${addr}`);
           const d2 = JSON.parse(r2.body);
@@ -2318,6 +2470,20 @@ async function scanForEntries() {
 
   console.log(`[SCAN] Fetched ${candidates.length} unique candidates via ${keywords.length} keywords + boosts + vol sweep`);
 
+  // ── Trending cross-reference ──────────────────────────────────────────────
+  // Merge pump.fun + Birdeye (refreshed every 5 min) with DexScreener boosts
+  // (already fetched above) into one per-scan map: addr → platform count.
+  // trendCount 0 → use base scoreThreshold (72)
+  // trendCount 1 → threshold drops to 65
+  // trendCount 2+ → threshold drops to 57
+  await fetchTrendingAddrs();
+  const scanTrendingMap = new Map(trendingAddrs); // start from pump.fun + Birdeye
+  for (const a of dexBoostAddrs) {
+    scanTrendingMap.set(a, (scanTrendingMap.get(a) || 0) + 1); // add DexScreener boost
+  }
+  const trendingTotal = scanTrendingMap.size;
+  if (trendingTotal > 0) console.log(`[TRENDING] ${trendingTotal} addrs in merged map (${dexBoostAddrs.size} DexBoost + pump.fun + Birdeye)`);
+
   // Clean up expired SL blocks (older than 6h)
   const nowTs = Date.now();
   for (const [addr, ts] of recentSLCoins) {
@@ -2340,7 +2506,14 @@ async function scanForEntries() {
 
     const result = detectStrategy(pair, openStrategies);
     if (result) {
-      if (result.score >= scoreThreshold) {
+      // Tiered threshold: trending presence lowers the bar
+      // Base: 72 | On 1 platform: 65 | On 2+ platforms: 57
+      const addrLower  = (result.addr || '').toLowerCase();
+      const trendCount = scanTrendingMap.get(addrLower) || 0;
+      const effectiveThreshold = trendCount >= 2 ? 57 : trendCount === 1 ? 65 : scoreThreshold;
+
+      if (result.score >= effectiveThreshold) {
+        if (trendCount > 0) result._trendingPlatforms = trendCount; // attach badge for Telegram
         // Record price snapshot for trend/rebound tracking
         const price = parseFloat(pair.priceUsd || 0);
         recordPriceHistory(result.addr, price, result.score);
@@ -2349,10 +2522,11 @@ async function scanForEntries() {
         nearMissCount++;
         // Log near misses for visibility
         if (result.score >= 40) {
-          console.log(`[NEAR MISS] ${result.symbol}: ${result.strategy.label} score ${result.score} (need ${scoreThreshold}) | m5:${result.m5Ch?.toFixed(1)}% m5txns:${result.m5Txns} h1:${result.ch1?.toFixed(1)}% buy:${result.buyPct?.toFixed(0)}%`);
+          const trendNote = trendCount > 0 ? ` [trending:${trendCount}]` : '';
+          console.log(`[NEAR MISS] ${result.symbol}: ${result.strategy.label} score ${result.score} (need ${effectiveThreshold}${trendNote}) | m5:${result.m5Ch?.toFixed(1)}% m5txns:${result.m5Txns} h1:${result.ch1?.toFixed(1)}% buy:${result.buyPct?.toFixed(0)}%`);
         }
-        // Collect top near-misses for the periodic watching report (score 60–71)
-        if (result.score >= 60) {
+        // Collect near-misses for watching report: score ≥60, or trending with score ≥50
+        if (result.score >= 60 || (trendCount > 0 && result.score >= 50)) {
           watchingCoins.push(result);
         }
       }
@@ -2483,6 +2657,9 @@ async function scanForEntries() {
           `🎯 TP3: $${fmtPrice(coin.price * s.tp3x)} (+${((s.tp3x-1)*100).toFixed(0)}%) → 20%\n`;
 
     const pumpBadge     = coin.isPumpFun ? `🎪 Pump.fun${isYoung?' · YOUNG COIN':''}\n` : '';
+    const trendBadge    = coin._trendingPlatforms
+      ? `🔥 Trending on ${coin._trendingPlatforms} platform${coin._trendingPlatforms > 1 ? 's' : ''} (score threshold lowered)\n`
+      : '';
     const pullbackBadge = coin._pulledBackPct
       ? `📉 Pullback entry: -${coin._pulledBackPct}% → +${coin._bouncedPct}% bounce\n`
       : '';
@@ -2497,6 +2674,7 @@ async function scanForEntries() {
       `*${coin.symbol}* — ${coin.name}\n` +
       `${s.label} · Score: *${coin.score}/100*\n` +
       `${pumpBadge}` +
+      `${trendBadge}` +
       `${pullbackBadge}` +
       `💡 ${s.desc}\n\n` +
       `💵 Entry: $${fmtPrice(coin.price)}\n` +
@@ -2655,11 +2833,11 @@ async function sendTelegram(text) {
   });
 }
 
-function httpGet(hostname, path) {
+function httpGet(hostname, path, extraHeaders = {}) {
   return new Promise(resolve => {
     const req = https.request({
       hostname, path, method:'GET', timeout:10000,
-      headers:{'Accept':'application/json','User-Agent':'Mozilla/5.0'},
+      headers:{'Accept':'application/json','User-Agent':'Mozilla/5.0', ...extraHeaders},
     }, res => {
       let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve({status:res.statusCode,body:d}));
     });
