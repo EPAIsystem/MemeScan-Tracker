@@ -616,6 +616,42 @@ function saveCfg(c) {
   try { localStorage.setItem('mscan_cfg', JSON.stringify(c)); } catch {}
 }
 
+// ── Firebase Anonymous Auth ───────────────────────────────────────────────────
+let _idToken = null, _refreshToken = null, _tokenExpiry = 0;
+
+async function getIdToken(apiKey) {
+  if (_idToken && Date.now() < _tokenExpiry - 60000) return _idToken;
+  try {
+    if (_refreshToken) {
+      const r = await fetch(`https://securetoken.googleapis.com/v1/token?key=${apiKey}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: _refreshToken })
+      });
+      if (r.ok) {
+        const d = await r.json();
+        _idToken = d.id_token; _refreshToken = d.refresh_token;
+        _tokenExpiry = Date.now() + parseInt(d.expires_in) * 1000;
+        return _idToken;
+      }
+    }
+    // Sign in anonymously
+    const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${apiKey}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ returnSecureToken: true })
+    });
+    if (!r.ok) return null;
+    const d = await r.json();
+    _idToken = d.idToken; _refreshToken = d.refreshToken;
+    _tokenExpiry = Date.now() + parseInt(d.expiresIn) * 1000;
+    return _idToken;
+  } catch { return null; }
+}
+
+async function authHeaders(cfg) {
+  const token = await getIdToken(cfg.apiKey);
+  return token ? { 'Authorization': `Bearer ${token}` } : {};
+}
+
 // ── Firestore REST helpers ────────────────────────────────────────────────────
 function base(cfg) {
   return `https://firestore.googleapis.com/v1/projects/${cfg.projectId}/databases/(default)/documents`;
@@ -647,14 +683,14 @@ async function fsQuery(cfg, coll, field, value) {
   if (!field) {
     q.structuredQuery.orderBy = [{ field: { fieldPath: 'enteredAt' }, direction: 'DESCENDING' }];
   }
-  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(q) });
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(await authHeaders(cfg)) }, body: JSON.stringify(q) });
   if (!r.ok) { const t = await r.text(); throw new Error(`Firestore ${r.status}: ${t.slice(0,120)}`); }
   const rows = await r.json();
   return rows.map(x => x.document ? parseDoc(x.document) : null).filter(Boolean);
 }
 
 async function fsGet(cfg, coll, id) {
-  const r = await fetch(`${base(cfg)}/${coll}/${id}?key=${cfg.apiKey}`);
+  const r = await fetch(`${base(cfg)}/${coll}/${id}?key=${cfg.apiKey}`, { headers: await authHeaders(cfg) });
   if (r.status === 404) return null;
   if (!r.ok) throw new Error(`Firestore ${r.status}`);
   return parseDoc(await r.json());
@@ -671,7 +707,7 @@ async function fsAdd(cfg, coll, fields) {
   const url = `${base(cfg)}/${coll}?key=${cfg.apiKey}`;
   const r = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...(await authHeaders(cfg)) },
     body: JSON.stringify({ fields: fsFields }),
   });
   if (!r.ok) { const t = await r.text(); throw new Error(`Firestore add ${r.status}: ${t.slice(0,120)}`); }
@@ -679,7 +715,7 @@ async function fsAdd(cfg, coll, fields) {
 }
 
 async function fsDelete(cfg, coll, id) {
-  const r = await fetch(`${base(cfg)}/${coll}/${id}?key=${cfg.apiKey}`, { method: 'DELETE' });
+  const r = await fetch(`${base(cfg)}/${coll}/${id}?key=${cfg.apiKey}`, { method: 'DELETE', headers: await authHeaders(cfg) });
   if (!r.ok && r.status !== 404) throw new Error(`Firestore delete ${r.status}`);
 }
 
@@ -687,7 +723,7 @@ async function fsListSubcoll(cfg, parentColl, parentId, subColl) {
   // List all docs in a sub-collection: e.g. paper_config/wallets/slots
   const url = `${base(cfg)}/${parentColl}/${parentId}/${subColl}?key=${cfg.apiKey}&pageSize=20`;
   try {
-    const r = await fetch(url);
+    const r = await fetch(url, { headers: await authHeaders(cfg) });
     if (!r.ok) return [];
     const d = await r.json();
     return (d.documents || []).map(parseDoc).filter(Boolean);
@@ -706,7 +742,7 @@ async function fsSet(cfg, coll, id, fields) {
   const url = `${base(cfg)}/${coll}/${id}?key=${cfg.apiKey}&${fieldPaths}`;
   const r = await fetch(url, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...(await authHeaders(cfg)) },
     body: JSON.stringify({ fields: fsFields }),
   });
   if (!r.ok) { const t = await r.text(); throw new Error(`Firestore set ${r.status}: ${t.slice(0,120)}`); }
@@ -1533,7 +1569,7 @@ async function setWalletActive(walletId, active) {
     const body   = { fields: { active: { booleanValue: active } } };
     const r = await fetch(url, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...(await authHeaders(S.config)) },
       body: JSON.stringify(body),
     });
     if (!r.ok) throw new Error(await r.text());
