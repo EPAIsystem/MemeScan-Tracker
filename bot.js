@@ -27,7 +27,7 @@ const TELEGRAM_TOKEN  = (process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_
 const TELEGRAM_CHAT   = (process.env.TELEGRAM_CHAT_ID   || process.env.TELEGRAM_CHAT   || '').trim();
 const POSITION_SIZE   = parseFloat(process.env.POSITION_SIZE || '100');
 const MAX_POSITIONS   = 10;
-const MIN_SCORE       = 50;  // floor = base score of any detected pattern; effectively "enter anything that matches a strategy"
+const MIN_SCORE       = 42;  // minimum entry score — catches weaker-signal coins; no upper cap (80, 90, 100 all pass)
 const DAILY_LOSS_LIMIT= -0.30;
 const SCAN_INTERVAL   = 15000;  // 15s — entry scanner
 const PRICE_CHECK     =  3000;  //  3s — position monitor (all hot-path reads cached; ~5,760 reads/day total)
@@ -2856,7 +2856,7 @@ async function scanForEntries() {
       `🔍 *Scan #${scanCount}*${paused}${halted}\n` +
       `Mode: *${mode}* · Open positions: ${openPositions.length}/${MAX_POSITIONS}\n` +
       `${candidates.length} candidates → ${matches.length} matched → ${lockedMatches.length} LP OK → ${qualityMatches.length} quality\n` +
-      `${nearMissCount} near-misses (score 40-${scoreThreshold - 1})`
+      `${nearMissCount} near-misses (score ${MIN_SCORE - 8}-${scoreThreshold - 1})`
     ).catch(() => {});
   }
 
