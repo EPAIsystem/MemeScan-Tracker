@@ -2806,23 +2806,6 @@ async function scanForEntries() {
   // Always log scan summary so Fly.io logs show activity
   console.log(`[SCAN] #${scanCount}: ${candidates.length} candidates → ${matches.length} above threshold, ${nearMissCount} near misses (threshold: ${scoreThreshold})`);
 
-  // ── Periodic heartbeat (every 20 scans ≈ 5 min) ─────────────────────────────
-  // Sends to Telegram so you can see the bot is actually scanning.
-  // Uses scanCount from outer scope (incremented in main setInterval).
-  if (scanCount % 20 === 0) {
-    const openPositions = await getOpenPositions().catch(() => []);
-    const cfg = await getTradingConfig().catch(() => ({}));
-    const mode = (cfg.tradingMode || 'paper').toUpperCase();
-    const paused = cfg.running === false ? ' ⏸PAUSED' : '';
-    const halted = dayHaltedToday ? ' 🚨HALTED' : '';
-    await sendTelegram(
-      `🔍 *Scan #${scanCount}*${paused}${halted}\n` +
-      `Mode: *${mode}* · Open positions: ${openPositions.length}/${MAX_POSITIONS}\n` +
-      `${candidates.length} candidates → ${matches.length} matched → ${lockedMatches.length} LP OK → ${qualityMatches.length} quality\n` +
-      `${nearMissCount} near-misses (score 40-${scoreThreshold - 1})`
-    ).catch(() => {});
-  }
-
   // ── PERIODIC "WATCHING" REPORT — every 60 scans (~15 min) ───────────────────
   // Tells Telegram what the bot is monitoring but has NOT entered yet.
   // Score ≥ 60 = on radar (strong signal, monitoring). Score ≥ MIN_SCORE = entered (separate message).
@@ -2860,6 +2843,22 @@ async function scanForEntries() {
     if (label !== '🆕 NEW') console.log(`[QUALITY] ✅ ${coin.symbol} — ${label}`);
     return true;
   });
+
+  // ── Periodic heartbeat (every 20 scans ≈ 5 min) ─────────────────────────────
+  // Placed here so lockedMatches and qualityMatches are already declared above.
+  if (scanCount % 20 === 0) {
+    const openPositions = await getOpenPositions().catch(() => []);
+    const cfg2 = await getTradingConfig().catch(() => ({}));
+    const mode = (cfg2.tradingMode || 'paper').toUpperCase();
+    const paused = cfg2.running === false ? ' ⏸PAUSED' : '';
+    const halted = dayHaltedToday ? ' 🚨HALTED' : '';
+    await sendTelegram(
+      `🔍 *Scan #${scanCount}*${paused}${halted}\n` +
+      `Mode: *${mode}* · Open positions: ${openPositions.length}/${MAX_POSITIONS}\n` +
+      `${candidates.length} candidates → ${matches.length} matched → ${lockedMatches.length} LP OK → ${qualityMatches.length} quality\n` +
+      `${nearMissCount} near-misses (score 40-${scoreThreshold - 1})`
+    ).catch(() => {});
+  }
 
   const usedThisScan = new Set();
 
