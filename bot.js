@@ -1044,6 +1044,10 @@ async function enterPosition(coin, overrides = {}) {
   // positionSize: dynamic sizing (liq × 1% × MC multiplier), capped at /setsize override or POSITION_SIZE env var
   const ceiling    = overrides.size || parseFloat(cfg.positionSize) || POSITION_SIZE;
   const posSize    = calcDynamicPositionSize(coin.liq || 0, coin.mcap || 0, ceiling);
+  const rawSize    = (coin.liq || 0) * 0.01;  // 1% of liq before MC multiplier & ceiling
+  const posSizeNote = posSize >= ceiling
+    ? `$${posSize} _(capped — liq 1% = $${rawSize.toFixed(0)})_`
+    : `$${posSize} _(liq × 1%)_`;
   // Surge momentum: flag if m5 is ripping fast at entry (not applicable to moon bags)
   const isSurge = !overrides.isMoonBag && (coin.m5Ch || 0) >= SURGE_M5_ENTRY_TRIGGER;
   const tradingMode = cfg.tradingMode || 'paper';
@@ -1093,6 +1097,7 @@ async function enterPosition(coin, overrides = {}) {
     initialTrailPct: s.initialTrailPct,
     trailingActive: false,
     size: posSize,
+    sizeNote: posSizeNote,
     remaining: 1.0,
     tp1Hit: false, tp2Hit: false,
     // Partial profit fields (Active Momentum + Surge)
@@ -3266,7 +3271,7 @@ async function scanForEntries() {
       `${rangeReentryBadge}` +
       `💡 ${s.desc}\n\n` +
       `💵 Entry: $${fmtPrice(coin.price)}\n` +
-      `💰 Position: $${pos.size}${pos.walletLabel ? ` · ${pos.walletLabel}` : ''}\n` +
+      `💰 Position: ${pos.sizeNote || '$'+pos.size}${pos.walletLabel ? ` · ${pos.walletLabel}` : ''}\n` +
       `📊 Buy%: ${coin.buyPct.toFixed(0)}% | Liq: $${(coin.liq/1000).toFixed(0)}k\n` +
       `📈 Age: ${ageLabel} | m5: ${coin.m5Ch>0?'+':''}${coin.m5Ch.toFixed(1)}% | h1: ${coin.ch1!=null?(coin.ch1>0?'+':'')+coin.ch1.toFixed(1)+'%':'<1h'}\n\n` +
       tpInfo +
