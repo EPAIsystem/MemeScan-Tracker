@@ -90,9 +90,9 @@ const SURGE_AVG_TRADE_MIN   = 40;       // avg trade ≥$40 confirms real buyers
 const ANTI_MANIP_AVG_TRADE_FLOOR  = 15;   // global: avg trade must be ≥$15 (kills $0.01–$2 spam)
 const ANTI_MANIP_M5_TXNS_MAX      = 200;  // global: >200 txns in 5min = 40/min = bots
 const ANTI_MANIP_MC_LIQ_RATIO_MAX = 30;   // global: mc/liq > 30× = thin pool, easy to manipulate
-const ANTI_MANIP_SC_AVG_TRADE     = 40;   // Surge Catch only: stricter $40 avg trade floor
+const ANTI_MANIP_SC_AVG_TRADE     = 20;   // Surge Catch: young coins trade smaller ($20 floor)
 const ANTI_MANIP_SC_TXNS_MAX      = 150;  // Surge Catch only: 30/min ceiling
-const ANTI_MANIP_SC_MC_LIQ_MAX    = 20;   // Surge Catch only: tighter mc/liq ceiling
+const ANTI_MANIP_SC_MC_LIQ_MAX    = 30;   // Surge Catch: thin pools normal for young surges
 
 // ─── DYNAMIC POSITION SIZING ─────────────────────────────────────────────────
 // Position scales with liquidity (1% of pool ≈ <1% price impact) and market cap.
