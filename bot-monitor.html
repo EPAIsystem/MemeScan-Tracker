@@ -1595,7 +1595,7 @@ function tradingControlsHTML() {
 
   const sizeBlock = `
     <div>
-      <div class="ctrl-block-label">Position Size</div>
+      <div class="ctrl-block-label">Size Ceiling</div>
       ${S.editingSize
         ? `<div class="size-row">
             <input class="size-input" id="size-inp" type="number" min="5" step="5"
@@ -1604,9 +1604,10 @@ function tradingControlsHTML() {
             <button class="size-edit-btn" onclick="S.editingSize=false;render()">✕</button>
           </div>`
         : `<div class="size-row">
-            <span class="size-val">$${posSize}</span>
+            <span class="size-val">$${posSize} <span style="font-size:10px;opacity:0.55;font-weight:400">max</span></span>
             <button class="size-edit-btn" onclick="S.editingSize=true;render()">✏ Edit</button>
-          </div>`}
+          </div>
+          <div style="font-size:10px;opacity:0.45;margin-top:2px">dynamic · liq × 1%</div>`}
     </div>`;
 
   const ctrlPanel = `
