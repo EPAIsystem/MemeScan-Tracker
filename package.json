@@ -2,8 +2,9 @@
   "name": "memescan-tracker",
   "private": true,
   "dependencies": {
-    "firebase-admin": "^12.0.0",
     "@solana/web3.js": "1.87.6",
-    "bs58": "^5.0.0"
+    "bs58": "^5.0.0",
+    "firebase-admin": "^12.0.0",
+    "rpc-websockets": "7.5.1"
   }
 }
