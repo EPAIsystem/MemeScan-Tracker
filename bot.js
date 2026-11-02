@@ -27,6 +27,7 @@ const TELEGRAM_TOKEN  = (process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_
 const TELEGRAM_CHAT   = (process.env.TELEGRAM_CHAT_ID   || process.env.TELEGRAM_CHAT   || '').trim();
 const POSITION_SIZE   = parseFloat(process.env.POSITION_SIZE || '100');
 const MAX_POSITIONS   = 20;
+const SURGE_RESERVED  = 5;   // last 5 slots reserved for Surge Catch (id 2) only
 const MIN_SCORE       = 42;  // minimum entry score — catches weaker-signal coins; no upper cap (80, 90, 100 all pass)
 const DAILY_LOSS_LIMIT= -0.30;
 const SCAN_INTERVAL   = 15000;  // 15s — entry scanner
@@ -3120,6 +3121,9 @@ async function scanForEntries() {
 
   for (const coin of qualityMatches) {
     if (positions.length >= MAX_POSITIONS) break;
+    // Reserve last SURGE_RESERVED slots exclusively for Surge Catch (id 2).
+    // Other strategies stop competing once positions reach MAX_POSITIONS - SURGE_RESERVED.
+    if (coin.strategy.id !== 2 && positions.length >= MAX_POSITIONS - SURGE_RESERVED) continue;
     if (usedThisScan.has(coin.addr)) continue;
     // Check cooldown
     const last = alertCooldown.get(coin.addr) || 0;
@@ -3356,7 +3360,7 @@ async function main() {
   await sendTelegram(
     `✅ *MemeScan PRO — 4-STRATEGY BOT LIVE*\n\n` +
     `${slotLines}\n\n` +
-    `💰 $${POSITION_SIZE}/position · 🛑 Daily limit: 30%\n` +
+    `💰 Dynamic sizing (liq × 1%, $50–$${POSITION_SIZE} cap) · 🛑 Daily limit: 30%\n` +
     `🎛 Mode: *${startMode}*\n` +
     `${walletLine}\n` +
     `⏱ Scanning every 15 seconds\n\n` +
