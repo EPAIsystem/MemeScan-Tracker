@@ -245,10 +245,15 @@ header {
 .pos-right { text-align: right; }
 .cat-badge {
   display: inline-block;
-  font-size: 10px; padding: 2px 8px; border-radius: 20px;
-  background: var(--bg3); border: 1px solid var(--border);
-  color: var(--fg2); white-space: nowrap;
+  font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 20px;
+  border: 1px solid currentColor; white-space: nowrap; letter-spacing: 0.02em;
 }
+/* Strategy-specific badge colours */
+.cat-badge.surge   { color: #ff9f40; background: rgba(255,159,64,0.15); }
+.cat-badge.momentum{ color: #4fc3f7; background: rgba(79,195,247,0.15); }
+.cat-badge.bounce  { color: #66bb6a; background: rgba(102,187,106,0.15); }
+.cat-badge.recovery{ color: #ba68c8; background: rgba(186,104,200,0.15); }
+.cat-badge.manual  { color: var(--fg2); background: var(--bg3); }
 .pos-score { font-family: var(--mono); font-size: 10px; color: var(--fg3); margin-top: 4px; }
 .pos-age   { font-size: 11px; color: var(--yellow); font-weight: 600; margin-top: 3px; letter-spacing: 0.02em; }
 
@@ -860,6 +865,17 @@ async function loadData() {
   render();
 }
 
+// ── Strategy badge colour class ───────────────────────────────────────────────
+function getBadgeClass(strategyId) {
+  switch (strategyId) {
+    case 0:  return 'bounce';
+    case 1:  return 'momentum';
+    case 2:  return 'surge';
+    case 3:  return 'recovery';
+    default: return 'manual';
+  }
+}
+
 // ── Format helpers ────────────────────────────────────────────────────────────
 function fmtPrice(p) {
   if (p == null || p === 0) return '—';
@@ -1149,7 +1165,7 @@ function posCard(pos) {
         <div class="pos-name">${pos.name || ''}</div>
       </div>
       <div class="pos-right">
-        <span class="cat-badge">${pos.strategyLabel || pos.catLabel || ''}</span>
+        <span class="cat-badge ${getBadgeClass(pos.strategyId)}">${pos.strategyLabel || pos.catLabel || ''}</span>
         ${pos.youngCoin ? `<span style="font-size:10px;background:rgba(255,100,0,0.25);color:#ff8c42;border:1px solid rgba(255,140,66,0.4);border-radius:4px;padding:1px 5px;margin-left:3px;">🔥 YOUNG</span>` : ''}
         <div class="pos-score">Score ${pos.score || '—'}/100</div>
         ${pos.enteredAt ? `<div class="pos-age" data-entered-at="${pos.enteredAt}" title="Time since entry">⏱ ${ageStr}</div>` : ''}
