@@ -79,7 +79,26 @@ const surgeWatchlist        = new Map(); // addr → { symbol, peakPrice, pullba
 const SURGE_PULLBACK_MIN    = 0.05;     // ≥5% drop from peak = in pullback zone
 const SURGE_PULLBACK_MAX    = 0.35;     // >35% drop = dump — abandon watchlist entry
 const SURGE_BOUNCE_CONFIRM  = 0.03;     // 3% recovery from pullback low = entry signal
-const SURGE_WATCH_EXPIRY_MS = 25 * 60 * 1000; // 25 min max watch window
+const SURGE_WATCH_EXPIRY_MS = 3 * 60 * 1000;  // 3 min max watch window (fast surges fade fast)
+const SURGE_BUY_RATE_MIN    = 8;        // ≥8 buys/min = confirmed real surge (m5Buys/5)
+const SURGE_CONFIRM_MIN_MS  = 60000;    // must watch ≥1 min before buy-rate entry fires
+const SURGE_AVG_TRADE_MIN   = 40;       // avg trade ≥$40 confirms real buyers (not micro-bots)
+
+// ─── ANTI-MANIPULATION THRESHOLDS ────────────────────────────────────────────
+// Applied globally in detectStrategy() before any strategy-specific scoring.
+// Catches bot farms (micro-trade spam), thin-pool manipulation, and wash trading.
+const ANTI_MANIP_AVG_TRADE_FLOOR  = 15;   // global: avg trade must be ≥$15 (kills $0.01–$2 spam)
+const ANTI_MANIP_M5_TXNS_MAX      = 200;  // global: >200 txns in 5min = 40/min = bots
+const ANTI_MANIP_MC_LIQ_RATIO_MAX = 30;   // global: mc/liq > 30× = thin pool, easy to manipulate
+const ANTI_MANIP_SC_AVG_TRADE     = 40;   // Surge Catch only: stricter $40 avg trade floor
+const ANTI_MANIP_SC_TXNS_MAX      = 150;  // Surge Catch only: 30/min ceiling
+const ANTI_MANIP_SC_MC_LIQ_MAX    = 20;   // Surge Catch only: tighter mc/liq ceiling
+
+// ─── DYNAMIC POSITION SIZING ─────────────────────────────────────────────────
+// Position scales with liquidity (1% of pool ≈ <1% price impact) and market cap.
+// POSITION_SIZE env var is now the MAXIMUM cap — not a fixed amount.
+// MC sweet spot ($25k–$200k): fast-moving small caps where small traders make the most.
+const POS_FLOOR = 50;   // $50 minimum — below this, fees erase profits
 
 // ─── RANGE-TRADE MODE (Bottom Bounce id 0, Active Momentum id 1, Old Recovery id 3) ──
 // When a position gains <5% in 30 minutes (slow movement), the bot identifies the
@@ -224,6 +243,20 @@ function calcTrailPct(initialTrailPct, gainPct) {
   return Math.max(5, initialTrailPct - (gainPct / 7));
 }
 
+// Dynamic position size: 1% of pool liquidity × market cap multiplier, capped at ceiling.
+// MC sweet spot ($25k–$200k) gets a 1.3× boost — these coins can 2x–5x fast for small traders.
+// Large caps (>$2M) are reduced — a $100 position barely moves the needle there.
+function calcDynamicPositionSize(liq, mcap, ceiling = POSITION_SIZE) {
+  const base = liq * 0.01;  // 1% of pool — keeps price impact under ~1%
+  const mcMult =
+    mcap < 25000    ? 0.5 :   // ultra-micro — too risky, minimize
+    mcap <= 200000  ? 1.3 :   // sweet spot $25k–$200k — size up for fast gains
+    mcap <= 2000000 ? 1.0 :   // standard small cap
+    mcap <= 20000000? 0.8 :   // mid cap — our $100 barely matters, pull back
+                      0.6;    // large cap — we're dust here, don't overexpose
+  return Math.max(POS_FLOOR, Math.min(base * mcMult, ceiling));
+}
+
 // Moon bag SL: returns the current SL fraction (e.g. 0.20 = 20%) based on
 // how much the moon bag position has gained since its own entry price.
 function getMoonBagSL(gainFromEntry) {
@@ -243,6 +276,7 @@ function detectStrategy(pair, openStrategies) {
   const ageDays = (now - created) / 86400000;
   const liq     = pair.liquidity?.usd || 0;
   const vol24   = pair.volume?.h24 || 0;
+  const m5Vol   = pair.volume?.m5  || 0;   // 5-min USD volume (anti-manipulation)
   const mcap    = pair.fdv || pair.marketCap || 1;
   const ch1Raw  = pair.priceChange?.h1;                                 // null = no data
   const ch1     = ch1Raw == null ? null : parseFloat(ch1Raw);
@@ -257,7 +291,12 @@ function detectStrategy(pair, openStrategies) {
   const buyPct  = total24 > 0 ? (buys24 / total24) * 100 : 50;
   const price   = parseFloat(pair.priceUsd || 0);
   const addr    = (pair.baseToken?.address || '').trim();
-  const volMcap = mcap > 0 ? vol24 / mcap : 0;
+  const volMcap     = mcap > 0 ? vol24 / mcap : 0;
+  // Anti-manipulation derived metrics
+  const avgTrade    = m5Txns > 0 && m5Vol > 0 ? m5Vol / m5Txns : null; // null = data missing, skip filter
+  const mcLiqRatio  = liq > 0 ? mcap / liq : 999;
+  const mcSweetSpot = mcap >= 25000 && mcap <= 200000; // fast-doubling range for small traders
+  const m5BuyRate   = m5Buys / 5; // buys per minute (direct from m5 txn data)
 
   // Universal hard filters
   const isSolana = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr);
@@ -266,6 +305,12 @@ function detectStrategy(pair, openStrategies) {
   if (liq < 3000)  return null;
   if (price <= 0)  return null;
   if (sells24 === 0 && buys24 > 10) return null; // honeypot guard
+
+  // ── ANTI-MANIPULATION GLOBAL FILTERS ─────────────────────────────────────────
+  // Reject bot farms and thin-pool manipulation before wasting scoring cycles.
+  if (m5Txns > ANTI_MANIP_M5_TXNS_MAX) return null;                        // 40+ txns/min = bot spam
+  if (avgTrade !== null && avgTrade < ANTI_MANIP_AVG_TRADE_FLOOR) return null; // micro-trade spam
+  if (mcLiqRatio > ANTI_MANIP_MC_LIQ_RATIO_MAX) return null;                // thin pool — easy to fake
 
   // Calculate age before the dead coin guard — needed for the young-coin exemption
   const ageMinutes = (now - created) / 60000;
@@ -315,7 +360,10 @@ function detectStrategy(pair, openStrategies) {
   if (isPumpFun && ageMinutes < 90 && liq < 15000) return null;
   if (isPumpFun && ageMinutes < 90 && buyPct < 62)  return null;
 
-  const base = { addr, price, liq, vol24, buyPct, buys24, ch1, ch24, m5Ch, m5Txns, ageDays, ageMinutes, volMcap,
+  const base = {
+    addr, price, liq, mcap, vol24, buyPct, buys24, ch1, ch24, m5Ch, m5Txns,
+    m5Buys, m5Vol, m5BuyRate, avgTrade, mcLiqRatio, mcSweetSpot,
+    ageDays, ageMinutes, volMcap,
     symbol: pair.baseToken?.symbol || '???',
     name:   pair.baseToken?.name   || '',
     chain:  pair.chainId || 'unknown',
@@ -347,6 +395,12 @@ function detectStrategy(pair, openStrategies) {
         if (liq > 50000) score += 8; else if (liq > 20000) score += 4;
         if (ch1 > 0)    score += 10; // h1 already positive = confirmed reversal
         if (volMcap > 0.3) score += 5;
+        // MC sweet spot + avg trade quality
+        if (mcSweetSpot) score += 10;
+        if (avgTrade !== null) {
+          if (avgTrade > 80) score += 5;
+          else if (avgTrade < 30) score -= 10;
+        }
       }
     }
 
@@ -358,6 +412,8 @@ function detectStrategy(pair, openStrategies) {
       if (buyPct < s.minBuyPct)  { match = false; }
       if (liq < s.minLiq)        { match = false; }
       if (ageDays > s.maxAgeDays){ match = false; }
+      // Anti-manipulation: require meaningful avg trade size
+      if (avgTrade !== null && avgTrade < 25) { match = false; }
       if (match) {
         score += Math.min(20, m5Txns / 2);         // very active = more confidence
         if (m5Ch > 5)  score += 15; else if (m5Ch > 2) score += 8;
@@ -371,6 +427,12 @@ function detectStrategy(pair, openStrategies) {
         const ch24pos1 = Math.max(ch24, 0);
         if      (ch1 > 30 && ch24pos1 < 20) score -= 35; // spike in flat day = range top
         else if (ch1 > 20 && ch24pos1 < 8)  score -= 20; // moderate spike, very weak 24h
+        // MC sweet spot + avg trade quality
+        if (mcSweetSpot) score += 10;
+        if (avgTrade !== null) {
+          if (avgTrade > 80) score += 5;
+          else if (avgTrade < 30) score -= 10;
+        }
       }
     }
 
@@ -382,6 +444,10 @@ function detectStrategy(pair, openStrategies) {
       if (ch1 < s.minCh1)        { match = false; } // h1 confirms uptrend
       if (buyPct < s.minBuyPct)  { match = false; }
       if (liq < s.minLiq)        { match = false; }
+      // Stricter anti-manipulation for Surge Catch (high-risk, bot-targeted strategy)
+      if (avgTrade !== null && avgTrade < ANTI_MANIP_SC_AVG_TRADE) { match = false; }
+      if (m5Txns > ANTI_MANIP_SC_TXNS_MAX)                         { match = false; }
+      if (mcLiqRatio > ANTI_MANIP_SC_MC_LIQ_MAX)                   { match = false; }
       if (match) {
         score += Math.min(25, m5Ch * 3);             // bigger m5 move = higher score
         if (m5Txns > 50) score += 15; else if (m5Txns > 30) score += 10; else if (m5Txns > 20) score += 5;
@@ -395,6 +461,12 @@ function detectStrategy(pair, openStrategies) {
         // A genuine surge WILL have high ch1 relative to ch24 — penalising that ratio
         // directly blocks the pattern this strategy is designed to catch.
         // Range-top protection is handled in the entry loop via priceHistory.
+        // MC sweet spot + avg trade quality
+        if (mcSweetSpot) score += 10;
+        if (avgTrade !== null) {
+          if (avgTrade > 80) score += 5;
+          else if (avgTrade < 50) score -= 5; // SC requires cleaner signal
+        }
       }
     }
 
@@ -414,6 +486,12 @@ function detectStrategy(pair, openStrategies) {
         if (liq > 300000) score += 12; else if (liq > 150000) score += 7;
         if (buys24 > 200) score += 10; else if (buys24 > 100) score += 5;
         if (volMcap > 0.05) score += 5;
+        // MC sweet spot + avg trade quality
+        if (mcSweetSpot) score += 10;
+        if (avgTrade !== null) {
+          if (avgTrade > 80) score += 5;
+          else if (avgTrade < 30) score -= 10;
+        }
       }
     }
 
@@ -962,8 +1040,9 @@ async function enterPosition(coin, overrides = {}) {
   const usePartial = !!s.usePartialProfit;
   // ── Trading mode & wallet ──────────────────────────────────────────────────
   const cfg        = await getTradingConfig();
-  // positionSize can be overridden via /setsize in Firestore; falls back to env var
-  const posSize    = overrides.size || parseFloat(cfg.positionSize) || POSITION_SIZE;
+  // positionSize: dynamic sizing (liq × 1% × MC multiplier), capped at /setsize override or POSITION_SIZE env var
+  const ceiling    = overrides.size || parseFloat(cfg.positionSize) || POSITION_SIZE;
+  const posSize    = calcDynamicPositionSize(coin.liq || 0, coin.mcap || 0, ceiling);
   // Surge momentum: flag if m5 is ripping fast at entry (not applicable to moon bags)
   const isSurge = !overrides.isMoonBag && (coin.m5Ch || 0) >= SURGE_M5_ENTRY_TRIGGER;
   const tradingMode = cfg.tradingMode || 'paper';
@@ -1995,8 +2074,23 @@ function checkSurgePullback(coin, pullbackMin = SURGE_PULLBACK_MIN, bounceConfir
   // ── EXPIRY CHECK ─────────────────────────────────────────────────────────────
   if (now - entry.watchedSince > SURGE_WATCH_EXPIRY_MS) {
     surgeWatchlist.delete(addr);
-    console.log(`[SURGE-WATCH] ${coin.symbol} — expired after 25 min without pullback entry`);
+    console.log(`[SURGE-WATCH] ${coin.symbol} — expired after 3 min without entry`);
     return false;
+  }
+
+  // ── BUY-RATE CONFIRMATION: enter without pullback if momentum is sustained ────
+  // Requires: watched ≥1 min + strong buy rate + healthy avg trade + uptrend
+  const watchedMs = now - entry.watchedSince;
+  if (
+    watchedMs >= SURGE_CONFIRM_MIN_MS &&
+    coin.m5BuyRate  >= SURGE_BUY_RATE_MIN  &&
+    coin.avgTrade   >= SURGE_AVG_TRADE_MIN &&
+    isTrendingUp(addr, 3)
+  ) {
+    coin._buyRateEntry = true;
+    console.log(`[SURGE-WATCH] ${coin.symbol} — BUY-RATE CONFIRMED ✅ ${coin.m5BuyRate.toFixed(1)}/min buys, avgTrade $${coin.avgTrade?.toFixed(0)}, trend up — ENTERING`);
+    surgeWatchlist.delete(addr);
+    return true; // ✅ enter on sustained momentum
   }
 
   // ── STILL RISING: update peak ─────────────────────────────────────────────────
@@ -3039,28 +3133,21 @@ async function scanForEntries() {
     // IS the pullback — adding another intraday dip gate double-filters them and
     // prevents any entries after a bot restart (surgeWatchlist is empty on deploy).
     //
-    // Three ways through for id 1 / id 2:
-    //   A) EXPLOSIVE BYPASS (id 1 only): m5 > 8% AND h1 > 25% AND buyPct > 70%
-    //      — trend so strong a pullback may never come; enter immediately.
-    //   B) MOMENTUM BYPASS: coin has been watched ≥5 min with m5 rising (>2%)
-    //      and solid buy pressure (>62%) — handles "bot restarted mid-move" case
-    //      where the watchlist was empty and the pullback cycle can't complete.
-    //   C) FULL PULLBACK CYCLE: ≥5% dip from peak → ≥3% bounce from that low.
+    // Entry paths for id 1 (Active Momentum):
+    //   A) EXPLOSIVE BYPASS: m5 > 8% AND h1 > 25% AND buyPct > 70% — enter immediately
+    //   B) FULL PULLBACK CYCLE (via checkSurgePullback): ≥5% dip → ≥3% bounce
+    // Entry paths for id 2 (Surge Catch — via checkSurgePullback):
+    //   A) BUY-RATE CONFIRMATION: watched ≥1 min + m5BuyRate ≥8/min + avgTrade ≥$40 + uptrend
+    //   B) FULL PULLBACK CYCLE: ≥5% dip from peak → ≥3% bounce from that low
 
     if (coin.strategy.id === 2) {
-      const watchEntry = surgeWatchlist.get(coin.addr);
-      const watchedMs  = watchEntry ? (Date.now() - watchEntry.watchedSince) : 0;
-      const isMomentumBypass = watchedMs > 5 * 60 * 1000
-        && (coin.m5Ch || 0) > 2 && (coin.buyPct || 0) > 62;
-      if (isMomentumBypass) {
-        console.log(`[SURGE-WATCH] ${coin.symbol} — MOMENTUM BYPASS (watched ${Math.round(watchedMs/60000)}min, m5:${coin.m5Ch?.toFixed(1)}%, buy:${coin.buyPct?.toFixed(0)}%) — entering`);
-        coin._momentumBypass = true;
-      } else {
-        const shouldEnter = checkSurgePullback(coin);
-        if (!shouldEnter) {
-          usedThisScan.add(coin.addr); // don't reprocess same coin twice this scan
-          continue;
-        }
+      // Two paths through the gate (both handled inside checkSurgePullback):
+      //   A) BUY-RATE CONFIRMATION: watched ≥1 min + m5BuyRate ≥8/min + avgTrade ≥$40 + uptrend
+      //   B) FULL PULLBACK CYCLE: ≥5% dip from peak → ≥3% bounce from that low
+      const shouldEnter = checkSurgePullback(coin);
+      if (!shouldEnter) {
+        usedThisScan.add(coin.addr); // don't reprocess same coin twice this scan
+        continue;
       }
     }
 
