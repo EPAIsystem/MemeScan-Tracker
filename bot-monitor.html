@@ -1009,8 +1009,11 @@ function render() {
     const rows = S.history.map(t => {
       const pnl = t.pnl || 0;
       const pct = t.entryPrice && t.exitPrice ? (t.exitPrice - t.entryPrice) / t.entryPrice * 100 : null;
+      const stratLabel = t.strategyLabel || t.catLabel || '—';
+      const stratShort = stratLabel.replace(/^[^\w]*/, '').split(' ').slice(0,2).join(' '); // strip emoji, keep first 2 words
       return `<tr>
         <td class="td-sym">${t.symbol || '?'}</td>
+        <td><span class="cat-badge ${getBadgeClass(t.strategyId)}" style="font-size:9px;padding:2px 6px">${stratShort}</span></td>
         <td>${fmtPrice(t.entryPrice)}</td>
         <td>${fmtPrice(t.exitPrice)}</td>
         <td class="${pct >= 0 ? 'c-green' : 'c-red'}">${pct != null ? fmtPct(pct) : '—'}</td>
@@ -1021,7 +1024,7 @@ function render() {
     }).join('');
     histHTML = `<div class="table-wrap">
       <table>
-        <thead><tr><th>Token</th><th>Entry</th><th>Exit</th><th>%</th><th>P&amp;L</th><th>Reason</th><th>Closed</th></tr></thead>
+        <thead><tr><th>Token</th><th>Strategy</th><th>Entry</th><th>Exit</th><th>%</th><th>P&amp;L</th><th>Reason</th><th>Closed</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>`;
