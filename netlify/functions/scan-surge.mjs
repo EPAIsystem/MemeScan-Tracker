@@ -21,7 +21,7 @@
 import { getStore } from '@netlify/blobs';
 
 // ---------- tunables ----------
-const CHAINS = { solana: 'solana', eth: 'eth' }; // GeckoTerminal network ids
+const CHAINS = { solana: 'solana' }; // GeckoTerminal network ids — Solana only; ETH removed (bot can't trade EVM addresses)
 const MCAP_MIN = 30_000;
 const MCAP_MAX = 120_000;
 const AGE_MIN_MS = 4 * 3600 * 1000;    // start watching at 4h old
