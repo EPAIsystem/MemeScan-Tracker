@@ -26,7 +26,7 @@ try {
 const TELEGRAM_TOKEN  = (process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_TOKEN  || '').trim();
 const TELEGRAM_CHAT   = (process.env.TELEGRAM_CHAT_ID   || process.env.TELEGRAM_CHAT   || '').trim();
 const POSITION_SIZE   = parseFloat(process.env.POSITION_SIZE || '100');
-const MAX_POSITIONS   = 10;
+const MAX_POSITIONS   = 20;
 const MIN_SCORE       = 42;  // minimum entry score — catches weaker-signal coins; no upper cap (80, 90, 100 all pass)
 const DAILY_LOSS_LIMIT= -0.30;
 const SCAN_INTERVAL   = 15000;  // 15s — entry scanner
@@ -67,7 +67,7 @@ let watchingCoinsSnapshot = []; // updated each scan; holds near-miss coins for 
 
 // ─── PRICE HISTORY TRACKER ────────────────────────────────────────────────────
 const priceHistory = new Map(); // addr → [{price, score, ts}, ...]
-const PRICE_HIST_MAX    = 20;   // keep last 20 scan snapshots per coin
+const PRICE_HIST_MAX    = 40;   // keep last 40 scan snapshots per coin (~10 min of data at 15s scans)
 const PRICE_HIST_TREND  = 3;    // consecutive rising points = confirmed uptrend
 const PRICE_HIST_REBOUND_PCT = 0.05; // 5% recovery from dip = rebound confirmed
 
@@ -80,6 +80,34 @@ const SURGE_PULLBACK_MIN    = 0.05;     // ≥5% drop from peak = in pullback zo
 const SURGE_PULLBACK_MAX    = 0.35;     // >35% drop = dump — abandon watchlist entry
 const SURGE_BOUNCE_CONFIRM  = 0.03;     // 3% recovery from pullback low = entry signal
 const SURGE_WATCH_EXPIRY_MS = 25 * 60 * 1000; // 25 min max watch window
+
+// ─── RANGE-TRADE MODE (Bottom Bounce id 0, Active Momentum id 1, Old Recovery id 3) ──
+// When a position gains <5% in 30 minutes (slow movement), the bot identifies the
+// support/resistance range and cycles in/out for consistent small profits.
+//   • At resistance + declining momentum → take profit, add to re-entry watchlist
+//   • At resistance + still rising       → skip exit, tighten SL to protect gain
+//   • TP1/TP2/TP3 remain as guardrails for fast-moving positions
+// Surge Catch (id 2) is exempt — it has its own stale-exit logic.
+const RANGE_SLOW_MIN_AGE    = 30 * 60 * 1000;  // 30 min minimum hold before range check
+const RANGE_SLOW_GAIN_MAX   = 0.05;             // <5% gain in 30 min = slow movement
+const RANGE_RESISTANCE_PCT  = 1.02;             // price ≥ 2% above recent high = at resistance
+const RANGE_SUPPORT_PCT     = 1.03;             // re-entry when price ≤ support × 1.03 (within 3%)
+const RANGE_MIN_EXIT_GAIN   = 0.01;             // need at least 1% gain before range-cycling
+const RANGE_REENTRY_BOUNCE  = 0.03;             // 3% bounce from support = re-entry signal
+const RANGE_REENTRY_WINDOW  = 2 * 60 * 60 * 1000; // 2h watchlist expiry
+
+// addr → { symbol, strategyId, strategyLabel, supportLevel, exitPrice, exitTime, dexUrl }
+const rangeReentryWatchlist = new Map();
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ─── CORE OPERATING PRINCIPLE ─────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// This bot exists to make profit. Losses are permitted ONLY when unavoidable.
+// Every feature — exit timing, entry gates, slot management, TP/SL placement,
+// range cycling, trailing SL decisions — must serve this principle.
+// Never hold a flat position hoping it recovers; extract value from the range.
+// Never accept a loss when a smarter exit or hold could have avoided it.
+// ═════════════════════════════════════════════════════════════════════════════
 
 // ─── FIREBASE INIT ────────────────────────────────────────────────────────────
 let db;
@@ -108,13 +136,13 @@ try {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// ─── 4-STRATEGY SYSTEM  (10 total slots) ─────────────────────────────────────
+// ─── 4-STRATEGY SYSTEM  (20 total slots) ─────────────────────────────────────
 // ═════════════════════════════════════════════════════════════════════════════
 const STRATEGIES = [
   {
     id: 0,
     label: '📉 BOTTOM BOUNCE',
-    maxSlots: 1,
+    maxSlots: 20, // unlimited — competes openly for global slots with id 1 and id 3
     desc: 'Oversold token reversing from its bottom',
     // ── Entry criteria ──
     maxCh24: -10,       // was falling — 24h must be negative (e.g. -10% to -90%)
@@ -133,7 +161,7 @@ const STRATEGIES = [
   {
     id: 1,
     label: '⚡ ACTIVE MOMENTUM',
-    maxSlots: 2,
+    maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 3
     desc: 'Price ticking every 5-15 min — strong live activity',
     // ── Entry criteria ──
     minM5Txns: 15,       // busy last 5 min
@@ -171,7 +199,7 @@ const STRATEGIES = [
   {
     id: 3,
     label: '📈 OLD RECOVERY',
-    maxSlots: 1,
+    maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 1
     desc: 'Established coin climbing back steadily',
     // ── Entry criteria ──
     minAgeDays: 15,
@@ -2321,6 +2349,84 @@ async function monitorPositions() {
       }
     }
 
+    // ── RANGE-TRADE EXIT (Bottom Bounce id 0, Active Momentum id 1, Old Recovery id 3) ──
+    // PROFIT-FIRST cycling: when movement is slow (<5% in 30 min), identify the S/R
+    // range and extract consistent small profits instead of sitting flat.
+    //   • At resistance + declining → exit now, watch for support re-entry
+    //   • At resistance + still rising → hold, tighten SL (never sell into strength)
+    if ([0, 1, 3].includes(pos.strategyId) && !pos.tpDisabled && gain > RANGE_MIN_EXIT_GAIN) {
+      const ageMs = Date.now() - pos.enteredAt;
+      if (ageMs >= RANGE_SLOW_MIN_AGE) {
+        const hist = priceHistory.get(pos.address) || [];
+        // Find the price snapshot from ~30 min ago to measure progress
+        const cutoff30 = Date.now() - RANGE_SLOW_MIN_AGE;
+        const snap30   = hist.slice().reverse().find(h => h.ts <= cutoff30);
+        const priceAt30 = snap30 ? snap30.price : pos.entryPrice;
+        const gainSince30 = (price - priceAt30) / priceAt30;
+        const isSlowMovement = Math.abs(gainSince30) < RANGE_SLOW_GAIN_MAX;
+
+        if (isSlowMovement && hist.length >= 4) {
+          // Build S/R range from recent price history
+          const recentSnaps = hist.slice(-12);
+          const recentHigh  = Math.max(...recentSnaps.map(h => h.price));
+          const recentLow   = Math.min(...recentSnaps.map(h => h.price));
+
+          // Keep a running range on the position (grows as we see more data)
+          const rangeHigh = Math.max(pos.rangeHigh || recentHigh, recentHigh);
+          const rangeLow  = Math.min(pos.rangeLow  || recentLow,  recentLow);
+          if (rangeHigh !== pos.rangeHigh) { updates.rangeHigh = rangeHigh; pos.rangeHigh = rangeHigh; }
+          if (rangeLow  !== pos.rangeLow)  { updates.rangeLow  = rangeLow;  pos.rangeLow  = rangeLow; }
+
+          const atResistance = price >= rangeHigh * RANGE_RESISTANCE_PCT;
+          if (atResistance) {
+            const declining = isDeclining(pos.address, 3);
+            const rising    = isTrendingUp(pos.address, 3);
+
+            if (declining && !rising) {
+              // Fading at resistance — take profit, free slot, watch for support bounce
+              if (closingNow.has(pos.id)) continue;
+              closingNow.add(pos.id);
+              try {
+                const exitPnl = fillGain * pos.size * pos.remaining;
+                const pnl     = (pos.pnl || 0) + exitPnl;
+                await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'RANGE_EXIT', pnl });
+                await updateDailyStats(exitPnl, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
+                enteredToday.delete(pos.address);
+                rangeReentryWatchlist.set(pos.address, {
+                  symbol: pos.symbol, strategyId: pos.strategyId, strategyLabel: pos.strategyLabel,
+                  supportLevel: rangeLow, exitPrice: exitFillPrice, exitTime: Date.now(), dexUrl: pos.dexUrl,
+                });
+                await sendTelegram(
+                  `🔄 *RANGE EXIT — PROFIT LOCKED*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
+                  `📊 At resistance $${fmtPrice(rangeHigh)}, momentum declining\n` +
+                  `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
+                  `💰 P&L: *+$${pnl.toFixed(2)}* (+${gainPct.toFixed(1)}%)\n` +
+                  `👀 Watching for re-entry near $${fmtPrice(rangeLow)}\n🔗 [Chart](${pos.dexUrl})`
+                );
+              } finally {
+                closingNow.delete(pos.id);
+              }
+              continue;
+
+            } else if (rising) {
+              // Uptrend still intact at resistance — hold, tighten SL to protect gain
+              const tightSL = Math.max(pos.currentSL, price * 0.97);
+              if (tightSL > (updates.currentSL ?? pos.currentSL) * 1.005) {
+                updates.currentSL    = tightSL;
+                updates.trailingActive = true;
+                if (!pos.rangeHoldAlert) {
+                  updates.rangeHoldAlert = true;
+                  alertMsg = `📈 *RANGE HOLD — TREND STRONG*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
+                    `At resistance $${fmtPrice(rangeHigh)} but uptrend confirmed — holding full position\n` +
+                    `🔒 SL tightened to $${fmtPrice(tightSL)}\n🔗 [Chart](${pos.dexUrl})`;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
     // ── RUG DETECTION — EMERGENCY EXIT ────────────────────────────────────
     // If price crashes >40% from peak in a single 5s tick AND we were profitable,
     // exit immediately before it goes to near-zero
@@ -2483,22 +2589,51 @@ async function monitorPositions() {
     // ── STANDARD TP1 / TP2 / TP3 (Bottom Bounce + Old Recovery) ─────────
     // ══════════════════════════════════════════════════════════════════════
     else if (!pos.tpDisabled) {
-      if (!pos.tp1Hit && price >= pos.tp1) {
+      // ── PROFIT-FIRST TP1 OVERRIDE: skip TP1 if strong uptrend still running ──
+      // Never sell into strength — trail SL instead and capture the bigger move.
+      // If tp1 was skipped but trend later fades (retests TP1), take the sell then.
+      if (!pos.tp1Hit && !pos.tp1Skipped && price >= pos.tp1) {
+        if (isTrendingUp(pos.address, 5)) {
+          // Trend strong — hold full position, tighten SL to protect the gain
+          const tightSL = Math.max(pos.currentSL, pos.tp1 * 0.97);
+          updates = { tp1Skipped: true, currentSL: tightSL, trailingActive: true };
+          alertMsg = `📈 *TP1 SKIPPED — TREND HOLDING*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
+            `+${gainPct.toFixed(1)}% — momentum strong, holding full position for bigger move\n` +
+            `🔒 SL raised to $${fmtPrice(tightSL)}\n🔗 [Chart](${pos.dexUrl})`;
+          Object.assign(pos, updates);
+        } else {
+          // Trend not strong enough — take the standard TP1 partial
+          const partPnL = fillGain * pos.size * 0.50;
+          updates = { tp1Hit:true, remaining: pos.remaining - 0.50,
+            currentSL: pos.entryPrice * 1.01, trailingActive:true, pnl: (pos.pnl || 0) + partPnL };
+          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, 0.50));
+          alertMsg = `✅ *TP1 HIT — 50% SOLD*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
+            `Entry: $${fmtPrice(pos.entryPrice)} → $${fmtPrice(exitFillPrice)}\n` +
+            `💰 +$${partPnL.toFixed(2)} | SL → breakeven\n🔗 [Chart](${pos.dexUrl})`;
+          Object.assign(pos, updates);
+        }
+      }
+      // TP1 was skipped but trend has since faded — re-test, take the delayed sell
+      else if (!pos.tp1Hit && pos.tp1Skipped && price >= pos.tp1 && !isTrendingUp(pos.address, 3)) {
         const partPnL = fillGain * pos.size * 0.50;
-        updates = { tp1Hit:true, remaining: pos.remaining - 0.50,
+        updates = { tp1Hit:true, tp1Skipped:false, remaining: pos.remaining - 0.50,
           currentSL: pos.entryPrice * 1.01, trailingActive:true, pnl: (pos.pnl || 0) + partPnL };
         await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, 0.50));
-        alertMsg = `✅ *TP1 HIT — 50% SOLD*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
+        alertMsg = `✅ *TP1 HIT (DELAYED) — 50% SOLD*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
           `Entry: $${fmtPrice(pos.entryPrice)} → $${fmtPrice(exitFillPrice)}\n` +
           `💰 +$${partPnL.toFixed(2)} | SL → breakeven\n🔗 [Chart](${pos.dexUrl})`;
         Object.assign(pos, updates);
       }
-      else if (pos.tp1Hit && !pos.tp2Hit && price >= pos.tp2) {
-        const partPnL = fillGain * pos.size * 0.30;
-        updates = { tp2Hit:true, remaining: pos.remaining - 0.30,
+      // TP2: triggers whether TP1 was hit normally or skipped (sell combined 80% if skipped)
+      else if ((pos.tp1Hit || pos.tp1Skipped) && !pos.tp2Hit && price >= pos.tp2) {
+        const wasSkipped = pos.tp1Skipped && !pos.tp1Hit;
+        const sellFrac  = wasSkipped ? 0.80 : 0.30; // 80% combined if TP1 was held; 30% normal
+        const tp2Label  = wasSkipped ? 'TP2 HIT — 80% SOLD (TP1 held for uptrend)' : 'TP2 HIT — 30% SOLD';
+        const partPnL = fillGain * pos.size * sellFrac;
+        updates = { tp2Hit:true, tp1Hit:true, tp1Skipped:false, remaining: pos.remaining - sellFrac,
           currentSL: pos.tp1 * 0.99, pnl: (pos.pnl || 0) + partPnL };
-        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, 0.30));
-        alertMsg = `🎯 *TP2 HIT — 30% SOLD*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
+        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, sellFrac));
+        alertMsg = `🎯 *${tp2Label}*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
           `💰 +$${partPnL.toFixed(2)} | SL → TP1 level\n🔗 [Chart](${pos.dexUrl})`;
         Object.assign(pos, updates);
       }
@@ -2862,6 +2997,33 @@ async function scanForEntries() {
 
   const usedThisScan = new Set();
 
+  // ── RANGE RE-ENTRY: flag quality coins that bounced off support after range exit ──
+  // These coins already scored, passed LP gate, and appeared in qualityMatches.
+  // If they match our watchlist and show a support bounce, mark for direct entry
+  // (bypassing the pullback gate — we know the range and this IS the entry signal).
+  for (const coin of qualityMatches) {
+    const w = rangeReentryWatchlist.get(coin.addr);
+    if (!w) continue;
+    // Expire old watchlist entries
+    if (Date.now() - w.exitTime > RANGE_REENTRY_WINDOW) {
+      rangeReentryWatchlist.delete(coin.addr);
+      continue;
+    }
+    // Already in a position for this coin — watchlist entry is stale
+    if (positions.find(p => p.address === coin.addr)) {
+      rangeReentryWatchlist.delete(coin.addr);
+      continue;
+    }
+    // Price near support level and bouncing back up?
+    const atSupport = coin.price <= w.supportLevel * RANGE_SUPPORT_PCT;
+    const bouncing  = isRebounding(coin.addr);
+    const rising    = isTrendingUp(coin.addr, 3);
+    if (atSupport && (bouncing || rising)) {
+      coin._rangeReentry = true; // bypass pullback gate — this IS the re-entry signal
+      console.log(`[RANGE-REENTRY] ${coin.symbol} bouncing from support $${fmtPrice(w.supportLevel)} — flagged for entry`);
+    }
+  }
+
   for (const coin of qualityMatches) {
     if (positions.length >= MAX_POSITIONS) break;
     if (usedThisScan.has(coin.addr)) continue;
@@ -2904,7 +3066,10 @@ async function scanForEntries() {
 
     if (coin.strategy.id === 1) {
       const isExplosive = (coin.m5Ch || 0) >= 8 && (coin.ch1 || 0) >= 25 && (coin.buyPct || 0) >= 70;
-      if (isExplosive) {
+      if (coin._rangeReentry) {
+        // Range re-entry: support bounce confirmed — skip pullback gate, enter directly
+        console.log(`[AM-WATCH] ${coin.symbol} — RANGE RE-ENTRY bypass — entering at support bounce`);
+      } else if (isExplosive) {
         console.log(`[AM-WATCH] ${coin.symbol} — EXPLOSIVE entry bypass (m5:${coin.m5Ch?.toFixed(1)}% h1:${coin.ch1?.toFixed(1)}% buy:${coin.buyPct?.toFixed(0)}%) — entering immediately`);
         coin._explosiveEntry = true;
       } else {
@@ -2963,6 +3128,7 @@ async function scanForEntries() {
     alertCooldown.set(coin.addr, Date.now()); // set AFTER successful entry to avoid 30-min lockout on failure
     positions.push(pos);
     slotCount[coin.strategy.id]++;
+    if (coin._rangeReentry) rangeReentryWatchlist.delete(coin.addr); // watchlist fulfilled
 
     const s = coin.strategy;
     const isYoung = s.id === 1 && (coin.ageMinutes || 0) < 60;
@@ -2989,6 +3155,9 @@ async function scanForEntries() {
     const explosiveBadge = coin._explosiveEntry
       ? `⚡ Explosive trend — immediate entry (m5:+${coin.m5Ch?.toFixed(1)}% h1:+${coin.ch1?.toFixed(1)}%)\n`
       : '';
+    const rangeReentryBadge = coin._rangeReentry
+      ? `🔄 Range re-entry — support bounce confirmed\n`
+      : '';
     const modeHeader = pos.tradingMode === 'real'
       ? `💰 *BOT ENTERED — REAL TRADE*`
       : `✅ *BOT ENTERED — PAPER TRADE*`;
@@ -3003,6 +3172,7 @@ async function scanForEntries() {
       `${trendBadge}` +
       `${pullbackBadge}` +
       `${explosiveBadge}` +
+      `${rangeReentryBadge}` +
       `💡 ${s.desc}\n\n` +
       `💵 Entry: $${fmtPrice(coin.price)}\n` +
       `💰 Position: $${pos.size}${pos.walletLabel ? ` · ${pos.walletLabel}` : ''}\n` +
