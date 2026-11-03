@@ -80,10 +80,10 @@ const surgeWatchlist        = new Map(); // addr → { symbol, peakPrice, pullba
 const SURGE_PULLBACK_MIN    = 0.05;     // ≥5% drop from peak = in pullback zone
 const SURGE_PULLBACK_MAX    = 0.35;     // >35% drop = dump — abandon watchlist entry
 const SURGE_BOUNCE_CONFIRM  = 0.03;     // 3% recovery from pullback low = entry signal
-const SURGE_WATCH_EXPIRY_MS = 3 * 60 * 1000;  // 3 min max watch window (fast surges fade fast)
+const SURGE_WATCH_EXPIRY_MS = 5 * 60 * 1000;  // 5 min max watch window — more time to confirm pullback/bounce cycle
 const SURGE_BUY_RATE_MIN    = 8;        // ≥8 buys/min = confirmed real surge (m5Buys/5)
 const SURGE_CONFIRM_MIN_MS  = 60000;    // must watch ≥1 min before buy-rate entry fires
-const SURGE_AVG_TRADE_MIN   = 40;       // avg trade ≥$40 confirms real buyers (not micro-bots)
+const SURGE_AVG_TRADE_MIN   = 25;       // avg trade ≥$25 — young surging coins trade smaller; still above $20 anti-manip floor
 
 // ─── ANTI-MANIPULATION THRESHOLDS ────────────────────────────────────────────
 // Applied globally in detectStrategy() before any strategy-specific scoring.
@@ -199,7 +199,7 @@ const STRATEGIES = [
   {
     id: 2,
     label: '🚀 SURGE CATCH',
-    maxSlots: 6,
+    maxSlots: 20, // competes for all global slots — last 5 reserved exclusively via SURGE_RESERVED logic
     desc: 'Any token actively surging RIGHT NOW — catch it mid-flight, not after',
     // ── Entry criteria — use m5 as primary signal, not h1 ──
     // h1 is a lagging indicator — the surge may already be over by then
