@@ -616,8 +616,30 @@ tbody tr:hover td { background: var(--bg3); }
   padding: 5px 10px; cursor: pointer; transition: background .15s;
 }
 .add-pos-btn:hover { background: rgba(79,110,247,.22); }
+
+/* ── Advisory Toast ─────────────────────────────────────────────────────────── */
+#advisory-toast {
+  position: fixed;
+  bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+  left: 50%; transform: translateX(-50%);
+  background: #1e1a0f;
+  border: 1px solid var(--yellow);
+  border-radius: 12px;
+  padding: 12px 18px;
+  max-width: min(440px, calc(100vw - 32px));
+  font-size: 13px;
+  color: var(--yellow);
+  line-height: 1.5;
+  z-index: 999;
+  box-shadow: 0 4px 24px rgba(0,0,0,.55);
+  opacity: 0;
+  transition: opacity .3s ease;
+  pointer-events: none;
+}
+#advisory-toast.visible { opacity: 1; }
 </style>
 
+<div id="advisory-toast"></div>
 <div id="root"></div>
 
 <script>
@@ -650,7 +672,19 @@ const S = {
   addingPosition: false,  // modal open/closed
   addPosErr: '',          // error inside modal
   addPosSaving: false,    // saving spinner
+  shownAdvisories: new Set(), // track posIds whose advisory toast has already been shown
 };
+
+// ── Advisory Toast ────────────────────────────────────────────────────────────
+let _toastTimer = null;
+function showAdvisoryToast(message) {
+  const el = document.getElementById('advisory-toast');
+  if (!el) return;
+  if (_toastTimer) clearTimeout(_toastTimer);
+  el.textContent = message;
+  el.classList.add('visible');
+  _toastTimer = setTimeout(() => { el.classList.remove('visible'); }, 7000);
+}
 
 // ── Config store ──────────────────────────────────────────────────────────────
 function loadCfg() {
@@ -834,6 +868,15 @@ async function loadData() {
     S.stats = statsDoc;
     S.control = ctrlDoc || {};
     S.botRunning = ctrlDoc ? (ctrlDoc.running !== false) : true;
+
+    // Show advisory toast for any new position that the bot flagged
+    for (const pos of positions) {
+      if (pos.advisoryNote && !S.shownAdvisories.has(pos._id || pos.id)) {
+        S.shownAdvisories.add(pos._id || pos.id);
+        showAdvisoryToast(pos.advisoryNote);
+        break; // show one at a time; next refresh will catch others if multiple
+      }
+    }
 
     // Load wallets (sub-collection)
     S.wallets = await fsListSubcoll(S.config, 'paper_config', 'wallets', 'slots');
@@ -1598,7 +1641,7 @@ function tradingControlsHTML() {
       <div class="ctrl-block-label">Size Ceiling</div>
       ${S.editingSize
         ? `<div class="size-row">
-            <input class="size-input" id="size-inp" type="number" min="5" step="5"
+            <input class="size-input" id="size-inp" type="number" min="10" max="1000" step="5"
               value="${posSize}" onkeydown="if(event.key==='Enter')saveSize()" autofocus>
             <button class="size-edit-btn" onclick="saveSize()">Save</button>
             <button class="size-edit-btn" onclick="S.editingSize=false;render()">✕</button>
@@ -1607,7 +1650,7 @@ function tradingControlsHTML() {
             <span class="size-val">$${posSize} <span style="font-size:10px;opacity:0.55;font-weight:400">max</span></span>
             <button class="size-edit-btn" onclick="S.editingSize=true;render()">✏ Edit</button>
           </div>
-          <div style="font-size:10px;opacity:0.45;margin-top:2px">dynamic · liq × 1%</div>`}
+          <div style="font-size:10px;opacity:0.45;margin-top:2px">dynamic · liq × 1% · range $10–$1,000</div>`}
     </div>`;
 
   const ctrlPanel = `
@@ -1675,7 +1718,11 @@ async function saveSize() {
   if (!S.config) return;
   const inp = document.getElementById('size-inp');
   const val = parseFloat(inp?.value);
-  if (!val || val < 1) return;
+  if (!val || val < 10 || val > 1000) {
+    if (inp) inp.style.borderColor = 'var(--red)';
+    setTimeout(() => { if (inp) inp.style.borderColor = ''; }, 1500);
+    return;
+  }
   try {
     const existing = await fsGet(S.config, 'paper_config', 'control') || {};
     await fsSet(S.config, 'paper_config', 'control', { ...existing, positionSize: val });

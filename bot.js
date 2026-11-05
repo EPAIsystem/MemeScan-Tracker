@@ -99,7 +99,7 @@ const ANTI_MANIP_SC_MC_LIQ_MAX    = 30;   // Surge Catch: thin pools normal for 
 // Position scales with liquidity (1% of pool ≈ <1% price impact) and market cap.
 // POSITION_SIZE env var is now the MAXIMUM cap — not a fixed amount.
 // MC sweet spot ($25k–$200k): fast-moving small caps where small traders make the most.
-const POS_FLOOR = 50;   // $50 minimum — below this, fees erase profits
+const POS_FLOOR = 10;   // $10 minimum — below this, fees erase profits
 
 // ─── RANGE-TRADE MODE (Bottom Bounce id 0, Active Momentum id 1, Old Recovery id 3) ──
 // When a position gains <5% in 30 minutes (slow movement), the bot identifies the
@@ -168,11 +168,12 @@ const STRATEGIES = [
     maxCh24: -10,       // was falling — 24h must be negative (e.g. -10% to -90%)
     minCh24: -92,
     maxCh1: 5,          // h1 not still crashing (< +5% = hasn't mooned yet)
-    minCh1: -20,        // h1 not still in freefall (> -20%)
+    minCh1: 0,          // h1 must be positive — ascending recovery confirmed
+    minCh6: 0,          // h6 must also be positive — sustained 6h recovery, not a dead-cat bounce
     minM5Ch: -0.5,      // m5 stabilising or turning green
     minBuyPct: 55,      // buyers coming in
     minLiq: 15000,
-    minM5Txns: 3,       // activity picking up
+    minM5Txns: 8,       // real bounce needs real tx flow, not a single spike
     // ── TP / SL (standard 3-step) ──
     tp1x: 1.25, tp2x: 1.55, tp3x: 2.10,
     slx: 0.87,
@@ -225,10 +226,12 @@ const STRATEGIES = [
     minAgeDays: 15,
     minCh24: 3,          // positive 24h
     minCh1: 0.5,         // positive h1 (still climbing)
+    minCh6: 0,           // h6 must be positive — 6h sustained momentum, not noise
     minBuyPct: 50,
     minLiq: 80000,       // established = decent liquidity
     minBuys24: 50,
     maxCh1: 30,          // not a sudden spike — steady recovery
+    minAvgTrade: 30,     // hard filter: real buyers, not micro-trade spam
     // ── TP / SL (conservative) ──
     tp1x: 1.12, tp2x: 1.30, tp3x: 1.65,
     slx: 0.92,
@@ -281,6 +284,7 @@ function detectStrategy(pair, openStrategies) {
   const mcap    = pair.fdv || pair.marketCap || 1;
   const ch1Raw  = pair.priceChange?.h1;                                 // null = no data
   const ch1     = ch1Raw == null ? null : parseFloat(ch1Raw);
+  const ch6     = parseFloat(pair.priceChange?.h6  || 0);  // 6h price change (DexScreener field)
   const ch24    = parseFloat(pair.priceChange?.h24 || 0);
   const m5Ch    = parseFloat(pair.priceChange?.m5  || 0);
   const buys24  = pair.txns?.h24?.buys  || 0;
@@ -362,7 +366,7 @@ function detectStrategy(pair, openStrategies) {
   if (isPumpFun && ageMinutes < 90 && buyPct < 62)  return null;
 
   const base = {
-    addr, price, liq, mcap, vol24, buyPct, buys24, ch1, ch24, m5Ch, m5Txns,
+    addr, price, liq, mcap, vol24, buyPct, buys24, ch1, ch6, ch24, m5Ch, m5Txns,
     m5Buys, m5Vol, m5BuyRate, avgTrade, mcLiqRatio, mcSweetSpot,
     ageDays, ageMinutes, volMcap,
     symbol: pair.baseToken?.symbol || '???',
@@ -383,6 +387,7 @@ function detectStrategy(pair, openStrategies) {
       // ── BOTTOM BOUNCE ──────────────────────────────────────────────────────
       if (ch24 > s.maxCh24 || ch24 < s.minCh24) { match = false; }
       if (ch1  < s.minCh1  || ch1 > s.maxCh1)   { match = false; }
+      if (s.minCh6 != null && ch6 < s.minCh6)   { match = false; } // 6h must also be positive
       if (m5Ch < s.minM5Ch)                       { match = false; }
       if (buyPct < s.minBuyPct)                   { match = false; }
       if (liq < s.minLiq)                          { match = false; }
@@ -477,9 +482,11 @@ function detectStrategy(pair, openStrategies) {
       if (ch24 < s.minCh24)        { match = false; }
       if (ch1 < s.minCh1)          { match = false; }
       if (ch1 > s.maxCh1)          { match = false; } // spike guard
+      if (s.minCh6 != null && ch6 < s.minCh6) { match = false; } // 6h sustained momentum
       if (buyPct < s.minBuyPct)    { match = false; }
       if (liq < s.minLiq)          { match = false; }
       if (buys24 < s.minBuys24)    { match = false; }
+      if (s.minAvgTrade != null && avgTrade !== null && avgTrade < s.minAvgTrade) { match = false; } // real buyers only
       if (match) {
         score += Math.min(15, ch24 / 3);
         if (ch1 > 8)  score += 12; else if (ch1 > 3) score += 6;
@@ -1048,6 +1055,17 @@ async function enterPosition(coin, overrides = {}) {
   const posSizeNote = posSize >= ceiling
     ? `$${posSize} _(capped — liq 1% = $${rawSize.toFixed(0)})_`
     : `$${posSize} _(liq × 1%)_`;
+  // ── Bidirectional size advisory (stored in position doc; dashboard shows as toast) ──
+  // Compare user's set ceiling to what the bot would naturally recommend (no ceiling).
+  const dynRec = calcDynamicPositionSize(coin.liq || 0, coin.mcap || 0, Infinity);
+  let advisoryNote = null;
+  if (ceiling > dynRec * 1.5 && dynRec > POS_FLOOR) {
+    // User's ceiling is well above what the bot actually uses for this coin
+    advisoryNote = `⚠️ Your ceiling ($${ceiling}) far exceeds what the bot calculated for this coin ($${dynRec}). Actual entry: $${posSize}. For larger trades, choose coins with higher liquidity.`;
+  } else if (ceiling < dynRec * 0.5 && ceiling < 50) {
+    // User's ceiling is too restrictive — entry may not cover fees
+    advisoryNote = `⚠️ Set size $${ceiling} is well below the bot's recommended $${dynRec} (liq × 1%). At this size, profits may not cover fees. Suggested: $${dynRec}.`;
+  }
   // Surge momentum: flag if m5 is ripping fast at entry (not applicable to moon bags)
   const isSurge = !overrides.isMoonBag && (coin.m5Ch || 0) >= SURGE_M5_ENTRY_TRIGGER;
   const tradingMode = cfg.tradingMode || 'paper';
@@ -1105,6 +1123,7 @@ async function enterPosition(coin, overrides = {}) {
     recoveredAmount: usePartial ? 0 : null,
     freeRide:        usePartial ? false : null,
     isManual:        overrides.isManual || false,
+    advisoryNote:    advisoryNote,  // non-null = dashboard shows advisory toast on next refresh
     // Young coin mode: quick 10/20/30% exits for Active Momentum coins < 1h old
     youngCoin: (s.id === 1 && (coin.ageMinutes || 0) < 60),
     // Surge momentum: skip TP1/TP2, ride to 80%+ then full-exit & reinvest
@@ -3365,7 +3384,7 @@ async function main() {
   await sendTelegram(
     `✅ *MemeScan PRO — 4-STRATEGY BOT LIVE*\n\n` +
     `${slotLines}\n\n` +
-    `💰 Dynamic sizing (liq × 1%, $50–$${POSITION_SIZE} cap) · 🛑 Daily limit: 30%\n` +
+    `💰 Dynamic sizing (liq × 1%, $10–$${POSITION_SIZE} cap) · 🛑 Daily limit: 30%\n` +
     `🎛 Mode: *${startMode}*\n` +
     `${walletLine}\n` +
     `⏱ Scanning every 15 seconds\n\n` +
