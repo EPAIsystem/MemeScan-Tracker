@@ -2164,31 +2164,39 @@ function checkSurgePullback(coin, pullbackMin = SURGE_PULLBACK_MIN, bounceConfir
   return false;
 }
 
-// ─── LP LOCK FILTER (GoPlus batch check) ─────────────────────────────────────
-// Filters a list of strategy matches, returning only those with confirmed
-// locked or burned LP. Pump.fun bonding-curve tokens are exempt (their curve
-// IS the lock). Results cached 30 min to minimise API calls.
+// ─── LP LOCK + SECURITY FILTER (GoPlus batch check) ──────────────────────────
+// Checks every strategy match for three things via GoPlus token_security API:
+//
+//   1. Mintable  — mint authority still active → ALWAYS rejected
+//   2. Freezable — freeze authority still active → ALWAYS rejected
+//   3. LP locked — liquidity locked/burned → required (EVM only via GoPlus)
+//
+// Pump.fun tokens are EXEMPT from the LP lock check (pump.fun burns LP on
+// graduation to Raydium — the burn IS the lock), but they are NOT exempt from
+// the mintable/freezable check. Every coin gets screened for mint + freeze.
+//
+// Results cached 30 min to minimise API calls.
 async function filterByLpLock(matches) {
-  const locked  = new Set();
-  const toCheck = [];
+  const passed   = new Set();
+  const toCheck  = [];
+  const lpExempt = new Set(); // LP lock not required for these (pump.fun)
 
   for (const coin of matches) {
-    // Pump.fun tokens — bonding curve OR graduated to Raydium:
-    //   - Bonding curve (dexId='pump-fun'): liquidity locked in the curve contract
-    //   - Graduated (addr ends in 'pump', now on Raydium): pump.fun enforced no dev drain
-    // LP lock check is irrelevant for both — exempt entirely.
-    const isPumpFunAddr = coin.isPumpFun || coin.addr.endsWith('pump');
-    if (isPumpFunAddr) { locked.add(coin.addr); continue; }
-
     const cached = lpLockCache.get(coin.addr);
     if (cached && Date.now() - cached.ts < LP_LOCK_TTL) {
-      if (cached.locked) locked.add(coin.addr);
+      if (cached.locked) passed.add(coin.addr);
       continue;
     }
+
+    // Pump.fun: LP is burned on graduation → exempt from LP lock check only.
+    // Still needs mintable/freezable screening — do NOT skip GoPlus entirely.
+    const isPumpFun = coin.isPumpFun || coin.addr.endsWith('pump');
+    if (isPumpFun) lpExempt.add(coin.addr);
+
     toCheck.push(coin);
   }
 
-  if (!toCheck.length) return matches.filter(c => locked.has(c.addr));
+  if (!toCheck.length) return matches.filter(c => passed.has(c.addr));
 
   // Group by chain for batched API calls
   const byChain = {};
@@ -2201,7 +2209,7 @@ async function filterByLpLock(matches) {
   for (const [chain, coins] of Object.entries(byChain)) {
     const goplusChain = GOPLUS_CHAIN_MAP[chain] || null;
     if (!goplusChain) {
-      // Unknown chain → skip conservatively
+      // Unknown chain → block conservatively
       for (const c of coins) lpLockCache.set(c.addr, { locked: false, ts: Date.now() });
       continue;
     }
@@ -2212,8 +2220,8 @@ async function filterByLpLock(matches) {
       const r = await httpGet('api.gopluslabs.io', `/api/v1/token_security/${goplusChain}?contract_addresses=${addrs}`);
       if (r.status !== 200) {
         // GoPlus unavailable — fail open so the bot can still trade
-        console.warn(`[LP LOCK] GoPlus returned ${r.status} for chain ${chain} — failing open (${coins.length} coins allowed through)`);
-        for (const c of coins) locked.add(c.addr);
+        console.warn(`[SECURITY] GoPlus returned ${r.status} for chain ${chain} — failing open (${coins.length} coins allowed through)`);
+        for (const c of coins) { lpLockCache.set(c.addr, { locked: true, ts: Date.now() }); passed.add(c.addr); }
         continue;
       }
       const d      = JSON.parse(r.body);
@@ -2221,35 +2229,65 @@ async function filterByLpLock(matches) {
 
       const isSolana = chain === 'solana';
       for (const coin of coins) {
-        // GoPlus keys EVM addresses in lowercase; Solana keeps exact case
+        // GoPlus keys EVM addresses lowercase; Solana keeps exact case
         const info = result[coin.addr.toLowerCase()] || result[coin.addr] || null;
 
-        let passes;
-        if (isSolana) {
-          // GoPlus Solana has no lp_locked/lp_burned fields (Solana LP locking works differently).
-          // For Solana: pass unless GoPlus explicitly flags it as an airdrop scam.
-          // Note: pump.fun tokens are already exempted above before reaching this point.
-          const isScam = info?.is_airdrop_scam === '1';
-          passes = !isScam;
-          if (isScam) console.log(`[LP LOCK] ❌ ${coin.symbol} (${coin.addr.slice(0,8)}…) — GoPlus: airdrop scam`);
-        } else {
-          // EVM chains: require LP locked or burned via third-party locker
-          passes = info?.lp_locked === '1' || info?.lp_burned === '1';
-          if (!passes) console.log(`[LP LOCK] ❌ ${coin.symbol} (${coin.addr.slice(0,8)}…) — LP not locked, skipped`);
+        // ── 1 & 2: Mintable / Freezable — hard block, all chains ────────
+        let isMintable  = false;
+        let isFreezable = false;
+        if (info) {
+          if (isSolana) {
+            // GoPlus Solana: mint_authority present = can mint more tokens
+            //                freeze_authority present = can freeze transfers
+            isMintable  = !!(info.mint_authority  && info.mint_authority  !== '');
+            isFreezable = !!(info.freeze_authority && info.freeze_authority !== '');
+          } else {
+            // GoPlus EVM: is_mintable = "1", transfer_pausable = "1" (freeze equivalent)
+            isMintable  = info.is_mintable        === '1';
+            isFreezable = info.transfer_pausable  === '1';
+          }
         }
 
-        lpLockCache.set(coin.addr, { locked: passes, ts: Date.now() });
-        if (passes) locked.add(coin.addr);
+        if (isMintable) {
+          console.log(`[SECURITY] ❌ ${coin.symbol} (${coin.addr.slice(0,8)}…) — MINTABLE token rejected`);
+          lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
+          continue;
+        }
+        if (isFreezable) {
+          console.log(`[SECURITY] ❌ ${coin.symbol} (${coin.addr.slice(0,8)}…) — FREEZABLE token rejected`);
+          lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
+          continue;
+        }
+
+        // ── 3: LP Lock ───────────────────────────────────────────────────
+        let lpPasses;
+        if (lpExempt.has(coin.addr)) {
+          // Pump.fun burns LP on graduation to Raydium — counts as locked
+          lpPasses = true;
+        } else if (isSolana) {
+          // Non-pump.fun Solana: GoPlus lacks reliable LP lock data for Solana.
+          // Block on airdrop scam flag; pass otherwise.
+          const isScam = info?.is_airdrop_scam === '1';
+          lpPasses = !isScam;
+          if (isScam) console.log(`[SECURITY] ❌ ${coin.symbol} (${coin.addr.slice(0,8)}…) — airdrop scam, skipped`);
+        } else {
+          // EVM: require LP locked or burned via third-party locker
+          lpPasses = info?.lp_locked === '1' || info?.lp_burned === '1';
+          if (!lpPasses) console.log(`[SECURITY] ❌ ${coin.symbol} (${coin.addr.slice(0,8)}…) — LP not locked, skipped`);
+        }
+
+        lpLockCache.set(coin.addr, { locked: lpPasses, ts: Date.now() });
+        if (lpPasses) passed.add(coin.addr);
       }
     } catch(e) {
       // GoPlus network error — fail open so the bot can still trade
-      console.warn(`[LP LOCK] GoPlus error for chain ${chain}: ${e.message} — failing open (${coins.length} coins allowed through)`);
-      for (const c of coins) locked.add(c.addr);
+      console.warn(`[SECURITY] GoPlus error for chain ${chain}: ${e.message} — failing open (${coins.length} coins allowed through)`);
+      for (const c of coins) { lpLockCache.set(c.addr, { locked: true, ts: Date.now() }); passed.add(c.addr); }
     }
     await sleep(200); // brief pause between chain batches
   }
 
-  return matches.filter(c => locked.has(c.addr));
+  return matches.filter(c => passed.has(c.addr));
 }
 
 async function monitorPositions() {
