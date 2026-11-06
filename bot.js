@@ -169,7 +169,7 @@ const STRATEGIES = [
     minCh24: -92,
     maxCh1: 5,          // h1 not still crashing (< +5% = hasn't mooned yet)
     minCh1: 0,          // h1 must be positive — ascending recovery confirmed
-    minCh6: 0,          // h6 must also be positive — sustained 6h recovery, not a dead-cat bounce
+    minCh6: -50,        // h6 allowed down to -50% — h1 + m5 confirm the actual turn
     minM5Ch: -0.5,      // m5 stabilising or turning green
     minBuyPct: 55,      // buyers coming in
     minLiq: 15000,
@@ -190,7 +190,7 @@ const STRATEGIES = [
     minCh1: 3,           // positive h1 trend
     minBuyPct: 55,
     minLiq: 8000,
-    maxAgeDays: 3,       // young, active coins
+    // No age cap — any coin with strong active momentum qualifies
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.50, tp2x: 2.50, tp3x: 5.00,
     slx: 0.80,
@@ -226,12 +226,12 @@ const STRATEGIES = [
     minAgeDays: 15,
     minCh24: 3,          // positive 24h
     minCh1: 0.5,         // positive h1 (still climbing)
-    minCh6: 0,           // h6 must be positive — 6h sustained momentum, not noise
+    minCh6: 0,           // h6 positive — sustained momentum (not noise)
     minBuyPct: 50,
-    minLiq: 80000,       // established = decent liquidity
-    minBuys24: 50,
+    minLiq: 50000,       // realistic floor for established coins
+    minBuys24: 35,       // real buy activity without over-restricting
     maxCh1: 30,          // not a sudden spike — steady recovery
-    minAvgTrade: 30,     // hard filter: real buyers, not micro-trade spam
+    minAvgTrade: 20,     // real buyers filter — lowered to match real market behaviour
     // ── TP / SL (conservative) ──
     tp1x: 1.12, tp2x: 1.30, tp3x: 1.65,
     slx: 0.92,
@@ -417,7 +417,7 @@ function detectStrategy(pair, openStrategies) {
       if (ch1 < s.minCh1)        { match = false; }
       if (buyPct < s.minBuyPct)  { match = false; }
       if (liq < s.minLiq)        { match = false; }
-      if (ageDays > s.maxAgeDays){ match = false; }
+      // No age cap — any age qualifies as long as momentum is live
       // Anti-manipulation: require meaningful avg trade size
       if (avgTrade !== null && avgTrade < 25) { match = false; }
       if (match) {
