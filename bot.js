@@ -2834,6 +2834,17 @@ async function monitorPositions() {
           trailPct = Math.min(trailPct, 5);
         }
         newSL = price * (1 - trailPct / 100);
+
+        // ── PROFIT LOCK — Active Momentum & Surge Catch ───────────────────
+        // Once any profit is made, raise the SL floor so the trade can never
+        // return to a loss. Floor = entry + 80% of profit above entry.
+        //   +10% gain → SL ≥ entry × 1.08  (locks $8 of $10)
+        //   +15% gain → SL ≥ entry × 1.12  (locks $12 of $15)
+        //   +19% gain → SL ≥ entry × 1.152 (locks ~$15 of $19)
+        // Only real market slippage can cause an exit below this floor.
+        if ((pos.strategyId === 1 || pos.strategyId === 2) && gain > 0) {
+          newSL = Math.max(newSL, pos.entryPrice * (1 + gain * 0.80));
+        }
       }
       const currentSL = updates.currentSL ?? pos.currentSL;
       // Only write if SL moved ≥ 0.5% — prevents thousands of tiny writes per day
