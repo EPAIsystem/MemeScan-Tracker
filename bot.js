@@ -228,7 +228,7 @@ const STRATEGIES = [
     minCh1: 0.5,         // positive h1 (still climbing)
     minCh6: 0,           // h6 positive — sustained momentum (not noise)
     minBuyPct: 50,
-    minLiq: 50000,       // realistic floor for established coins
+    minLiq: 25000,       // established coins — lowered to match real market liq levels
     minBuys24: 35,       // real buy activity without over-restricting
     maxCh1: 30,          // not a sudden spike — steady recovery
     minAvgTrade: 20,     // real buyers filter — lowered to match real market behaviour
