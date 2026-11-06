@@ -191,7 +191,7 @@ const STRATEGIES = [
     minBuyPct: 55,
     minLiq: 8000,
     minAvgTrade: 25,   // real buyers — matches anti-manip floor for AM
-    // No age cap — any coin with strong active momentum qualifies
+    minAgeDays: 1/12,  // 2 hours+ only — SC handles infant coins (0–2h), AM takes over after
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.50, tp2x: 2.50, tp3x: 5.00,
     slx: 0.80,
@@ -210,8 +210,8 @@ const STRATEGIES = [
     minM5Txns: 20,       // very high activity in last 5 min
     minCh1: 3,           // h1 positive (confirming uptrend, not requiring 40%)
     minBuyPct: 58,       // buyers still in control
-    minLiq: 8000,        // matches AM — slippage costs make sub-$8k liq unprofitable
-    // No age limit — that's the point
+    minLiq: 4000,        // infant coins — $4k min; AM takes over at 2h+ where $8k is feasible
+    maxAgeDays: 1/12,  // 2 hours max — SC is for infant surges; older coins go to AM/BB/OR
     // ── TP / SL (quick first profit, trail the rest) ──
     tp1x: 1.25, tp2x: 1.80, tp3x: 3.50,
     slx: 0.82,
@@ -246,6 +246,51 @@ const STRATEGIES = [
 function calcTrailPct(initialTrailPct, gainPct) {
   // Tighten twice as fast for big gains (÷7 instead of ÷10)
   return Math.max(5, initialTrailPct - (gainPct / 7));
+}
+
+// ── TIERED PROFIT LOCK — Active Momentum & Surge Catch ───────────────────────
+// Locks in a floor at this fraction of gain. Returns null = no lock yet.
+// Floor activates at 10% gain so small moves still run free.
+function calcAMSCProfitLock(gainPct) {
+  if (gainPct < 10)  return null;   // <10% — no lock, let it breathe
+  if (gainPct < 50)  return 0.80;   // 10–50%: lock in 80% of gains
+  if (gainPct < 100) return 0.85;   // 50–100%: tighten to 85%
+  if (gainPct < 200) return 0.90;   // 100–200%: tighten to 90%
+  return 0.95;                       // 200%+: near-full lock at 95%
+}
+
+// ── TIERED TRAILING STOP — Bottom Bounce ─────────────────────────────────────
+// Wide trail at entry to survive early volatility; tightens as gains build
+function calcBBTrail(gainPct) {
+  if (gainPct < 10)  return 50;   // wide allowance — let it dance
+  if (gainPct < 20)  return 40;   // starting to rise — still generous
+  if (gainPct < 50)  return 35;   // solid gain — moderate trail
+  return 25;                       // 50%+ — tighten to standard
+}
+
+// Profit lock for BB — only kicks in at 50%+ gain
+function calcBBProfitLock(gainPct) {
+  if (gainPct < 50)  return null;   // <50% — no lock, let it find footing
+  if (gainPct < 100) return 0.50;   // 50–100%: protect half the gain
+  if (gainPct < 200) return 0.60;   // 100–200%: tighten to 60%
+  return 0.70;                       // 200%+: lock in 70%
+}
+
+// ── TIERED TRAILING STOP — Old Recovery ──────────────────────────────────────
+// OR coins are more mature/stable — slightly tighter trail than BB
+function calcORTrail(gainPct) {
+  if (gainPct < 10)  return 40;   // early hold — room to breathe
+  if (gainPct < 20)  return 30;   // building — moderate
+  if (gainPct < 50)  return 25;   // solid — tighten up
+  return 20;                       // 50%+ — snug trail
+}
+
+// Profit lock for OR — activates at 50%+ gain (more conservative than BB)
+function calcORProfitLock(gainPct) {
+  if (gainPct < 50)  return null;   // <50% — no lock
+  if (gainPct < 100) return 0.40;   // 50–100%: protect 40%
+  if (gainPct < 200) return 0.55;   // 100–200%: tighten to 55%
+  return 0.65;                       // 200%+: lock in 65%
 }
 
 // Dynamic position size: 1% of pool liquidity × market cap multiplier, capped at ceiling.
@@ -413,12 +458,12 @@ function detectStrategy(pair, openStrategies) {
 
     else if (s.id === 1) {
       // ── ACTIVE MOMENTUM ────────────────────────────────────────────────────
+      if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // 2h+ only — SC covers 0–2h
       if (m5Txns < s.minM5Txns)  { match = false; }
       if (m5Ch < s.minM5Ch)      { match = false; } // POSITIVE direction required (was abs)
       if (ch1 < s.minCh1)        { match = false; }
       if (buyPct < s.minBuyPct)  { match = false; }
       if (liq < s.minLiq)        { match = false; }
-      // No age cap — any age qualifies as long as momentum is live
       // Anti-manipulation: require meaningful avg trade size (from strategy definition)
       if (s.minAvgTrade != null && avgTrade !== null && avgTrade < s.minAvgTrade) { match = false; }
       if (match) {
@@ -446,6 +491,8 @@ function detectStrategy(pair, openStrategies) {
     else if (s.id === 2) {
       // ── SURGE CATCH ────────────────────────────────────────────────────────
       // Primary signal: m5 activity — catch it WHILE it's happening
+      // Age gate: 0–2 hours only — SC is the infant-coin strategy
+      if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // over 2h → AM/BB/OR
       if (m5Ch < s.minM5Ch)      { match = false; } // must be moving in last 5 min
       if (m5Txns < s.minM5Txns)  { match = false; } // must be very active
       if (ch1 < s.minCh1)        { match = false; } // h1 confirms uptrend
@@ -2642,7 +2689,7 @@ async function monitorPositions() {
           `🛑 *STOP LOSS HIT*\n\n` +
           `*${pos.symbol}* ${pos.strategyLabel}\n` +
           `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
-          `🛑 SL: $${fmtPrice(pos.currentSL)} | Trail: ${calcTrailPct(pos.initialTrailPct, gainPct).toFixed(1)}%\n` +
+          `🛑 SL: $${fmtPrice(pos.currentSL)} | Trail: ${(pos.strategyId === 0 ? calcBBTrail(gainPct) : pos.strategyId === 3 ? calcORTrail(gainPct) : calcTrailPct(pos.initialTrailPct, gainPct)).toFixed(1)}%\n` +
           `📊 P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*\n🔗 [Chart](${pos.dexUrl})`
         );
       } finally {
@@ -2842,23 +2889,34 @@ async function monitorPositions() {
           );
         }
       } else {
-        let trailPct = calcTrailPct(pos.initialTrailPct, gainPct);
-        // SURGE_CATCH profit lock: once ≥20% gain, clamp trail to 5%
-        // Slippery coins spike fast and reverse hard — hold the gain tight
-        if (pos.strategyId === 2 && gain >= 0.20 && !pos.surgeMomentum) {
-          trailPct = Math.min(trailPct, 5);
+        // ── STRATEGY-SPECIFIC TRAILING STOP + PROFIT LOCK ─────────────────
+        let trailPct;
+        let profitLockFraction = null;
+
+        if (pos.strategyId === 0) {
+          // Bottom Bounce — wide trail at entry, tightens as gains build
+          trailPct = calcBBTrail(gainPct);
+          profitLockFraction = calcBBProfitLock(gainPct);
+
+        } else if (pos.strategyId === 3) {
+          // Old Recovery — slightly tighter than BB, same tiered approach
+          trailPct = calcORTrail(gainPct);
+          profitLockFraction = calcORProfitLock(gainPct);
+
+        } else {
+          // Active Momentum (1) & Surge Catch (2) — narrowing trail from initialTrailPct
+          trailPct = calcTrailPct(pos.initialTrailPct, gainPct);
+          profitLockFraction = calcAMSCProfitLock(gainPct);
         }
+
         newSL = price * (1 - trailPct / 100);
 
-        // ── PROFIT LOCK — Active Momentum & Surge Catch ───────────────────
-        // Once any profit is made, raise the SL floor so the trade can never
-        // return to a loss. Floor = entry + 80% of profit above entry.
-        //   +10% gain → SL ≥ entry × 1.08  (locks $8 of $10)
-        //   +15% gain → SL ≥ entry × 1.12  (locks $12 of $15)
-        //   +19% gain → SL ≥ entry × 1.152 (locks ~$15 of $19)
-        // Only real market slippage can cause an exit below this floor.
-        if ((pos.strategyId === 1 || pos.strategyId === 2) && gain > 0) {
-          newSL = Math.max(newSL, pos.entryPrice * (1 + gain * 0.80));
+        // ── PROFIT LOCK ────────────────────────────────────────────────────
+        // Raise the SL floor to lock in a fraction of gains above entry.
+        // AM/SC: activates at 10% gain (80%→85%→90%→95% as gains compound)
+        // BB/OR: activates at 50% gain (50%→60%→70% / 40%→55%→65%)
+        if (profitLockFraction !== null && gain > 0) {
+          newSL = Math.max(newSL, pos.entryPrice * (1 + gain * profitLockFraction));
         }
       }
       const currentSL = updates.currentSL ?? pos.currentSL;
