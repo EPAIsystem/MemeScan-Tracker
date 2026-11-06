@@ -190,6 +190,7 @@ const STRATEGIES = [
     minCh1: 3,           // positive h1 trend
     minBuyPct: 55,
     minLiq: 8000,
+    minAvgTrade: 25,   // real buyers — matches anti-manip floor for AM
     // No age cap — any coin with strong active momentum qualifies
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.50, tp2x: 2.50, tp3x: 5.00,
@@ -209,7 +210,7 @@ const STRATEGIES = [
     minM5Txns: 20,       // very high activity in last 5 min
     minCh1: 3,           // h1 positive (confirming uptrend, not requiring 40%)
     minBuyPct: 58,       // buyers still in control
-    minLiq: 4000,        // low bar — new coins surge fast
+    minLiq: 8000,        // matches AM — slippage costs make sub-$8k liq unprofitable
     // No age limit — that's the point
     // ── TP / SL (quick first profit, trail the rest) ──
     tp1x: 1.25, tp2x: 1.80, tp3x: 3.50,
@@ -346,7 +347,7 @@ function detectStrategy(pair, openStrategies) {
     if (!pass) return null;
   } else if (Math.abs(ch1) < 0.5) {
     const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2) // young coin pumping
-              || (ch24 <= -10 && buyPct >= 50 && liq >= 10000)        // bottom bounce stabilising
+              || (ch24 <= -5 && buyPct >= 50 && liq >= 10000)         // bottom bounce stabilising (matches BB maxCh24 -5%)
               || (m5Ch >= 3);                                           // actively surging now
     if (!pass) return null;
   }
@@ -418,8 +419,8 @@ function detectStrategy(pair, openStrategies) {
       if (buyPct < s.minBuyPct)  { match = false; }
       if (liq < s.minLiq)        { match = false; }
       // No age cap — any age qualifies as long as momentum is live
-      // Anti-manipulation: require meaningful avg trade size
-      if (avgTrade !== null && avgTrade < 25) { match = false; }
+      // Anti-manipulation: require meaningful avg trade size (from strategy definition)
+      if (s.minAvgTrade != null && avgTrade !== null && avgTrade < s.minAvgTrade) { match = false; }
       if (match) {
         score += Math.min(20, m5Txns / 2);         // very active = more confidence
         if (m5Ch > 5)  score += 15; else if (m5Ch > 2) score += 8;
@@ -491,8 +492,8 @@ function detectStrategy(pair, openStrategies) {
         score += Math.min(15, ch24 / 3);
         if (ch1 > 8)  score += 12; else if (ch1 > 3) score += 6;
         if (buyPct > 55) score += 10; else if (buyPct > 50) score += 5;
-        if (liq > 300000) score += 12; else if (liq > 150000) score += 7;
-        if (buys24 > 200) score += 10; else if (buys24 > 100) score += 5;
+        if (liq > 150000) score += 12; else if (liq > 40000) score += 7;
+        if (buys24 > 100) score += 10; else if (buys24 > 50) score += 5;
         if (volMcap > 0.05) score += 5;
         // MC sweet spot + avg trade quality
         if (mcSweetSpot) score += 10;
