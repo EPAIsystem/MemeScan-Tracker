@@ -88,7 +88,7 @@ const SURGE_AVG_TRADE_MIN   = 25;       // avg trade ≥$25 — young surging co
 // ─── ANTI-MANIPULATION THRESHOLDS ────────────────────────────────────────────
 // Applied globally in detectStrategy() before any strategy-specific scoring.
 // Catches bot farms (micro-trade spam), thin-pool manipulation, and wash trading.
-const ANTI_MANIP_AVG_TRADE_FLOOR  = 15;   // global: avg trade must be ≥$15 (kills $0.01–$2 spam)
+const ANTI_MANIP_AVG_TRADE_FLOOR  = 8;    // global: avg trade must be ≥$8 (kills $0.01–$2 spam; lowered for slow markets)
 const ANTI_MANIP_M5_TXNS_MAX      = 200;  // global: >200 txns in 5min = 40/min = bots
 const ANTI_MANIP_MC_LIQ_RATIO_MAX = 30;   // global: mc/liq > 30× = thin pool, easy to manipulate
 const ANTI_MANIP_SC_AVG_TRADE     = 20;   // Surge Catch: young coins trade smaller ($20 floor)
@@ -165,7 +165,7 @@ const STRATEGIES = [
     maxSlots: 20, // unlimited — competes openly for global slots with id 1 and id 3
     desc: 'Oversold token reversing from its bottom',
     // ── Entry criteria ──
-    maxCh24: -10,       // was falling — 24h must be negative (e.g. -10% to -90%)
+    maxCh24: -5,        // was falling — 24h must be negative (e.g. -5% to -92%; lowered to catch early-stage dips)
     minCh24: -92,
     maxCh1: 5,          // h1 not still crashing (< +5% = hasn't mooned yet)
     minCh1: 0,          // h1 must be positive — ascending recovery confirmed
@@ -185,8 +185,8 @@ const STRATEGIES = [
     maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 3
     desc: 'Price ticking every 5-15 min — strong live activity',
     // ── Entry criteria ──
-    minM5Txns: 15,       // busy last 5 min
-    minM5Ch: 1.0,        // at least +1% in last 5 min — MUST be going UP (was abs check)
+    minM5Txns: 8,        // real activity — lowered for slow-market sessions (was 15)
+    minM5Ch: 0.5,        // at least +0.5% in last 5 min — MUST be going UP (lowered from 1.0)
     minCh1: 3,           // positive h1 trend
     minBuyPct: 55,
     minLiq: 8000,
