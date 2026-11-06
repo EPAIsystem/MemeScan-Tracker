@@ -1571,30 +1571,44 @@ async function pollTelegramCommands() {
       }
 
       if (text === '/status') {
-        const stats   = await getDailyStats();
-        const cfg     = await getTradingConfig();
-        const mode    = (cfg.tradingMode || 'paper').toUpperCase();
-        const pnlStr  = stats.realizedPnL >= 0
-          ? `+$${stats.realizedPnL.toFixed(2)}`
-          : `-$${Math.abs(stats.realizedPnL).toFixed(2)}`;
-        const pct     = ((stats.realizedPnL / stats.startBalance) * 100).toFixed(1);
-        const botPaused = cfg.running === false;
-        const state   = botPaused        ? '⏸ PAUSED (running=false in DB)'
-                      : dayHaltedToday   ? '🚨 HALTED (daily limit)'
-                      : '✅ Running';
-        const posSize = parseFloat(cfg.positionSize) || POSITION_SIZE;
+        const stats      = await getDailyStats();
+        const cfg        = await getTradingConfig();
+        const mode       = (cfg.tradingMode || 'paper').toUpperCase();
+        const botPaused  = cfg.running === false;
+        const state      = botPaused      ? '⏸ PAUSED (running=false in DB)'
+                         : dayHaltedToday ? '🚨 HALTED (daily limit)'
+                         : '✅ Running';
+        const posSize    = parseFloat(cfg.positionSize) || POSITION_SIZE;
+
+        // ── Balance breakdown ────────────────────────────────────────────────────
+        const startBal   = stats.startBalance || (POSITION_SIZE * MAX_POSITIONS);
+        const grossProfit = stats.grossProfit  || 0;
+        const grossLoss   = stats.grossLoss    || 0;
+        const fees        = stats.dailyFees    || 0;
+        const netPnL      = grossProfit - grossLoss - fees;   // true net after fees
+        const currentBal  = startBal + netPnL;
+        const netPct      = ((netPnL / startBal) * 100).toFixed(1);
+        const netStr      = netPnL >= 0
+          ? `+$${netPnL.toFixed(2)} (+${netPct}%)`
+          : `-$${Math.abs(netPnL).toFixed(2)} (${netPct}%)`;
+
         const pausedNote = botPaused
           ? `\n⚠️ _Bot is PAUSED — set running=true in Firebase to resume_`
           : '';
+
         await sendTelegram(
           `📊 *STATUS*\n\n` +
-          `${state} · *${mode} mode*\n` +
-          `Daily P&L: *${pnlStr}* (${pct}%)\n` +
-          `Balance: $${(cfg.paperBalance || POSITION_SIZE * MAX_POSITIONS).toFixed(2)}\n` +
-          `Position size: *$${posSize.toFixed(2)}*\n` +
-          `Limit: ${(DAILY_LOSS_LIMIT * 100).toFixed(0)}%\n` +
+          `${state} · *${mode} mode*\n\n` +
+          `💰 Starting capital: *$${startBal.toFixed(2)}*\n` +
+          `💵 Current balance:  *$${currentBal.toFixed(2)}*\n\n` +
+          `📈 Gross profit:   +$${grossProfit.toFixed(2)}\n` +
+          `📉 Gross loss:     -$${grossLoss.toFixed(2)}\n` +
+          `💸 Fees & charges: -$${fees.toFixed(2)}\n` +
+          `─────────────────────\n` +
+          `🏆 Net P&L: *${netStr}*\n\n` +
+          `Position size: *$${posSize.toFixed(2)}* · Limit: ${(DAILY_LOSS_LIMIT * 100).toFixed(0)}%\n` +
           `Scan #: ${scanCount}${pausedNote}\n\n` +
-          `_/ping · /setsize 3 · /mode paper|real · /wallets · /clearreal · /restart_`
+          `_/stats · /ping · /setsize · /mode paper|real · /wallets_`
         );
       }
 
