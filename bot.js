@@ -203,10 +203,10 @@ const STRATEGIES = [
     // ── Entry criteria ──
     minM5Txns: 5,        // real activity — focused on trending coins which have natural volume
     minM5Ch: 0.3,        // moving up — focused on top 50 trending; even slight positive = entry
-    minCh1: 1,           // positive h1 — in an uptrend (loosened from 3%)
+    minCh1: 0,           // screener ranking is the quality gate — h1 not required for trending coins
     minBuyPct: 55,
-    minLiq: 5000,        // loosened — screener ranking is the quality gate now
-    minAvgTrade: 25,   // real buyers — matches anti-manip floor for AM
+    minLiq: 3000,        // screener ranking is the quality gate — liquidity floor relaxed
+    minAvgTrade: 10,     // relaxed — trending coins on screener can have smaller average buys
     minAgeDays: 1/12,  // 2 hours+ only — SC handles infant coins (0–2h), AM takes over after
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.50, tp2x: 2.50, tp3x: 5.00,
@@ -222,8 +222,8 @@ const STRATEGIES = [
     // ── Entry criteria — use m5 as primary signal, not h1 ──
     // h1 is a lagging indicator — the surge may already be over by then
     // m5 catches it while it's still happening
-    minM5Ch: 1,          // steady upward progress — actively moving up (was 3% surge-only)
-    minM5Txns: 10,       // real activity in last 5 min
+    minM5Ch: 0.3,        // building momentum — pump.fun ranking is the quality gate (was 1%)
+    minM5Txns: 5,        // relaxed — brand new coins may have lower m5 tx count
     minCh1: 0,           // young coins — h1 covers entire short life; m5 is the primary signal
     minBuyPct: 58,       // buyers still in control
     minLiq: 3000,        // young coins — $3k min; rug detection is the safety net for SC
@@ -246,8 +246,8 @@ const STRATEGIES = [
     minCh6: 0,           // h6 positive — sustained momentum (not noise)
     minM5Ch: 0.5,        // moving up RIGHT NOW — enter quickly when momentum is live
     minBuyPct: 50,
-    minLiq: 15000,       // established coins — loosened; still above rug-pull threshold
-    minBuys24: 35,       // real buy activity without over-restricting
+    minLiq: 8000,        // relaxed — established coins with real recovery activity
+    minBuys24: 20,       // relaxed — coins waking up may not have high buy counts yet
     maxCh1: 30,          // not a sudden spike — steady recovery
     minAvgTrade: 20,     // real buyers filter — lowered to match real market behaviour
     // ── TP / SL (conservative) ──
