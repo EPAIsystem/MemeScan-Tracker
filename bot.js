@@ -201,8 +201,6 @@ const STRATEGIES = [
     maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 3
     desc: 'Price ticking every 5-15 min — strong live activity',
     // ── Entry criteria ──
-    minBuyPct: 50,       // buyers still in control — minimum viable signal
-    minLiq: 3000,        // absolute rug floor — DexScreener ranking is the quality gate
     minAgeDays: 1/12,  // 2 hours+ only — SC handles infant coins (0–2h), AM takes over after
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.50, tp2x: 2.50, tp3x: 5.00,
@@ -218,9 +216,6 @@ const STRATEGIES = [
     // ── Entry criteria — use m5 as primary signal, not h1 ──
     // h1 is a lagging indicator — the surge may already be over by then
     // m5 catches it while it's still happening
-    minCh1: 0,           // young coins — h1 covers entire short life; m5 is the primary signal
-    minBuyPct: 55,       // buyers still in control
-    minLiq: 3000,        // young coins — $3k min; rug detection is the safety net for SC
     maxAgeDays: 1/12,  // 2 hours max — SC is for infant surges; older coins go to AM/BB/OR
     // ── TP / SL (quick first profit, trail the rest) ──
     tp1x: 1.25, tp2x: 1.80, tp3x: 3.50,
@@ -427,10 +422,11 @@ function detectStrategy(pair, openStrategies) {
   // use the standard TP1/TP2/TP3 targets which are better calibrated for real moves.
   if (ageMinutes < 60) return null;
 
-  // PUMP.FUN YOUNG COIN extra requirements (60–90 min): tighter liquidity + buy pressure
+  // PUMP.FUN YOUNG COIN extra requirements (60–90 min): minimal rug floor + buy pressure
   // (age < 60 already blocked above, so this only applies between 60–90 min)
-  if (isPumpFun && ageMinutes < 90 && liq < 15000) return null;
-  if (isPumpFun && ageMinutes < 90 && buyPct < 62)  return null;
+  // Relaxed to match SC filters — SC's anti-manipulation checks are the real safety net
+  if (isPumpFun && ageMinutes < 90 && liq < 5000) return null;
+  if (isPumpFun && ageMinutes < 90 && buyPct < 55)  return null;
 
   const base = {
     addr, price, liq, mcap, vol24, buyPct, buys24, ch1, ch6, ch24, m5Ch, m5Txns,
