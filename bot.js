@@ -2933,6 +2933,20 @@ async function monitorPositions() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
+    // ── CAPITAL FLOOR — UNCONDITIONAL (runs even when price < entry) ──────
+    // SL must ALWAYS be at least entryPrice. This corrects existing positions
+    // that were opened before capital protection was deployed (old low SL).
+    // The stop-loss check above will then fire on the next tick if price < entry.
+    // ══════════════════════════════════════════════════════════════════════
+    if (!pos.isMoonBag && !pos.capitalWithdrawn) {
+      const currentSLNow = updates.currentSL ?? pos.currentSL;
+      if (pos.entryPrice > currentSLNow * 1.005) {
+        updates.currentSL = pos.entryPrice;
+        updates.trailingActive = true;
+      }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
     // ── PROGRESSIVE TRAILING SL — ALL STRATEGIES, EVERY TICK ─────────────
     // Tightens as price rises, floors at 5%
     // ══════════════════════════════════════════════════════════════════════
