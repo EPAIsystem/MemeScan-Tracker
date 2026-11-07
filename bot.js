@@ -201,12 +201,8 @@ const STRATEGIES = [
     maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 3
     desc: 'Price ticking every 5-15 min — strong live activity',
     // ── Entry criteria ──
-    minM5Txns: 5,        // real activity — focused on trending coins which have natural volume
-    minM5Ch: 0.3,        // moving up — focused on top 50 trending; even slight positive = entry
-    minCh1: 0,           // screener ranking is the quality gate — h1 not required for trending coins
-    minBuyPct: 55,
-    minLiq: 3000,        // screener ranking is the quality gate — liquidity floor relaxed
-    minAvgTrade: 10,     // relaxed — trending coins on screener can have smaller average buys
+    minBuyPct: 50,       // buyers still in control — minimum viable signal
+    minLiq: 3000,        // absolute rug floor — DexScreener ranking is the quality gate
     minAgeDays: 1/12,  // 2 hours+ only — SC handles infant coins (0–2h), AM takes over after
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.50, tp2x: 2.50, tp3x: 5.00,
@@ -222,10 +218,8 @@ const STRATEGIES = [
     // ── Entry criteria — use m5 as primary signal, not h1 ──
     // h1 is a lagging indicator — the surge may already be over by then
     // m5 catches it while it's still happening
-    minM5Ch: 0.3,        // building momentum — pump.fun ranking is the quality gate (was 1%)
-    minM5Txns: 5,        // relaxed — brand new coins may have lower m5 tx count
     minCh1: 0,           // young coins — h1 covers entire short life; m5 is the primary signal
-    minBuyPct: 58,       // buyers still in control
+    minBuyPct: 55,       // buyers still in control
     minLiq: 3000,        // young coins — $3k min; rug detection is the safety net for SC
     maxAgeDays: 1/12,  // 2 hours max — SC is for infant surges; older coins go to AM/BB/OR
     // ── TP / SL (quick first profit, trail the rest) ──
@@ -240,16 +234,9 @@ const STRATEGIES = [
     maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 1
     desc: 'Established coin climbing back steadily',
     // ── Entry criteria ──
-    minAgeDays: 15,
-    minCh24: 3,          // positive 24h
-    minCh1: 0.5,         // positive h1 (still climbing)
-    minCh6: 0,           // h6 positive — sustained momentum (not noise)
-    minM5Ch: 0.5,        // moving up RIGHT NOW — enter quickly when momentum is live
-    minBuyPct: 50,
-    minLiq: 8000,        // relaxed — established coins with real recovery activity
-    minBuys24: 20,       // relaxed — coins waking up may not have high buy counts yet
-    maxCh1: 30,          // not a sudden spike — steady recovery
-    minAvgTrade: 20,     // real buyers filter — lowered to match real market behaviour
+    minAgeDays: 15,      // the defining characteristic of OR — established coins only
+    minBuyPct: 50,       // buyers in control — minimum viable signal
+    minLiq: 5000,        // absolute rug floor — platform ranking is the quality gate
     // ── TP / SL (conservative) ──
     tp1x: 1.12, tp2x: 1.30, tp3x: 1.65,
     slx: 0.92,
@@ -3112,36 +3099,34 @@ async function monitorPositions() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // ── CAPITAL FLOOR — 2-MINUTE GRACE PERIOD ────────────────────────────
-    // Phase 1: First 2 min → original -25% SL is the safety net (no floor).
-    // At 2 min, price ≥ entry → lock SL at entryPrice (100% capital protected).
-    // At 2 min, price < entry → tighten SL to -15% and wait for recovery.
-    // Once price crosses entry after tightening → capital floor applied immediately.
+    // ── CAPITAL FLOOR — PRICE-BASED TRIGGER ──────────────────────────────
+    // As soon as price crosses ABOVE entry → lock SL at entryPrice (no grace,
+    // no delay — the moment the coin is profitable, capital is protected).
+    // If price stays BELOW entry for 2+ min → tighten SL from -25% to -15%.
+    // The 2-min grace only protects the downside before the coin has moved.
     // ══════════════════════════════════════════════════════════════════════
     if (!pos.isMoonBag && !pos.capitalWithdrawn) {
       const ageMs        = Date.now() - pos.enteredAt;
       const currentSLNow = updates.currentSL ?? pos.currentSL;
 
-      if (ageMs >= CAPITAL_FLOOR_GRACE_MS) {
-        if (price >= pos.entryPrice) {
-          // Price is at or above entry — apply capital floor: lock SL at entryPrice
-          if (pos.entryPrice > currentSLNow * 1.005) {
-            updates.currentSL    = pos.entryPrice;
-            updates.trailingActive = true;
-          }
-        } else if (!pos.slTightened) {
-          // Price still below entry after 2-min grace — tighten SL from -25% to -15%
-          const tightenedSL = pos.entryPrice * SL_TIGHTEN_PCT;
-          if (tightenedSL > currentSLNow * 1.005) {
-            updates.currentSL  = tightenedSL;
-            updates.slTightened = true;
-            sendTelegram(
-              `⚠️ *SL TIGHTENED — ${pos.symbol}*\n` +
-              `Price still below entry after 2-min grace\n` +
-              `SL: −25% → −15% from entry ($${fmtPrice(tightenedSL)})\n` +
-              `Waiting for price to recover above entry ($${fmtPrice(pos.entryPrice)})…`
-            ).catch(() => {});
-          }
+      if (price >= pos.entryPrice) {
+        // Price is at or above entry — apply capital floor IMMEDIATELY
+        if (pos.entryPrice > currentSLNow * 1.005) {
+          updates.currentSL    = pos.entryPrice;
+          updates.trailingActive = true;
+        }
+      } else if (ageMs >= CAPITAL_FLOOR_GRACE_MS && !pos.slTightened) {
+        // Price still below entry after 2-min grace — tighten SL from -25% to -15%
+        const tightenedSL = pos.entryPrice * SL_TIGHTEN_PCT;
+        if (tightenedSL > currentSLNow * 1.005) {
+          updates.currentSL  = tightenedSL;
+          updates.slTightened = true;
+          sendTelegram(
+            `⚠️ *SL TIGHTENED — ${pos.symbol}*\n` +
+            `Price still below entry after 2-min grace\n` +
+            `SL: −25% → −15% from entry ($${fmtPrice(tightenedSL)})\n` +
+            `Waiting for price to recover above entry ($${fmtPrice(pos.entryPrice)})…`
+          ).catch(() => {});
         }
       }
     }
@@ -3187,7 +3172,13 @@ async function monitorPositions() {
         } else {
           trailPct = calcTrailPct(pos.initialTrailPct, gainPct);
         }
-        const trailSL    = price * (1 - trailPct / 100);
+        // Trail applies to gain ABOVE entry only — never erodes capital.
+        // e.g. entry $1.00, price $1.34, trail 35% → SL = $1.00 + $0.34×0.65 = $1.221
+        // (old formula would give $1.34 × 0.65 = $0.871, which is BELOW entry — wrong)
+        const rawGain    = price - pos.entryPrice;
+        const trailSL    = rawGain > 0
+          ? pos.entryPrice + rawGain * (1 - trailPct / 100)   // trail on gain above entry
+          : price * (1 - trailPct / 100);                     // below entry — standard trail
         const capitalSL  = calcCapitalFloor(pos.entryPrice, gain); // always ≥ entryPrice
         newSL = Math.max(trailSL, capitalSL);
       }
