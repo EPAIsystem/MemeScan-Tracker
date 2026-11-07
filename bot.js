@@ -293,6 +293,23 @@ function calcORProfitLock(gainPct) {
   return 0.65;                       // 200%+: lock in 65%
 }
 
+// ── CAPITAL PROTECTION — Phase 1 SL floor ────────────────────────────────────
+// SL is always floored at entryPrice (zero-loss guarantee from day 1).
+// As gains build, the floor rises: 50% of gain is locked in at all times.
+// This replaces the per-strategy profit lock once capital is withdrawn.
+function calcCapitalFloor(entryPrice, gain) {
+  if (gain <= 0) return entryPrice; // never below entry — zero loss max
+  return entryPrice * (1 + gain * 0.50); // lock in 50% of gain above entry
+}
+
+// ── CAPITAL PROTECTION — Phase 2 profit trail ────────────────────────────────
+// After capital is withdrawn, remaining tokens are pure profit.
+// Trail starts at 50%, tightens 5% per additional 50% gain, min 5%.
+// profitGainPct = gain from capitalWithdrawPrice (not entryPrice)
+function calcProfitTrail(profitGainPct) {
+  return Math.max(5, 50 - Math.floor(Math.max(0, profitGainPct) / 50) * 5);
+}
+
 // Dynamic position size: 1% of pool liquidity × market cap multiplier, capped at ceiling.
 // MC sweet spot ($25k–$200k) gets a 1.3× boost — these coins can 2x–5x fast for small traders.
 // Large caps (>$2M) are reduced — a $100 position barely moves the needle there.
@@ -2689,13 +2706,60 @@ async function monitorPositions() {
           `🛑 *STOP LOSS HIT*\n\n` +
           `*${pos.symbol}* ${pos.strategyLabel}\n` +
           `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
-          `🛑 SL: $${fmtPrice(pos.currentSL)} | Trail: ${(pos.strategyId === 0 ? calcBBTrail(gainPct) : pos.strategyId === 3 ? calcORTrail(gainPct) : calcTrailPct(pos.initialTrailPct, gainPct)).toFixed(1)}%\n` +
+          `🛑 SL: $${fmtPrice(pos.currentSL)} | Trail: ${pos.capitalWithdrawn && pos.capitalWithdrawPrice ? calcProfitTrail((price - pos.capitalWithdrawPrice) / pos.capitalWithdrawPrice * 100).toFixed(1) : (pos.strategyId === 0 ? calcBBTrail(gainPct) : pos.strategyId === 3 ? calcORTrail(gainPct) : calcTrailPct(pos.initialTrailPct, gainPct)).toFixed(1)}%\n` +
           `📊 P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*\n🔗 [Chart](${pos.dexUrl})`
         );
       } finally {
         closingNow.delete(pos.id);
       }
       continue;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ── CAPITAL WITHDRAWAL (Phase 1 → Phase 2 transition) ─────────────────
+    // Sell enough tokens to recover the full original capital ($pos.size).
+    // SC: triggers at 20% gain (rug-pull risk — recover fast).
+    // AM/BB/OR: triggers at 100% gain (position has doubled — time to house money).
+    // After this fires, all further TP sells are skipped — Phase 2 profit trail only.
+    // ══════════════════════════════════════════════════════════════════════
+    if (!pos.capitalWithdrawn) {
+      const capThreshold = pos.strategyId === 2 ? 0.20 : 1.00; // SC=20%, others=100%
+      if (gain >= capThreshold && pos.remaining > 0.01) {
+        const totalRecovered = pos.recoveredAmount || 0;
+        const stillNeeded    = pos.size - totalRecovered; // capital still at risk
+        if (stillNeeded > 0.01) {
+          // Sell the minimum fraction needed to bring total recovered >= pos.size
+          const currentValue = pos.remaining * pos.size * (price / pos.entryPrice);
+          const capitalFrac  = Math.min(pos.remaining, stillNeeded / currentValue);
+          const proceeds     = capitalFrac * pos.size * (exitFillPrice / pos.entryPrice);
+          const partPnL      = fillGain * pos.size * capitalFrac;
+          const newRemaining = pos.remaining - capitalFrac;
+          const newRecovered = totalRecovered + proceeds;
+          const capUpdates   = {
+            capitalWithdrawn:    true,
+            capitalWithdrawPrice: price,
+            remaining:           newRemaining,
+            recoveredAmount:     newRecovered,
+            pnl:                 (pos.pnl || 0) + partPnL,
+            tpDisabled:          true, // TP sells done — Phase 2 is pure profit trail
+          };
+          await updatePosition(pos.id, capUpdates);
+          await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, capitalFrac));
+          Object.assign(pos, capUpdates);
+          const stratLabel = pos.strategyId === 2 ? '20% (SC fast-exit)' : '100% (house money)';
+          alertMsg = `🛡️ *CAPITAL PROTECTED*\n\n` +
+            `*${pos.symbol}* ${pos.strategyLabel}\n` +
+            `📥 Entry: $${fmtPrice(pos.entryPrice)} | Trigger: +${stratLabel}\n` +
+            `💰 Sold ${(capitalFrac * 100).toFixed(1)}% → recovered $${newRecovered.toFixed(2)}\n` +
+            `🎯 ${(newRemaining * 100).toFixed(1)}% remains — pure profit, trailing SL only\n` +
+            `🔗 [Chart](${pos.dexUrl})`;
+        } else {
+          // Prior TP sells already recovered full capital — just flip the flag
+          const capUpdates = { capitalWithdrawn: true, capitalWithdrawPrice: price, tpDisabled: true };
+          await updatePosition(pos.id, capUpdates);
+          Object.assign(pos, capUpdates);
+        }
+      }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -2888,36 +2952,30 @@ async function monitorPositions() {
             `SL: ${(prevPct*100).toFixed(0)}% → *${(targetPct*100).toFixed(0)}%*\n🔗 [Chart](${pos.dexUrl})`
           );
         }
+      } else if (pos.capitalWithdrawn && pos.capitalWithdrawPrice) {
+        // ── PHASE 2: PROFIT TRAIL ──────────────────────────────────────────
+        // Capital is safe — trail remaining profit tokens only.
+        // Trail starts at 50%, tightens 5% per extra 50% gain from withdrawPrice, min 5%.
+        const profitGainPct = (price - pos.capitalWithdrawPrice) / pos.capitalWithdrawPrice * 100;
+        const trailPct      = calcProfitTrail(profitGainPct);
+        // Floor: never let SL fall below entry (absolute safety net)
+        newSL = Math.max(pos.entryPrice, price * (1 - trailPct / 100));
+
       } else {
-        // ── STRATEGY-SPECIFIC TRAILING STOP + PROFIT LOCK ─────────────────
+        // ── PHASE 1: STRATEGY TRAIL + CAPITAL FLOOR ───────────────────────
+        // Capital floor replaces the old per-strategy profit lock.
+        // SL is always ≥ entryPrice (zero-loss from day 1) and rises as gain × 0.50.
         let trailPct;
-        let profitLockFraction = null;
-
         if (pos.strategyId === 0) {
-          // Bottom Bounce — wide trail at entry, tightens as gains build
           trailPct = calcBBTrail(gainPct);
-          profitLockFraction = calcBBProfitLock(gainPct);
-
         } else if (pos.strategyId === 3) {
-          // Old Recovery — slightly tighter than BB, same tiered approach
           trailPct = calcORTrail(gainPct);
-          profitLockFraction = calcORProfitLock(gainPct);
-
         } else {
-          // Active Momentum (1) & Surge Catch (2) — narrowing trail from initialTrailPct
           trailPct = calcTrailPct(pos.initialTrailPct, gainPct);
-          profitLockFraction = calcAMSCProfitLock(gainPct);
         }
-
-        newSL = price * (1 - trailPct / 100);
-
-        // ── PROFIT LOCK ────────────────────────────────────────────────────
-        // Raise the SL floor to lock in a fraction of gains above entry.
-        // AM/SC: activates at 10% gain (80%→85%→90%→95% as gains compound)
-        // BB/OR: activates at 50% gain (50%→60%→70% / 40%→55%→65%)
-        if (profitLockFraction !== null && gain > 0) {
-          newSL = Math.max(newSL, pos.entryPrice * (1 + gain * profitLockFraction));
-        }
+        const trailSL    = price * (1 - trailPct / 100);
+        const capitalSL  = calcCapitalFloor(pos.entryPrice, gain); // always ≥ entryPrice
+        newSL = Math.max(trailSL, capitalSL);
       }
       const currentSL = updates.currentSL ?? pos.currentSL;
       // Only write if SL moved ≥ 0.5% — prevents thousands of tiny writes per day
