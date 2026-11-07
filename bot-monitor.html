@@ -1027,7 +1027,7 @@ function render() {
 
   const s = S.stats || {};
   const openLivePnl = S.positions.reduce((sum, p) => sum + (livePnl(p) || 0), 0);
-  const portfolio = 500 + (s.realizedPnL || 0) + openLivePnl;
+  const portfolio = (s.startBalance || 2000) + (s.realizedPnL || 0) + openLivePnl;
   const todayPnl  = s.realizedPnL || 0;
   const winRate   = s.trades > 0 ? Math.round(s.wins / s.trades * 100) : null;
   const updTime   = S.lastUpdated

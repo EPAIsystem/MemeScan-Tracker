@@ -97,6 +97,10 @@ const SC_RUG_DROP_PCT  = 0.30;  // 30% drop in 15s = rug signal
 const SC_RUG_WINDOW_MS = 15000; // 15-second rolling price window
 const SC_RUG_EXIT_CNT  = 2;     // 2nd signal → emergency exit all positions on coin
 
+// ─── CAPITAL FLOOR GRACE PERIOD ──────────────────────────────────────────────
+const CAPITAL_FLOOR_GRACE_MS = 2 * 60 * 1000; // 2 min before SL floors at entryPrice
+const SL_TIGHTEN_PCT         = 0.85;           // after grace, if still below entry → SL tightens to -15%
+
 // ─── ANTI-MANIPULATION THRESHOLDS ────────────────────────────────────────────
 // Applied globally in detectStrategy() before any strategy-specific scoring.
 // Catches bot farms (micro-trade spam), thin-pool manipulation, and wash trading.
@@ -3108,16 +3112,37 @@ async function monitorPositions() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // ── CAPITAL FLOOR — UNCONDITIONAL (runs even when price < entry) ──────
-    // SL must ALWAYS be at least entryPrice. This corrects existing positions
-    // that were opened before capital protection was deployed (old low SL).
-    // The stop-loss check above will then fire on the next tick if price < entry.
+    // ── CAPITAL FLOOR — 2-MINUTE GRACE PERIOD ────────────────────────────
+    // Phase 1: First 2 min → original -25% SL is the safety net (no floor).
+    // At 2 min, price ≥ entry → lock SL at entryPrice (100% capital protected).
+    // At 2 min, price < entry → tighten SL to -15% and wait for recovery.
+    // Once price crosses entry after tightening → capital floor applied immediately.
     // ══════════════════════════════════════════════════════════════════════
     if (!pos.isMoonBag && !pos.capitalWithdrawn) {
+      const ageMs        = Date.now() - pos.enteredAt;
       const currentSLNow = updates.currentSL ?? pos.currentSL;
-      if (pos.entryPrice > currentSLNow * 1.005) {
-        updates.currentSL = pos.entryPrice;
-        updates.trailingActive = true;
+
+      if (ageMs >= CAPITAL_FLOOR_GRACE_MS) {
+        if (price >= pos.entryPrice) {
+          // Price is at or above entry — apply capital floor: lock SL at entryPrice
+          if (pos.entryPrice > currentSLNow * 1.005) {
+            updates.currentSL    = pos.entryPrice;
+            updates.trailingActive = true;
+          }
+        } else if (!pos.slTightened) {
+          // Price still below entry after 2-min grace — tighten SL from -25% to -15%
+          const tightenedSL = pos.entryPrice * SL_TIGHTEN_PCT;
+          if (tightenedSL > currentSLNow * 1.005) {
+            updates.currentSL  = tightenedSL;
+            updates.slTightened = true;
+            sendTelegram(
+              `⚠️ *SL TIGHTENED — ${pos.symbol}*\n` +
+              `Price still below entry after 2-min grace\n` +
+              `SL: −25% → −15% from entry ($${fmtPrice(tightenedSL)})\n` +
+              `Waiting for price to recover above entry ($${fmtPrice(pos.entryPrice)})…`
+            ).catch(() => {});
+          }
+        }
       }
     }
 
