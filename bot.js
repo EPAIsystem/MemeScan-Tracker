@@ -428,6 +428,26 @@ function detectStrategy(pair, openStrategies) {
   if (isPumpFun && ageMinutes < 90 && liq < 5000) return null;
   if (isPumpFun && ageMinutes < 90 && buyPct < 55)  return null;
 
+  // ── RISING MOMENTUM GATE ──────────────────────────────────────────────────
+  // The bot must only enter when the coin is actively moving UP — not during a
+  // pullback or nosedive. Two checks, both must agree:
+  //
+  //   1. m5Ch > 0  — DexScreener confirms positive 5-min momentum at scan time
+  //   2. priceHistory rising — if we have live price readings for this coin,
+  //      the most recent reading must be ≥ the reading 2 ticks ago (6 seconds).
+  //      This catches coins that peaked between scans and are now coming down.
+  //
+  // Exception: Bottom Bounce (id=0) is designed to enter on oversold recovery —
+  // it can have a slightly negative m5 as the coin is stabilising. Allow m5Ch ≥ -1%.
+  if (m5Ch !== null && m5Ch < -1) return null; // declining — wait for it to turn around
+
+  const liveHist = priceHistory.get(addr) || [];
+  if (liveHist.length >= 3) {
+    const newest = liveHist[liveHist.length - 1]?.price;
+    const older  = liveHist[liveHist.length - 3]?.price; // ~6 seconds ago
+    if (newest && older && newest < older * 0.999) return null; // price declining in live feed
+  }
+
   const base = {
     addr, price, liq, mcap, vol24, buyPct, buys24, ch1, ch6, ch24, m5Ch, m5Txns,
     m5Buys, m5Vol, m5BuyRate, avgTrade, mcLiqRatio, mcSweetSpot,
@@ -1172,8 +1192,8 @@ async function enterPosition(coin, overrides = {}) {
     // User's ceiling is too restrictive — entry may not cover fees
     advisoryNote = `⚠️ Set size $${ceiling} is well below the bot's recommended $${dynRec} (liq × 1%). At this size, profits may not cover fees. Suggested: $${dynRec}.`;
   }
-  // Surge momentum: flag if m5 is ripping fast at entry (not applicable to moon bags)
-  const isSurge = !overrides.isMoonBag && (coin.m5Ch || 0) >= SURGE_M5_ENTRY_TRIGGER;
+  // Surge momentum disabled — surge exit + reinvest removed; capital floor handles profit protection
+  const isSurge = false;
   const tradingMode = cfg.tradingMode || 'paper';
   const coinChain  = normaliseChain(coin.chain);
   const wallet     = await selectWalletForChain(coinChain, cfg);
@@ -2032,7 +2052,13 @@ async function calcSurgeReinvest(totalPnL, liquidityUsd) {
   return Math.max(base, 0);
 }
 
+// openSurgeReinvest disabled — surge exit + reinvest mechanic removed.
+// Profit protection is now handled entirely by the capital floor (100% gain → capital withdrawn)
+// and the progressive trailing SL. No new position is ever opened at the surge peak price.
 async function openSurgeReinvest(pos, exitPrice, totalPnL) {
+  console.log(`[SURGE REINVEST] Disabled — ${pos.symbol} $${totalPnL?.toFixed(2)} profit rides via capital floor + trail`);
+  return;
+  // ── dead code below — kept for reference ──
   if (totalPnL <= 0) return;
 
   // Check slots
@@ -2645,43 +2671,9 @@ async function monitorPositions() {
     }
     const currentPeak = pos.peakPrice || peak;
 
-    // ── SURGE MOMENTUM — AUTO-DETECT & EXIT ───────────────────────────────────
-    // Auto-switch to surge mode if coin rips +40%+ within first 20 minutes.
-    if (!pos.surgeMomentum && !pos.isMoonBag) {
-      const elapsed = Date.now() - pos.enteredAt;
-      if (gain >= SURGE_AUTO_GAIN_TRIGGER && elapsed < SURGE_AUTO_TIME_LIMIT) {
-        await updatePosition(pos.id, { surgeMomentum: true });
-        pos.surgeMomentum = true;
-        await sendTelegram(
-          `🚀 *SURGE MODE AUTO-SWITCH*\n*${pos.symbol}* +${gainPct.toFixed(1)}% in ${Math.round(elapsed/60000)}min\n` +
-          `Skipping TP1/TP2 — riding to 80%+ full exit\n🔗 [Chart](${pos.dexUrl})`
-        );
-      }
-    }
-    // Surge exit: full position at 80%+ gain, then reinvest capped portion of profit
-    if (pos.surgeMomentum && !pos.isMoonBag && gain >= SURGE_EXIT_AT) {
-      // Guard against concurrent monitor ticks firing duplicate SURGE_EXIT
-      if (closingNow.has(pos.id)) continue;
-      closingNow.add(pos.id);
-      try {
-        const exitPnl = fillGain * pos.size * pos.remaining;
-        const pnl     = (pos.pnl || 0) + exitPnl;
-        await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'SURGE_EXIT', pnl });
-        await updateDailyStats(exitPnl, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
-        enteredToday.delete(pos.address);
-        await sendTelegram(
-          `🚀 *SURGE EXIT — FULL POSITION*\n\n` +
-          `*${pos.symbol}* ${pos.strategyLabel}\n` +
-          `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
-          `📊 P&L: *+$${pnl.toFixed(2)}* (+${gainPct.toFixed(1)}%)\n` +
-          `♻️ Calculating reinvestment…\n🔗 [Chart](${pos.dexUrl})`
-        );
-        await openSurgeReinvest(pos, exitFillPrice, pnl);
-      } finally {
-        closingNow.delete(pos.id);
-      }
-      continue;
-    }
+    // Surge exit + reinvest removed — positions now ride via capital floor + progressive trail.
+    // At 100% gain the capital floor withdraws the original capital; profit continues trailing.
+    // (Any legacy Firestore positions with surgeMomentum:true simply continue with normal TP/SL.)
 
     // ── SURGE_CATCH STALE EXIT — rotate slots for fresh surges ────────────
     // If a SURGE_CATCH position (strategyId 2) hasn't auto-switched to surge
