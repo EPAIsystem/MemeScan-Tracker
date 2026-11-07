@@ -1063,13 +1063,13 @@ async function getOpenPositions() {
 //     1–5%    → ~3%   slippage   (thin — price impact hurts)
 //     > 5%    → ~6%   slippage   (very thin — should avoid)
 function simulateFillPrice(rawPrice, positionSize, liquidityUsd, isBuy) {
-  const DEX_FEE = 0.0025; // 0.25% each way
+  const DEX_FEE = 0.0030; // 0.30% each way (base 0.25% × 1.20 — worst-case stress test)
   const ratio = liquidityUsd > 0 ? positionSize / liquidityUsd : 0.05;
   let slippage;
-  if      (ratio < 0.001) slippage = 0.002;  // 0.2%
-  else if (ratio < 0.01)  slippage = 0.010;  // 1%
-  else if (ratio < 0.05)  slippage = 0.030;  // 3%
-  else                    slippage = 0.060;  // 6%
+  if      (ratio < 0.001) slippage = 0.0024; // 0.24%  (base 0.2%  × 1.20)
+  else if (ratio < 0.01)  slippage = 0.0120; // 1.2%   (base 1%    × 1.20)
+  else if (ratio < 0.05)  slippage = 0.0360; // 3.6%   (base 3%    × 1.20)
+  else                    slippage = 0.0720; // 7.2%   (base 6%    × 1.20)
 
   // Buying: we pay MORE (price goes up against us, plus fee)
   // Selling: we receive LESS (price goes down against us, plus fee)
