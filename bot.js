@@ -67,7 +67,10 @@ const LP_LOCK_TTL = 30 * 60 * 1000; // 30-min cache — GoPlus data changes rare
 let watchingCoinsSnapshot = []; // updated each scan; holds near-miss coins for on-demand reporting
 
 // ─── PRICE HISTORY TRACKER ────────────────────────────────────────────────────
-const priceHistory = new Map(); // addr → [{price, score, ts}, ...]
+const priceHistory  = new Map(); // addr → [{price, score, ts}, ...]
+// SC rug detection: 15s rolling price window per live position
+const scPriceWindow = new Map(); // addr → [{price, ts}, ...]
+const scRugSignals  = new Map(); // addr → number of rug signals fired this session
 const PRICE_HIST_MAX    = 40;   // keep last 40 scan snapshots per coin (~10 min of data at 15s scans)
 const PRICE_HIST_TREND  = 3;    // consecutive rising points = confirmed uptrend
 const PRICE_HIST_REBOUND_PCT = 0.05; // 5% recovery from dip = rebound confirmed
@@ -84,6 +87,15 @@ const SURGE_WATCH_EXPIRY_MS = 5 * 60 * 1000;  // 5 min max watch window — more
 const SURGE_BUY_RATE_MIN    = 8;        // ≥8 buys/min = confirmed real surge (m5Buys/5)
 const SURGE_CONFIRM_MIN_MS  = 60000;    // must watch ≥1 min before buy-rate entry fires
 const SURGE_AVG_TRADE_MIN   = 25;       // avg trade ≥$25 — young surging coins trade smaller; still above $20 anti-manip floor
+
+// ─── SC RUG DETECTION ────────────────────────────────────────────────────────
+// For Surge Catch (strategy 2) only: young coins can rug in seconds.
+// If price drops ≥ 30% vs the price 15s ago (5 ticks at 3s):
+//   1st signal → capital protection fires + SL tightened aggressively
+//   2nd+ signal → exit ALL positions on this coin immediately
+const SC_RUG_DROP_PCT  = 0.30;  // 30% drop in 15s = rug signal
+const SC_RUG_WINDOW_MS = 15000; // 15-second rolling price window
+const SC_RUG_EXIT_CNT  = 2;     // 2nd signal → emergency exit all positions on coin
 
 // ─── ANTI-MANIPULATION THRESHOLDS ────────────────────────────────────────────
 // Applied globally in detectStrategy() before any strategy-specific scoring.
@@ -172,8 +184,8 @@ const STRATEGIES = [
     minCh6: -50,        // h6 allowed down to -50% — h1 + m5 confirm the actual turn
     minM5Ch: -0.5,      // m5 stabilising or turning green
     minBuyPct: 55,      // buyers coming in
-    minLiq: 15000,
-    minM5Txns: 8,       // real bounce needs real tx flow, not a single spike
+    minLiq: 8000,       // loosened — capital protection is the new safety net
+    minM5Txns: 5,       // real bounce needs real tx flow
     // ── TP / SL (standard 3-step) ──
     tp1x: 1.25, tp2x: 1.55, tp3x: 2.10,
     slx: 0.87,
@@ -185,11 +197,11 @@ const STRATEGIES = [
     maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 3
     desc: 'Price ticking every 5-15 min — strong live activity',
     // ── Entry criteria ──
-    minM5Txns: 8,        // real activity — lowered for slow-market sessions (was 15)
-    minM5Ch: 0.5,        // at least +0.5% in last 5 min — MUST be going UP (lowered from 1.0)
-    minCh1: 3,           // positive h1 trend
+    minM5Txns: 5,        // real activity — focused on trending coins which have natural volume
+    minM5Ch: 0.3,        // moving up — focused on top 50 trending; even slight positive = entry
+    minCh1: 1,           // positive h1 — in an uptrend (loosened from 3%)
     minBuyPct: 55,
-    minLiq: 8000,
+    minLiq: 5000,        // loosened — screener ranking is the quality gate now
     minAvgTrade: 25,   // real buyers — matches anti-manip floor for AM
     minAgeDays: 1/12,  // 2 hours+ only — SC handles infant coins (0–2h), AM takes over after
     // ── TP / SL (partial profit — sell in bits) ──
@@ -206,11 +218,11 @@ const STRATEGIES = [
     // ── Entry criteria — use m5 as primary signal, not h1 ──
     // h1 is a lagging indicator — the surge may already be over by then
     // m5 catches it while it's still happening
-    minM5Ch: 3,          // up 3%+ in last 5 min — actively surging NOW
-    minM5Txns: 20,       // very high activity in last 5 min
-    minCh1: 3,           // h1 positive (confirming uptrend, not requiring 40%)
+    minM5Ch: 1,          // steady upward progress — actively moving up (was 3% surge-only)
+    minM5Txns: 10,       // real activity in last 5 min
+    minCh1: 0,           // young coins — h1 covers entire short life; m5 is the primary signal
     minBuyPct: 58,       // buyers still in control
-    minLiq: 4000,        // infant coins — $4k min; AM takes over at 2h+ where $8k is feasible
+    minLiq: 3000,        // young coins — $3k min; rug detection is the safety net for SC
     maxAgeDays: 1/12,  // 2 hours max — SC is for infant surges; older coins go to AM/BB/OR
     // ── TP / SL (quick first profit, trail the rest) ──
     tp1x: 1.25, tp2x: 1.80, tp3x: 3.50,
@@ -228,8 +240,9 @@ const STRATEGIES = [
     minCh24: 3,          // positive 24h
     minCh1: 0.5,         // positive h1 (still climbing)
     minCh6: 0,           // h6 positive — sustained momentum (not noise)
+    minM5Ch: 0.5,        // moving up RIGHT NOW — enter quickly when momentum is live
     minBuyPct: 50,
-    minLiq: 25000,       // established coins — lowered to match real market liq levels
+    minLiq: 15000,       // established coins — loosened; still above rug-pull threshold
     minBuys24: 35,       // real buy activity without over-restricting
     maxCh1: 30,          // not a sudden spike — steady recovery
     minAvgTrade: 20,     // real buyers filter — lowered to match real market behaviour
@@ -447,24 +460,63 @@ function detectStrategy(pair, openStrategies) {
     let match = true;
 
     if (s.id === 0) {
-      // ── BOTTOM BOUNCE ──────────────────────────────────────────────────────
-      if (ch24 > s.maxCh24 || ch24 < s.minCh24) { match = false; }
-      if (ch1  < s.minCh1  || ch1 > s.maxCh1)   { match = false; }
-      if (s.minCh6 != null && ch6 < s.minCh6)   { match = false; } // 6h must also be positive
-      if (m5Ch < s.minM5Ch)                       { match = false; }
-      if (buyPct < s.minBuyPct)                   { match = false; }
-      if (liq < s.minLiq)                          { match = false; }
-      if (m5Txns < s.minM5Txns)                   { match = false; }
+      // ── BOTTOM BOUNCE — three entry paths ────────────────────────────────
+      //
+      // Path A: Classic oversold recovery — coin was falling, h1 turning up
+      // Path B: Trending pullback — uptrending coin takes a small dip (buy the dip)
+      // Path C: Steady restart — coin was flat/quiet, now starting to move up
+
+      const pathA = ch24 <= s.maxCh24           // was falling (ch24 < -5%)
+                 && ch24 >= s.minCh24            // not dead (-92% floor)
+                 && ch1 >= s.minCh1              // h1 turning positive
+                 && ch1 <= s.maxCh1              // h1 not already mooned
+                 && (s.minCh6 == null || ch6 >= s.minCh6)
+                 && m5Ch >= s.minM5Ch            // m5 stabilising
+                 && buyPct >= s.minBuyPct
+                 && liq >= s.minLiq
+                 && m5Txns >= s.minM5Txns;
+
+      // Path B: Trending coin dip — h1 uptrend + m5 small pullback (-5% to 0%)
+      const pathB = ch1 >= 2                    // confirmed uptrend (h1 > 2%)
+                 && m5Ch >= -5 && m5Ch < 0       // small momentary dip in last 5 min
+                 && buyPct >= 50                 // buyers still present
+                 && liq >= s.minLiq;
+
+      // Path C: Steady restart — coin was quiet (h6 flat), now starting to move
+      const pathC = ch6 >= -5 && ch6 <= 5       // h6 flat — coin was resting
+                 && ch1 >= 0                     // h1 not falling
+                 && m5Ch >= 0.5                  // just started moving up
+                 && buyPct >= 50
+                 && liq >= s.minLiq;
+
+      match = pathA || pathB || pathC;
+
       if (match) {
-        // Scoring: depth of drop + strength of reversal
-        score += Math.min(20, Math.abs(ch24) / 4);   // deeper drop = more potential
-        if (m5Ch > 2)   score += 15; else if (m5Ch > 0) score += 8;
-        if (buyPct > 65) score += 15; else if (buyPct > 58) score += 8;
-        if (m5Txns > 20) score += 10; else if (m5Txns > 8) score += 5;
-        if (liq > 50000) score += 8; else if (liq > 20000) score += 4;
-        if (ch1 > 0)    score += 10; // h1 already positive = confirmed reversal
-        if (volMcap > 0.3) score += 5;
-        // MC sweet spot + avg trade quality
+        if (pathA) {
+          // Classic oversold: score on depth of drop + reversal strength
+          score += Math.min(20, Math.abs(ch24) / 4);
+          if (m5Ch > 2)   score += 15; else if (m5Ch > 0) score += 8;
+          if (buyPct > 65) score += 15; else if (buyPct > 58) score += 8;
+          if (m5Txns > 20) score += 10; else if (m5Txns > 8) score += 5;
+          if (liq > 50000) score += 8; else if (liq > 20000) score += 4;
+          if (ch1 > 0)    score += 10; // confirmed reversal
+          if (volMcap > 0.3) score += 5;
+        } else if (pathB) {
+          // Trending pullback: score on uptrend strength + shallowness of dip
+          score += Math.min(15, ch1 / 2);        // stronger uptrend = more confidence
+          if (m5Ch >= -2) score += 15; else if (m5Ch >= -4) score += 8; // shallow dip better
+          if (buyPct > 60) score += 15; else if (buyPct > 50) score += 8;
+          if (liq > 50000) score += 8; else if (liq > 20000) score += 4;
+          if (m5Txns > 15) score += 10; else if (m5Txns > 5) score += 5;
+          score += 8; // structural bonus: buying a confirmed uptrend's dip
+        } else { // pathC
+          // Steady restart: score on momentum quality
+          if (m5Ch > 2)   score += 15; else if (m5Ch > 0.5) score += 8;
+          if (buyPct > 60) score += 15; else if (buyPct > 50) score += 8;
+          if (liq > 30000) score += 8; else if (liq > 15000) score += 4;
+          if (m5Txns > 10) score += 8; else if (m5Txns > 5) score += 4;
+        }
+        // Common bonuses for all paths
         if (mcSweetSpot) score += 10;
         if (avgTrade !== null) {
           if (avgTrade > 80) score += 5;
@@ -548,6 +600,8 @@ function detectStrategy(pair, openStrategies) {
       if (ch1 < s.minCh1)          { match = false; }
       if (ch1 > s.maxCh1)          { match = false; } // spike guard
       if (s.minCh6 != null && ch6 < s.minCh6) { match = false; } // 6h sustained momentum
+      // Enter quickly when momentum is live — m5 must also be positive right now
+      if (s.minM5Ch != null && m5Ch < s.minM5Ch) { match = false; }
       if (buyPct < s.minBuyPct)    { match = false; }
       if (liq < s.minLiq)          { match = false; }
       if (buys24 < s.minBuys24)    { match = false; }
@@ -2434,8 +2488,14 @@ async function monitorPositions() {
     return;
   }
 
+  // Track coins where rug emergency exit fired this tick — skip normal processing
+  const rugExitedThisTick = new Set();
+
   for (const pos of remaining_positions) {
     const isManual = !!pos.isManual;
+
+    // Skip if already emergency-exited this tick (rug on same coin, multiple positions)
+    if (rugExitedThisTick.has(pos.address)) continue;
 
     // Auto-close after 7 days
     if (Date.now() - pos.enteredAt > 7 * 86400000) {
@@ -2454,6 +2514,119 @@ async function monitorPositions() {
 
     const price = await getCurrentPrice(pos.address, pos.chain);
     if (!price || price <= 0) continue;
+
+    // ── SC RUG DETECTION ──────────────────────────────────────────────────────
+    // Surge Catch only: young coins can rug in seconds — monitor a 15s price window.
+    // 30%+ drop in 15s = rug signal.
+    //   1st signal → capital protection + tighten SL
+    //   2nd+ signal → exit ALL positions on this coin immediately
+    if (pos.strategyId === 2 && !pos.isMoonBag && !closingNow.has(pos.id)) {
+      const addr = pos.address;
+      const now  = Date.now();
+
+      // Maintain 15s rolling window in memory
+      let win = scPriceWindow.get(addr) || [];
+      win.push({ price, ts: now });
+      win = win.filter(e => now - e.ts <= SC_RUG_WINDOW_MS + 3000); // keep 18s max
+      scPriceWindow.set(addr, win);
+
+      // Need at least 4 entries (~12s) before firing to avoid early-tick false positives
+      if (win.length >= 4) {
+        // Compare to the oldest entry in the window (closest to 15s ago)
+        const refEntry = win[0];
+        const drop = refEntry.price > 0 ? (refEntry.price - price) / refEntry.price : 0;
+
+        if (drop >= SC_RUG_DROP_PCT) {
+          const prevCount  = scRugSignals.get(addr) || 0;
+          const sigCount   = prevCount + 1;
+          scRugSignals.set(addr, sigCount);
+          console.log(`[RUG] ${pos.symbol} signal #${sigCount}: ${(drop*100).toFixed(0)}% drop in ${Math.round((now - refEntry.ts)/1000)}s`);
+
+          if (sigCount >= SC_RUG_EXIT_CNT) {
+            // ── EMERGENCY EXIT — all positions on this coin ──────────────────
+            const allOnCoin = remaining_positions.filter(p =>
+              p.address === addr && !closingNow.has(p.id) && !rugExitedThisTick.has(p.address)
+            );
+            rugExitedThisTick.add(addr);
+            scPriceWindow.delete(addr);
+            scRugSignals.delete(addr);
+
+            for (const rugPos of allOnCoin) {
+              if (closingNow.has(rugPos.id)) continue;
+              closingNow.add(rugPos.id);
+              try {
+                const rugFill  = rugPos.tradingMode === 'paper'
+                  ? simulateFillPrice(price, rugPos.size * rugPos.remaining, rugPos.liquidityAtEntry || 0, false)
+                  : price;
+                const rugGain  = (rugFill - rugPos.entryPrice) / rugPos.entryPrice;
+                const rugPnL   = rugGain * rugPos.size * rugPos.remaining + (rugPos.pnl || 0);
+                await closePosition(rugPos.id, { exitPrice: rugFill, exitReason: 'RUG_EMERGENCY', pnl: rugPnL });
+                await updateDailyStats(rugPnL, false, rugPos.isManual || false,
+                  calcExitFeeUsd(rugPos, price, rugFill, rugPos.remaining));
+                await sendTelegram(
+                  `🚨 *RUG EMERGENCY EXIT*\n\n` +
+                  `*${rugPos.symbol}* ${rugPos.strategyLabel}\n` +
+                  `📉 *${(drop*100).toFixed(0)}% crash in ${Math.round((now - refEntry.ts)/1000)}s* (signal #${sigCount})\n` +
+                  `📥 Entry: $${fmtPrice(rugPos.entryPrice)} → Exit: $${fmtPrice(rugFill)}\n` +
+                  `💸 P&L: *${rugPnL >= 0 ? '+' : ''}$${rugPnL.toFixed(2)}*\n🔗 [Chart](${rugPos.dexUrl})`
+                );
+              } finally {
+                closingNow.delete(rugPos.id);
+              }
+            }
+            continue; // skip normal processing for this pos (already closed)
+
+          } else {
+            // ── SIGNAL #1: capital protection + tighten SL ──────────────────
+            const capUpdates = {};
+            if (!pos.capitalWithdrawn && pos.remaining > 0.01) {
+              const totalRecovered = pos.recoveredAmount || 0;
+              const stillNeeded    = pos.size - totalRecovered;
+              if (stillNeeded > 0.01) {
+                const rugFill    = pos.tradingMode === 'paper'
+                  ? simulateFillPrice(price, pos.size * pos.remaining, pos.liquidityAtEntry || 0, false)
+                  : price;
+                const rugFillGain = (rugFill - pos.entryPrice) / pos.entryPrice;
+                const curValue   = pos.remaining * pos.size * (price / pos.entryPrice);
+                const capFrac    = Math.min(pos.remaining, stillNeeded / curValue);
+                const proceeds   = capFrac * pos.size * (rugFill / pos.entryPrice);
+                const partPnL    = rugFillGain * pos.size * capFrac;
+                capUpdates.capitalWithdrawn     = true;
+                capUpdates.capitalWithdrawPrice = price;
+                capUpdates.remaining            = pos.remaining - capFrac;
+                capUpdates.recoveredAmount      = totalRecovered + proceeds;
+                capUpdates.pnl                  = (pos.pnl || 0) + partPnL;
+                capUpdates.tpDisabled           = true;
+                await updateDailyStats(partPnL, true, isManual,
+                  calcExitFeeUsd(pos, price, rugFill, capFrac));
+              } else {
+                capUpdates.capitalWithdrawn     = true;
+                capUpdates.capitalWithdrawPrice = price;
+                capUpdates.tpDisabled           = true;
+              }
+            }
+            // Tighten SL to current price × 0.90 (10% buffer) — above existing SL
+            const tightenedSL = price * 0.90;
+            if (tightenedSL > (pos.currentSL || 0)) {
+              capUpdates.currentSL      = tightenedSL;
+              capUpdates.trailingActive = true;
+            }
+            if (Object.keys(capUpdates).length > 0) {
+              await updatePosition(pos.id, capUpdates);
+              Object.assign(pos, capUpdates);
+            }
+            await sendTelegram(
+              `⚠️ *RUG SIGNAL #1 — ${pos.symbol}*\n\n` +
+              `📉 *${(drop*100).toFixed(0)}% drop in ${Math.round((now - refEntry.ts)/1000)}s*\n` +
+              `🛡️ Capital protection applied\n` +
+              `🛑 SL tightened to $${fmtPrice(price * 0.90)} (10% buffer)\n` +
+              `⚠️ *One more signal = emergency exit*\n🔗 [Chart](${pos.dexUrl})`
+            );
+          }
+        }
+      }
+    }
+    // ── END SC RUG DETECTION ──────────────────────────────────────────────────
 
     // Store currentPrice in Firestore so dashboard doesn't depend on browser-side DexScreener fetch.
     // Only write when price moved ≥ 0.5% to limit Firestore writes.
@@ -3019,7 +3192,7 @@ async function fetchTrendingAddrs() {
 
   const fresh = new Map();
 
-  // ── Platform 1: pump.fun — top 200 most recently traded coins ──────────────
+  // ── Platform 1a: pump.fun — top 200 most recently traded coins ─────────────
   try {
     const r = await httpGet(
       'frontend-api.pump.fun',
@@ -3031,8 +3204,24 @@ async function fetchTrendingAddrs() {
       const addr = (c.mint || '').toLowerCase();
       if (addr) fresh.set(addr, (fresh.get(addr) || 0) + 1);
     }
-    console.log(`[TRENDING] pump.fun: ${list.length} trending coins`);
-  } catch(e) { console.log(`[TRENDING] pump.fun error: ${e.message}`); }
+    console.log(`[TRENDING] pump.fun (recent): ${list.length} coins`);
+  } catch(e) { console.log(`[TRENDING] pump.fun (recent) error: ${e.message}`); }
+
+  // ── Platform 1b: pump.fun movers — top 100 by market cap (most active SC pool)
+  // These are the coins with the most momentum — Surge Catch hunts from this list.
+  try {
+    const r = await httpGet(
+      'frontend-api.pump.fun',
+      '/coins?offset=0&limit=100&sort=market_cap&order=DESC'
+    );
+    const coins = JSON.parse(r.body);
+    const list  = Array.isArray(coins) ? coins : [];
+    for (const c of list) {
+      const addr = (c.mint || '').toLowerCase();
+      if (addr) fresh.set(addr, (fresh.get(addr) || 0) + 1); // counts as extra trending hit
+    }
+    console.log(`[TRENDING] pump.fun (movers/mcap): ${list.length} coins`);
+  } catch(e) { console.log(`[TRENDING] pump.fun (movers) error: ${e.message}`); }
 
   // ── Platform 2: Birdeye — top 200 trending tokens on Solana ─────────────────
   const birdeyeKey = process.env.BIRDEYE_KEY || '';
