@@ -1411,9 +1411,11 @@ async function getDailyStats() {
   const today  = new Date().toISOString().slice(0, 10);
   const { stats } = await getCollections();
   const doc    = await db.collection(stats).doc(today).get();
-  // Use paperBalance from config if set; fall back to env-based default
-  const cfg    = await getTradingConfig();
-  const expectedBalance = parseFloat(cfg.paperBalance || 0) || (POSITION_SIZE * MAX_POSITIONS);
+  // Portfolio = positionSize × maxPositions (fixed formula — no manual topping up needed)
+  // $100 × 20 = $2,000 every day, regardless of paperBalance or /addfunds history
+  const cfg         = await getTradingConfig();
+  const posSize     = parseFloat(cfg.positionSize) || POSITION_SIZE;
+  const expectedBalance = posSize * MAX_POSITIONS;
   if (!doc.exists) {
     const init = {
       date: today, startBalance: expectedBalance,
