@@ -415,16 +415,16 @@ function detectStrategy(pair, openStrategies) {
   const dexId      = pair.dexId || '';
   const isPumpFun  = dexId === 'pump-fun';
 
-  // UNIVERSAL MINIMUM AGE: 60 minutes for ALL tokens (pump.fun or otherwise).
-  // Coins under 60 min are in their most volatile phase — initial hype spike,
-  // then immediate dump. Even a perfect-looking score at 12 min can hit SL in seconds.
-  // 60 min also eliminates YOUNG COIN MODE (< 60 min special exits), so all trades
-  // use the standard TP1/TP2/TP3 targets which are better calibrated for real moves.
-  if (ageMinutes < 60) return null;
+  // UNIVERSAL AGE RANGE: 1 minute minimum to 2 hours maximum (enforced by strategy filters).
+  // SC covers the infant surge window (1 min – 2h); AM covers the established momentum
+  // window (2h+). The 1-min floor just prevents millisecond-old garbage from slipping in.
+  // Rising-momentum gate (m5Ch + priceHistory) is the real protection against volatile
+  // early entries — a surging coin at 15 min is a valid SC target.
+  if (ageMinutes < 1) return null;
 
-  // PUMP.FUN YOUNG COIN extra requirements (60–90 min): minimal rug floor + buy pressure
-  // (age < 60 already blocked above, so this only applies between 60–90 min)
-  // Relaxed to match SC filters — SC's anti-manipulation checks are the real safety net
+  // PUMP.FUN YOUNG COIN extra requirements (1–90 min): minimal rug floor + buy pressure.
+  // These are the riskiest coins — ensure basic liquidity and genuine buy pressure.
+  // Relaxed thresholds: SC's anti-manipulation checks are the primary safety net.
   if (isPumpFun && ageMinutes < 90 && liq < 5000) return null;
   if (isPumpFun && ageMinutes < 90 && buyPct < 55)  return null;
 
@@ -3227,7 +3227,28 @@ async function fetchTrendingAddrs() {
     console.log(`[TRENDING] pump.fun (movers/mcap): ${list.length} coins`);
   } catch(e) { console.log(`[TRENDING] pump.fun (movers) error: ${e.message}`); }
 
-  // ── Platform 2: Birdeye — top 200 trending tokens on Solana ─────────────────
+  // ── Platform 2: DexScreener — latest new token profiles (infant surge feed) ──
+  // /token-profiles/latest/v1 surfaces newly listed tokens — these are the coins
+  // that appear in "New Trending" screener views (coins 10–90 min old with explosive
+  // early momentum). Perfect pool for Surge Catch to hunt from.
+  try {
+    const r = await httpGet(
+      'api.dexscreener.com',
+      '/token-profiles/latest/v1'
+    );
+    const profiles = JSON.parse(r.body);
+    const list = Array.isArray(profiles) ? profiles : [];
+    let added = 0;
+    for (const p of list) {
+      // Only Solana tokens
+      if ((p.chainId || '').toLowerCase() !== 'solana') continue;
+      const addr = (p.tokenAddress || '').toLowerCase();
+      if (addr) { fresh.set(addr, (fresh.get(addr) || 0) + 1); added++; }
+    }
+    console.log(`[TRENDING] DexScreener new profiles: ${added} Solana tokens`);
+  } catch(e) { console.log(`[TRENDING] DexScreener new profiles error: ${e.message}`); }
+
+  // ── Platform 3: Birdeye — top 200 trending tokens on Solana ─────────────────
   const birdeyeKey = process.env.BIRDEYE_KEY || '';
   if (birdeyeKey) {
     try {
@@ -3249,7 +3270,7 @@ async function fetchTrendingAddrs() {
   }
 
   trendingAddrs = fresh;
-  console.log(`[TRENDING] Cache updated: ${fresh.size} unique trending addrs (pump.fun + Birdeye)`);
+  console.log(`[TRENDING] Cache updated: ${fresh.size} unique trending addrs (pump.fun + DexScreener new + Birdeye)`);
 }
 
 // ─── SCANNER ─────────────────────────────────────────────────────────────────
