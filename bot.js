@@ -3414,6 +3414,34 @@ async function scanForEntries() {
   const trendingTotal = scanTrendingMap.size;
   if (trendingTotal > 0) console.log(`[TRENDING] ${trendingTotal} addrs in merged map (${dexBoostAddrs.size} DexBoost + pump.fun + Birdeye)`);
 
+  // ── Trending-feed candidates (SC/AM primary source) ───────────────────────────
+  // Addresses in the trending map that weren't caught by keyword/boost/volume sweep
+  // are fetched directly from DexScreener and added to candidates.
+  // This is how infant coins (10–90 min, no keyword match, no boost, low daily vol)
+  // actually reach detectStrategy() — without this, they score-boost coins they never meet.
+  // Limit: 100 addresses per scan to stay within rate limits (~8 s at 80 ms/req).
+  {
+    const trendOnlyAddrs = [...scanTrendingMap.keys()]
+      .filter(a => !seen.has(a))
+      .slice(0, 100);
+    if (trendOnlyAddrs.length > 0) {
+      console.log(`[TRENDING] Fetching ${trendOnlyAddrs.length} trending addrs not in keyword/boost pool`);
+      let fetched = 0;
+      for (const ta of trendOnlyAddrs) {
+        try {
+          const r = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${ta}`);
+          const d = JSON.parse(r.body);
+          for (const p of (d.pairs || []).slice(0, 2)) {
+            const a = p.baseToken?.address || '';
+            if (a && !seen.has(a)) { seen.add(a); candidates.push(p); fetched++; }
+          }
+        } catch(e) {}
+        await sleep(80);
+      }
+      console.log(`[TRENDING] Added ${fetched} new candidates from trending feeds`);
+    }
+  }
+
   // Clean up expired SL blocks (older than 6h)
   const nowTs = Date.now();
   for (const [addr, ts] of recentSLCoins) {
