@@ -2499,7 +2499,8 @@ async function monitorPositions() {
     enteredToday.delete(pos.address);
     await sendTelegram(
       `🚫 *MANUAL CLOSE*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-      `Exit: $${fmtPrice(exitFillPriceManual)} | P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*`
+      `${fmtTradeResult(pos.size, pnl)}\n` +
+      `📥 Exit price: $${fmtPrice(exitFillPriceManual)}\n🔗 [Chart](${pos.dexUrl})`
     );
   }
 
@@ -2518,7 +2519,7 @@ async function monitorPositions() {
         const exitPnl = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
         const pnl     = (pos.pnl || 0) + exitPnl;
         await closePosition(pos.id, { exitPrice: price, exitReason: 'DAILY_LIMIT', pnl });
-        await sendTelegram(`🚨 *DAILY LOSS LIMIT*\n*${pos.symbol}* closed. P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
+        await sendTelegram(`🚨 *DAILY LOSS LIMIT*\n*${pos.symbol}* ${pos.strategyLabel}\n${fmtTradeResult(pos.size, pnl)}`);
       }
       const lostPct = Math.abs((stats.realizedPnL / stats.startBalance) * 100).toFixed(1);
       await sendTelegram(
@@ -2552,7 +2553,7 @@ async function monitorPositions() {
       const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
       await closePosition(pos.id, { exitPrice: exitFillPriceExp, exitReason: 'EXPIRED', pnl });
       await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPriceExp, pos.remaining));
-      await sendTelegram(`⏰ *EXPIRED* — *${pos.symbol}*\nExit: $${fmtPrice(exitFillPriceExp)} | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
+      await sendTelegram(`⏰ *EXPIRED* — *${pos.symbol}* ${pos.strategyLabel}\n${fmtTradeResult(pos.size, pnl)}\n📥 Exit: $${fmtPrice(exitFillPriceExp)}\n🔗 [Chart](${pos.dexUrl})`);
       enteredToday.delete(pos.address);
       continue;
     }
@@ -2613,7 +2614,7 @@ async function monitorPositions() {
                   `*${rugPos.symbol}* ${rugPos.strategyLabel}\n` +
                   `📉 *${(drop*100).toFixed(0)}% crash in ${Math.round((now - refEntry.ts)/1000)}s* (signal #${sigCount})\n` +
                   `📥 Entry: $${fmtPrice(rugPos.entryPrice)} → Exit: $${fmtPrice(rugFill)}\n` +
-                  `💸 P&L: *${rugPnL >= 0 ? '+' : ''}$${rugPnL.toFixed(2)}*\n🔗 [Chart](${rugPos.dexUrl})`
+                  `${fmtTradeResult(rugPos.size, rugPnL)}\n🔗 [Chart](${rugPos.dexUrl})`
                 );
               } finally {
                 closingNow.delete(rugPos.id);
@@ -2868,7 +2869,7 @@ async function monitorPositions() {
           `*${pos.symbol}* ${pos.strategyLabel}\n` +
           `📉 Dropped *${dropPct}%* from peak in one tick\n` +
           `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
-          `📊 P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*\n🔗 [Chart](${pos.dexUrl})`
+          `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})`
         );
         console.log(`[BOT] RUG_DETECTED ${pos.symbol}: peak $${fmtPrice(currentPeak)} → now $${fmtPrice(price)} (${dropPct}%)`);
       } finally {
@@ -2893,7 +2894,7 @@ async function monitorPositions() {
           `*${pos.symbol}* ${pos.strategyLabel}\n` +
           `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
           `🛑 SL: $${fmtPrice(pos.currentSL)} | Trail: ${pos.capitalWithdrawn && pos.capitalWithdrawPrice ? calcProfitTrail((price - pos.capitalWithdrawPrice) / pos.capitalWithdrawPrice * 100).toFixed(1) : (pos.strategyId === 0 ? calcBBTrail(gainPct) : pos.strategyId === 3 ? calcORTrail(gainPct) : calcTrailPct(pos.initialTrailPct, gainPct)).toFixed(1)}%\n` +
-          `📊 P&L: *${pnl>=0?'+':''}$${pnl.toFixed(2)}*\n🔗 [Chart](${pos.dexUrl})`
+          `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})`
         );
       } finally {
         closingNow.delete(pos.id);
@@ -3111,9 +3112,10 @@ async function monitorPositions() {
         await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason:'TP3', pnl: (pos.pnl || 0) + partPnL });
         await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
         enteredToday.delete(pos.address);
+        const tp3TotalPnl = (pos.pnl || 0) + partPnL;
         await sendTelegram(`🏆 *TP3 — FULL EXIT*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
           `Entry: $${fmtPrice(pos.entryPrice)} → $${fmtPrice(exitFillPrice)}\n` +
-          `💰 Final: +$${partPnL.toFixed(2)}\n🔗 [Chart](${pos.dexUrl})`);
+          `${fmtTradeResult(pos.size, tp3TotalPnl)}\n🔗 [Chart](${pos.dexUrl})`);
         continue;
       }
     }
@@ -3920,6 +3922,16 @@ function fmtPrice(p) {
   if (p < 0.000001) return p.toExponential(3);
   if (p < 0.01)     return p.toPrecision(4);
   return p.toFixed(4);
+}
+
+// Trade result summary: "💵 Entered $100.00 → Returned $102.40 (+$2.40, +2.4%)"
+// Used in every final-close notification so the user can see at a glance
+// what they put in and what came back (or didn't).
+function fmtTradeResult(size, totalPnl) {
+  const returned = size + totalPnl;
+  const pct      = size > 0 ? (totalPnl / size * 100) : 0;
+  const sign     = totalPnl >= 0 ? '+' : '';
+  return `💵 Entered $${size.toFixed(2)} → Returned $${returned.toFixed(2)} (${sign}$${totalPnl.toFixed(2)}, ${sign}${pct.toFixed(1)}%)`;
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
