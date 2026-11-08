@@ -28,7 +28,7 @@ const TELEGRAM_CHAT   = (process.env.TELEGRAM_CHAT_ID   || process.env.TELEGRAM_
 const POSITION_SIZE   = parseFloat(process.env.POSITION_SIZE || '100');
 const MAX_POSITIONS   = 20;
 const SURGE_RESERVED  = 5;   // last 5 slots reserved for Surge Catch (id 2) only
-const MIN_SCORE       = 55;  // quality threshold — only confident entries (Oct-27 baseline was 60)
+const MIN_SCORE       = 35;  // Nov-5 baseline — wider entry net; reverted from 55
 
 // ── STRATEGY FILTER SWITCH ────────────────────────────────────────────────────
 // true  = all per-strategy filters active (normal operation — Oct-27 baseline)
@@ -186,15 +186,14 @@ const STRATEGIES = [
     maxSlots: 20, // unlimited — competes openly for global slots with id 1 and id 3
     desc: 'Oversold token reversing from its bottom',
     // ── Entry criteria ──
-    maxCh24: -5,        // was falling — 24h must be negative (e.g. -5% to -92%; lowered to catch early-stage dips)
+    maxCh24: -10,       // was falling — 24h must be negative (Nov-5 baseline)
     minCh24: -92,
     maxCh1: 5,          // h1 not still crashing (< +5% = hasn't mooned yet)
-    minCh1: 0,          // h1 must be positive — ascending recovery confirmed
-    minCh6: -50,        // h6 allowed down to -50% — h1 + m5 confirm the actual turn
+    minCh1: -20,        // h1 not in freefall — allows entry during early recovery (Nov-5 baseline)
     minM5Ch: -0.5,      // m5 stabilising or turning green
     minBuyPct: 55,      // buyers coming in
-    minLiq: 15000,      // Oct-27 baseline — genuine bounce needs real liquidity
-    minM5Txns: 5,       // real bounce needs real tx flow
+    minLiq: 15000,
+    minM5Txns: 3,       // activity picking up (Nov-5 baseline)
     // ── TP / SL (standard 3-step) ──
     tp1x: 1.25, tp2x: 1.55, tp3x: 2.10,
     slx: 0.87,
@@ -206,13 +205,12 @@ const STRATEGIES = [
     maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 3
     desc: 'Price ticking every 5-15 min — strong live activity',
     // ── Entry criteria ──
-    minAgeDays: 1/12,  // 2 hours+ only — SC handles infant coins (0–2h), AM takes over after
-    maxAgeDays: 7,     // discovery-phase opening — widen to 7 days; tighten per-strategy once all 4 appear
-    minM5Ch: 1,        // must be moving positively right now — not entering on a stall
-    minM5Txns: 10,     // discovery-phase opening — lowered from 15; tighten once AM is confirmed active
-    minBuyPct: 55,     // buyers must be in control
-    minCh1: 3,         // h1 momentum confirmed — coin is genuinely moving up
-    minLiq: 10000,     // liquidity floor — $10k minimum
+    maxAgeDays: 3,       // young, active coins (Nov-5 baseline)
+    minM5Ch: 1.0,        // at least +1% in last 5 min — MUST be going UP
+    minM5Txns: 15,       // busy last 5 min (Nov-5 baseline)
+    minBuyPct: 55,
+    minCh1: 3,           // positive h1 trend
+    minLiq: 8000,        // Nov-5 baseline
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.50, tp2x: 2.50, tp3x: 5.00,
     slx: 0.80,
@@ -227,12 +225,11 @@ const STRATEGIES = [
     // ── Entry criteria — use m5 as primary signal, not h1 ──
     // h1 is a lagging indicator — the surge may already be over by then
     // m5 catches it while it's still happening
-    maxAgeDays: 2,     // discovery-phase opening — 48h window; tighten back to 24h once SC confirms active
-    minM5Ch: 3,        // must be actively surging in last 5 min — not just age-qualified
-    minM5Txns: 20,     // very high activity — Oct-27 baseline (was 15)
-    minCh1: 5,         // h1 already positive — surge has already started
-    minBuyPct: 58,     // buyers must dominate — surge needs buy pressure
-    minLiq: 5000,      // rug floor — $5k minimum for infant coins
+    minM5Ch: 3,          // up 3%+ in last 5 min — actively surging NOW
+    minM5Txns: 20,       // very high activity in last 5 min
+    minCh1: 3,           // h1 positive (confirming uptrend) (Nov-5 baseline)
+    minBuyPct: 58,       // buyers still in control
+    minLiq: 4000,        // low bar — new coins surge fast (Nov-5 baseline)
     // ── TP / SL (quick first profit, trail the rest) ──
     tp1x: 1.25, tp2x: 1.80, tp3x: 3.50,
     slx: 0.82,
@@ -247,11 +244,11 @@ const STRATEGIES = [
     // ── Entry criteria ──
     minAgeDays: 15,      // the defining characteristic of OR — established coins only
     minCh24: 3,          // 24h must be POSITIVE — recovery already confirmed (Oct-27 baseline)
-    minCh1: 1,           // h1 also positive — still climbing right now
-    maxCh1: 15,          // h1 spike guard — not already mooned before we enter
-    minBuyPct: 50,       // buyers in control — minimum viable signal
-    minLiq: 20000,       // discovery-phase opening — lowered from $60k; tighten once OR confirms active
-    minBuys24: 20,       // discovery-phase opening — lowered from 50; tighten once OR confirms active
+    minCh1: 0.5,         // positive h1 (still climbing) (Nov-5 baseline)
+    maxCh1: 30,          // not a sudden spike — steady recovery (Nov-5 baseline)
+    minBuyPct: 50,
+    minLiq: 80000,       // established = decent liquidity (Nov-5 baseline)
+    minBuys24: 50,       // Nov-5 baseline
     // ── TP / SL (conservative) ──
     tp1x: 1.12, tp2x: 1.30, tp3x: 1.65,
     slx: 0.92,
