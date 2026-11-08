@@ -436,6 +436,13 @@ function detectStrategy(pair, openStrategies) {
   const dexId      = pair.dexId || '';
   const isPumpFun  = dexId === 'pump-fun';
 
+  // ── ACTIVITY RECENCY GATE ────────────────────────────────────────────────────
+  // The coin must be actively trading RIGHT NOW — not stale or sleeping.
+  // m5Txns = number of transactions in the last 5 minutes (DexScreener).
+  // Zero transactions in 5 minutes means the coin has gone quiet — skip it.
+  // Even 1-2 transactions confirms the coin is live; scoring rewards higher activity.
+  if (!m5Txns || m5Txns < 1) return null;
+
   // ── GRADUATED-ONLY GATE ───────────────────────────────────────────────────────
   // Only trade coins that have completed the pump.fun bonding curve and migrated
   // to Raydium (or any other DEX). Un-graduated pump.fun coins are pre-migration,
