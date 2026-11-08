@@ -207,9 +207,9 @@ const STRATEGIES = [
     desc: 'Price ticking every 5-15 min — strong live activity',
     // ── Entry criteria ──
     minAgeDays: 1/12,  // 2 hours+ only — SC handles infant coins (0–2h), AM takes over after
-    maxAgeDays: 3,     // 3-day cap — young, active coins only (Oct-27 baseline)
+    maxAgeDays: 7,     // discovery-phase opening — widen to 7 days; tighten per-strategy once all 4 appear
     minM5Ch: 1,        // must be moving positively right now — not entering on a stall
-    minM5Txns: 15,     // busy last 5 min — Oct-27 baseline (was 10)
+    minM5Txns: 10,     // discovery-phase opening — lowered from 15; tighten once AM is confirmed active
     minBuyPct: 55,     // buyers must be in control
     minCh1: 3,         // h1 momentum confirmed — coin is genuinely moving up
     minLiq: 10000,     // liquidity floor — $10k minimum
@@ -227,7 +227,7 @@ const STRATEGIES = [
     // ── Entry criteria — use m5 as primary signal, not h1 ──
     // h1 is a lagging indicator — the surge may already be over by then
     // m5 catches it while it's still happening
-    maxAgeDays: 1,     // 24 hours max — catches recently graduated coins (graduation at 1–4h, surge follows)
+    maxAgeDays: 2,     // discovery-phase opening — 48h window; tighten back to 24h once SC confirms active
     minM5Ch: 3,        // must be actively surging in last 5 min — not just age-qualified
     minM5Txns: 20,     // very high activity — Oct-27 baseline (was 15)
     minCh1: 5,         // h1 already positive — surge has already started
@@ -250,8 +250,8 @@ const STRATEGIES = [
     minCh1: 1,           // h1 also positive — still climbing right now
     maxCh1: 15,          // h1 spike guard — not already mooned before we enter
     minBuyPct: 50,       // buyers in control — minimum viable signal
-    minLiq: 60000,       // established coin floor — Oct-27 was $80k, restored to $60k
-    minBuys24: 50,       // real 24h buyer activity — Oct-27 baseline (was 20)
+    minLiq: 20000,       // discovery-phase opening — lowered from $60k; tighten once OR confirms active
+    minBuys24: 20,       // discovery-phase opening — lowered from 50; tighten once OR confirms active
     // ── TP / SL (conservative) ──
     tp1x: 1.12, tp2x: 1.30, tp3x: 1.65,
     slx: 0.92,
