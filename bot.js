@@ -3362,8 +3362,13 @@ async function scanForEntries() {
   if (vacantSlots >= 5) {
     keywords.push('eth','avax','bonk','wif','trump','bitcoin','hot','fire','gem','100x');
   }
-  const seen = new Set();
-  const candidates    = [];
+  const seen        = new Set();
+  const candidates  = [];
+  // raydiumSeen tracks token addresses for which we already have a *Raydium pair*
+  // in candidates. Used to prevent the `seen` check from blocking the trending section
+  // from fetching the Raydium pair of a graduated coin that appeared earlier as a
+  // pump.fun pair (same token address → same `seen` entry, different pair).
+  const raydiumSeen   = new Set();
   const dexBoostAddrs = new Set(); // DexScreener boosted token addresses — merged into trending map below
 
   for (const kw of keywords) {
@@ -3372,7 +3377,10 @@ async function scanForEntries() {
       const d = JSON.parse(r.body);
       for (const p of (d.pairs || [])) {
         const addr = p.baseToken?.address || '';
-        if (!seen.has(addr)) { seen.add(addr); candidates.push(p); }
+        if (!seen.has(addr)) {
+          seen.add(addr); candidates.push(p);
+          if (p.dexId === 'raydium') raydiumSeen.add(addr);
+        }
       }
     } catch(e) {}
     await sleep(200);
@@ -3384,7 +3392,10 @@ async function scanForEntries() {
     const d = JSON.parse(r.body);
     for (const p of (d.pairs || [])) {
       const addr = p.baseToken?.address || '';
-      if (!seen.has(addr)) { seen.add(addr); candidates.push(p); }
+      if (!seen.has(addr)) {
+        seen.add(addr); candidates.push(p);
+        if (p.dexId === 'raydium') raydiumSeen.add(addr);
+      }
     }
   } catch(e) {}
 
@@ -3412,8 +3423,13 @@ async function scanForEntries() {
           const d2 = JSON.parse(r2.body);
           for (const p2 of (d2.pairs || []).slice(0, 2)) {
             const a2 = p2.baseToken?.address || '';
-            if (a2 && !seen.has(a2)) { seen.add(a2); candidates.push(p2); }
-            else if (a2 === addr) candidates.push(p2); // include even if addr already seen (different pair)
+            if (a2 && !seen.has(a2)) {
+              seen.add(a2); candidates.push(p2);
+              if (p2.dexId === 'raydium') raydiumSeen.add(a2);
+            } else if (a2 === addr) {
+              candidates.push(p2); // include even if addr already seen (different pair)
+              if (p2.dexId === 'raydium') raydiumSeen.add(a2);
+            }
           }
         } catch(e) {}
         await sleep(80); // rate limit — DexScreener allows ~10 req/s
@@ -3434,7 +3450,10 @@ async function scanForEntries() {
       .slice(0, 30);
     for (const p of topPairs) {
       const a = p.baseToken?.address || '';
-      if (a && !seen.has(a)) { seen.add(a); candidates.push(p); }
+      if (a && !seen.has(a)) {
+        seen.add(a); candidates.push(p);
+        if (p.dexId === 'raydium') raydiumSeen.add(a);
+      }
     }
     console.log(`[SCAN] Top-volume sweep: ${topPairs.length} Solana pairs (vol > $50k)`);
   } catch(e) { console.log(`[SCAN] Top-volume sweep error: ${e.message}`); }
@@ -3454,12 +3473,35 @@ async function scanForEntries() {
       .slice(0, 50);
     for (const p of orPairs) {
       const a = p.baseToken?.address || '';
-      if (a && !seen.has(a)) { seen.add(a); candidates.push(p); }
+      if (a && !seen.has(a)) {
+        seen.add(a); candidates.push(p);
+        if (p.dexId === 'raydium') raydiumSeen.add(a);
+      }
     }
     console.log(`[SCAN] OR sweep: ${orPairs.length} high-liq Solana pairs (liq ≥ $50k)`);
   } catch(e) { console.log(`[SCAN] OR sweep error: ${e.message}`); }
 
-  console.log(`[SCAN] Fetched ${candidates.length} unique candidates via ${keywords.length} keywords + boosts + vol sweep`);
+  // ── Raydium Active Pairs Sweep (Fix 2: direct Raydium candidate pool) ────────
+  // Keywords return ~30 results sorted by DexScreener relevance — mostly pump.fun
+  // pre-graduation coins. This sweep re-queries with broader terms and filters
+  // CLIENT-SIDE to Raydium only, sorted by 1h volume so the most active Raydium
+  // coins (SC/AM/BB targets) come first. Covers graduated coins that don't match
+  // any meme keyword and wouldn't appear in the trending feeds.
+  const rayActiveQueries = ['sol', 'meme', 'coin'];
+  for (const rq of rayActiveQueries) {
+    try {
+      const rRay = await httpGet('api.dexscreener.com', `/latest/dex/search?q=${rq}`);
+      const dRay = JSON.parse(rRay.body);
+      const rayPairs = (dRay.pairs || [])
+        .filter(p => p.chainId === 'solana' && p.dexId === 'raydium' && !raydiumSeen.has(p.baseToken?.address || ''));
+      for (const p of rayPairs) {
+        const a = p.baseToken?.address || '';
+        if (a) { seen.add(a); raydiumSeen.add(a); candidates.push(p); }
+      }
+    } catch(e) {}
+    await sleep(200);
+  }
+  console.log(`[SCAN] Fetched ${candidates.length} unique candidates via ${keywords.length} keywords + boosts + vol sweep + Raydium sweep (${raydiumSeen.size} Raydium pairs)`);
 
   // ── Trending cross-reference ──────────────────────────────────────────────
   // Merge pump.fun + Birdeye (refreshed every 5 min) with DexScreener boosts
@@ -3476,33 +3518,71 @@ async function scanForEntries() {
   if (trendingTotal > 0) console.log(`[TRENDING] ${trendingTotal} addrs in merged map (${dexBoostAddrs.size} DexBoost + pump.fun + Birdeye)`);
 
   // ── Trending-feed candidates (SC/AM primary source) ───────────────────────────
-  // Addresses in the trending map that weren't caught by keyword/boost/volume sweep
-  // are fetched directly from DexScreener and added to candidates.
-  // This is how infant coins (10–90 min, no keyword match, no boost, low daily vol)
-  // actually reach detectStrategy() — without this, they score-boost coins they never meet.
-  // Limit: 100 addresses per scan to stay within rate limits (~8 s at 80 ms/req).
+  // Split into two passes to fix the graduated-coin blind spot (Fix 1):
+  //
+  // PASS 1 — Raydium graduates (pump.fun raydium_pool set → weight ≥ 5):
+  //   These are the coins SC and AM are hunting. The bug: a graduated coin may have
+  //   appeared earlier in keyword results as its pump.fun pair (same token address →
+  //   same `seen` entry), causing the trending section to skip it and never fetch its
+  //   Raydium pair. Fix: filter PASS 1 by `raydiumSeen` (not `seen`), so we skip only
+  //   coins whose Raydium pair is already in candidates. For each one, fetch DexScreener
+  //   and pick the Raydium pair specifically — the pump.fun pair is ignored.
+  //
+  // PASS 2 — other trending (Birdeye, DexBoost, non-graduated) not yet seen.
+  //   Original logic: filter by `seen`, take first 2 pairs as before.
   {
-    const trendOnlyAddrs = [...scanTrendingMap.entries()]
-      .sort((a, b) => b[1] - a[1])          // highest weight first — Raydium graduates (weight 5+) lead
+    const gradAddrs = [...scanTrendingMap.entries()]
+      .filter(([, w]) => w >= 5)
+      .sort((a, b) => b[1] - a[1])
       .map(([addr]) => addr)
-      .filter(a => !seen.has(a))
-      .slice(0, 100);
-    if (trendOnlyAddrs.length > 0) {
-      const gradLeaders = trendOnlyAddrs.filter(a => (scanTrendingMap.get(a) || 0) >= 5).length;
-      console.log(`[TRENDING] Fetching ${trendOnlyAddrs.length} addrs (${gradLeaders} Raydium graduates at front)`);
+      .filter(a => !raydiumSeen.has(a))   // skip only if Raydium pair already in candidates
+      .slice(0, 50);
+
+    const otherAddrs = [...scanTrendingMap.entries()]
+      .filter(([, w]) => w < 5)
+      .sort((a, b) => b[1] - a[1])
+      .map(([addr]) => addr)
+      .filter(a => !seen.has(a))           // original behaviour for non-graduated
+      .slice(0, 50);
+
+    const totalFetch = gradAddrs.length + otherAddrs.length;
+    if (totalFetch > 0) {
+      console.log(`[TRENDING] Fetching ${totalFetch} addrs (${gradAddrs.length} Raydium graduates + ${otherAddrs.length} other trending)`);
       let fetched = 0;
-      for (const ta of trendOnlyAddrs) {
+
+      // Pass 1: graduated coins — look for Raydium pair specifically
+      for (const ta of gradAddrs) {
+        try {
+          const r = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${ta}`);
+          const d = JSON.parse(r.body);
+          const raydiumPair = (d.pairs || []).find(p => p.dexId === 'raydium');
+          if (raydiumPair) {
+            const a = raydiumPair.baseToken?.address || '';
+            if (a && !raydiumSeen.has(a)) {
+              seen.add(a); raydiumSeen.add(a); candidates.push(raydiumPair); fetched++;
+            }
+          }
+        } catch(e) {}
+        await sleep(80);
+      }
+
+      // Pass 2: non-graduated trending — original behaviour
+      for (const ta of otherAddrs) {
         try {
           const r = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${ta}`);
           const d = JSON.parse(r.body);
           for (const p of (d.pairs || []).slice(0, 2)) {
             const a = p.baseToken?.address || '';
-            if (a && !seen.has(a)) { seen.add(a); candidates.push(p); fetched++; }
+            if (a && !seen.has(a)) {
+              seen.add(a); candidates.push(p); fetched++;
+              if (p.dexId === 'raydium') raydiumSeen.add(a);
+            }
           }
         } catch(e) {}
         await sleep(80);
       }
-      console.log(`[TRENDING] Added ${fetched} new candidates from trending feeds`);
+
+      console.log(`[TRENDING] Added ${fetched} new candidates from trending feeds (${gradAddrs.length} grad pass + ${otherAddrs.length} other pass)`);
     }
   }
 
