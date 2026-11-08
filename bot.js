@@ -587,13 +587,9 @@ function detectStrategy(pair, openStrategies) {
         if (ch1 > 20)  score += 12; else if (ch1 > 8) score += 6;
         if (liq > 30000) score += 8; else if (liq > 15000) score += 4;
         if (volMcap > 1) score += 10; else if (volMcap > 0.4) score += 5;
-        // Range-spike guard: if 1h is a big spike but 24h is flat/modest,
-        // the coin is likely ranging and we're buying the top of a local spike.
-        // True breakouts have 24h trend that SUPPORTS the 1h move.
-        const ch24pos1 = Math.max(ch24, 0);
-        if      (ch1 > 30 && ch24pos1 < 20) score -= 35; // spike in flat day = range top
-        else if (ch1 > 20 && ch24pos1 < 8)  score -= 20; // moderate spike, very weak 24h
         // MC sweet spot + avg trade quality
+        // NOTE: Range-spike guard removed — with graduated-only gate, high ch1 / modest ch24
+        // is EXPECTED for a recently migrated Raydium coin and must not be penalised.
         if (mcSweetSpot) score += 10;
         if (avgTrade !== null) {
           if (avgTrade > 80) score += 5;
@@ -3246,11 +3242,17 @@ async function fetchTrendingAddrs() {
     );
     const coins = JSON.parse(r.body);
     const list  = Array.isArray(coins) ? coins : [];
+    let grad1a = 0;
     for (const c of list) {
       const addr = (c.mint || '').toLowerCase();
-      if (addr) fresh.set(addr, (fresh.get(addr) || 0) + 1);
+      if (!addr) continue;
+      // Graduated tokens (raydium_pool set) get weight 5 so they sort to the
+      // top of the trending candidates block — these are SC/AM's target market.
+      const w = c.raydium_pool ? 5 : 1;
+      fresh.set(addr, (fresh.get(addr) || 0) + w);
+      if (c.raydium_pool) grad1a++;
     }
-    console.log(`[TRENDING] pump.fun (recent): ${list.length} coins`);
+    console.log(`[TRENDING] pump.fun (recent): ${list.length} coins (${grad1a} graduated/Raydium)`);
   } catch(e) { console.log(`[TRENDING] pump.fun (recent) error: ${e.message}`); }
 
   // ── Platform 1b: pump.fun movers — top 100 by market cap (most active SC pool)
@@ -3262,11 +3264,15 @@ async function fetchTrendingAddrs() {
     );
     const coins = JSON.parse(r.body);
     const list  = Array.isArray(coins) ? coins : [];
+    let grad1b = 0;
     for (const c of list) {
       const addr = (c.mint || '').toLowerCase();
-      if (addr) fresh.set(addr, (fresh.get(addr) || 0) + 1); // counts as extra trending hit
+      if (!addr) continue;
+      const w = c.raydium_pool ? 5 : 1;
+      fresh.set(addr, (fresh.get(addr) || 0) + w);
+      if (c.raydium_pool) grad1b++;
     }
-    console.log(`[TRENDING] pump.fun (movers/mcap): ${list.length} coins`);
+    console.log(`[TRENDING] pump.fun (movers/mcap): ${list.length} coins (${grad1b} graduated/Raydium)`);
   } catch(e) { console.log(`[TRENDING] pump.fun (movers) error: ${e.message}`); }
 
   // ── Platform 2: DexScreener — latest new token profiles (infant surge feed) ──
@@ -3463,11 +3469,14 @@ async function scanForEntries() {
   // actually reach detectStrategy() — without this, they score-boost coins they never meet.
   // Limit: 100 addresses per scan to stay within rate limits (~8 s at 80 ms/req).
   {
-    const trendOnlyAddrs = [...scanTrendingMap.keys()]
+    const trendOnlyAddrs = [...scanTrendingMap.entries()]
+      .sort((a, b) => b[1] - a[1])          // highest weight first — Raydium graduates (weight 5+) lead
+      .map(([addr]) => addr)
       .filter(a => !seen.has(a))
       .slice(0, 100);
     if (trendOnlyAddrs.length > 0) {
-      console.log(`[TRENDING] Fetching ${trendOnlyAddrs.length} trending addrs not in keyword/boost pool`);
+      const gradLeaders = trendOnlyAddrs.filter(a => (scanTrendingMap.get(a) || 0) >= 5).length;
+      console.log(`[TRENDING] Fetching ${trendOnlyAddrs.length} addrs (${gradLeaders} Raydium graduates at front)`);
       let fetched = 0;
       for (const ta of trendOnlyAddrs) {
         try {
