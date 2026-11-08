@@ -112,7 +112,7 @@ const SL_TIGHTEN_PCT         = 0.85;           // after grace, if still below en
 const ANTI_MANIP_AVG_TRADE_FLOOR  = 8;    // global: avg trade must be ≥$8 (kills $0.01–$2 spam; lowered for slow markets)
 const ANTI_MANIP_M5_TXNS_MAX      = 200;  // global: >200 txns in 5min = 40/min = bots
 const ANTI_MANIP_MC_LIQ_RATIO_MAX = 30;   // global: mc/liq > 30× = thin pool, easy to manipulate
-const ANTI_MANIP_SC_AVG_TRADE     = 20;   // Surge Catch: young coins trade smaller ($20 floor)
+const ANTI_MANIP_SC_AVG_TRADE     = 10;   // Surge Catch: lowered from $20 — infant coins trade smaller; $10 is still above micro-spam ($8 global floor)
 const ANTI_MANIP_SC_TXNS_MAX      = 150;  // Surge Catch only: 30/min ceiling
 const ANTI_MANIP_SC_MC_LIQ_MAX    = 30;   // Surge Catch: thin pools normal for young surges
 
@@ -3438,6 +3438,26 @@ async function scanForEntries() {
     }
     console.log(`[SCAN] Top-volume sweep: ${topPairs.length} Solana pairs (vol > $50k)`);
   } catch(e) { console.log(`[SCAN] Top-volume sweep error: ${e.message}`); }
+
+  // ── Old Recovery candidate sweep (established Solana coins by liquidity) ──────
+  // OR (id=3) requires 15+ day old coins with $80k+ liq — the keyword scan never
+  // surfaces them because every keyword targets new/trending meme coins.
+  // This sweep uses a different DexScreener query (q=sol) and sorts by LIQUIDITY
+  // rather than volume, so established coins with deep pools rise to the top.
+  // A $50k liq floor pre-filters the result to candidates plausibly near OR's $80k bar.
+  try {
+    const rOr = await httpGet('api.dexscreener.com', '/latest/dex/search?q=sol');
+    const dOr = JSON.parse(rOr.body);
+    const orPairs = (dOr.pairs || [])
+      .filter(p => p.chainId === 'solana' && (p.liquidity?.usd || 0) >= 50000)
+      .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))
+      .slice(0, 50);
+    for (const p of orPairs) {
+      const a = p.baseToken?.address || '';
+      if (a && !seen.has(a)) { seen.add(a); candidates.push(p); }
+    }
+    console.log(`[SCAN] OR sweep: ${orPairs.length} high-liq Solana pairs (liq ≥ $50k)`);
+  } catch(e) { console.log(`[SCAN] OR sweep error: ${e.message}`); }
 
   console.log(`[SCAN] Fetched ${candidates.length} unique candidates via ${keywords.length} keywords + boosts + vol sweep`);
 
