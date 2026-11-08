@@ -29,6 +29,12 @@ const POSITION_SIZE   = parseFloat(process.env.POSITION_SIZE || '100');
 const MAX_POSITIONS   = 20;
 const SURGE_RESERVED  = 5;   // last 5 slots reserved for Surge Catch (id 2) only
 const MIN_SCORE       = 35;  // minimum entry score — wider net; no upper cap (80, 90, 100 all pass)
+
+// ── STRATEGY FILTER SWITCH ────────────────────────────────────────────────────
+// false = strategy-specific filters suspended (preserved in code, not erased).
+// Only the graduated gate + rising-momentum gate remain active.
+// Set true to re-enable all per-strategy filter checks.
+const STRATEGY_FILTERS_ACTIVE = false;
 const DAILY_LOSS_LIMIT= -0.30;
 const SCAN_INTERVAL   = 15000;  // 15s — entry scanner
 const PRICE_CHECK     =  3000;  //  3s — position monitor (all hot-path reads cached; ~5,760 reads/day total)
@@ -221,7 +227,7 @@ const STRATEGIES = [
     // ── Entry criteria — use m5 as primary signal, not h1 ──
     // h1 is a lagging indicator — the surge may already be over by then
     // m5 catches it while it's still happening
-    maxAgeDays: 1/12,  // 2 hours max — SC is for infant surges; older coins go to AM/BB/OR
+    maxAgeDays: 1,     // 24 hours max — catches recently graduated coins (graduation at 1–4h, surge follows)
     minM5Ch: 3,        // must be actively surging in last 5 min — not just age-qualified
     minM5Txns: 15,     // real activity — prevents entering stalled infant coins
     minCh1: 5,         // h1 already positive — surge has already started
@@ -430,11 +436,14 @@ function detectStrategy(pair, openStrategies) {
   const dexId      = pair.dexId || '';
   const isPumpFun  = dexId === 'pump-fun';
 
-  // UNIVERSAL AGE RANGE: 1 minute minimum to 2 hours maximum (enforced by strategy filters).
-  // SC covers the infant surge window (1 min – 2h); AM covers the established momentum
-  // window (2h+). The 1-min floor just prevents millisecond-old garbage from slipping in.
-  // Rising-momentum gate (m5Ch + priceHistory) is the real protection against volatile
-  // early entries — a surging coin at 15 min is a valid SC target.
+  // ── GRADUATED-ONLY GATE ───────────────────────────────────────────────────────
+  // Only trade coins that have completed the pump.fun bonding curve and migrated
+  // to Raydium (or any other DEX). Un-graduated pump.fun coins are pre-migration,
+  // highly volatile, and rug-prone. This is the single most important quality gate.
+  if (dexId === 'pump-fun') return null;
+
+  // UNIVERSAL AGE RANGE: 1 minute minimum — no hard upper cap (strategies own their age ranges).
+  // The 1-min floor just prevents millisecond-old garbage from slipping in.
   if (ageMinutes < 1) return null;
 
   // PUMP.FUN YOUNG COIN extra requirements (1–90 min): minimal rug floor + buy pressure.
@@ -487,6 +496,10 @@ function detectStrategy(pair, openStrategies) {
       // Path A: Classic oversold recovery — coin was falling, h1 turning up
       // Path B: Trending pullback — uptrending coin takes a small dip (buy the dip)
       // Path C: Steady restart — coin was flat/quiet, now starting to move up
+      if (!STRATEGY_FILTERS_ACTIVE) {
+        // Filters suspended — accept any coin that reaches scoring
+        match = true;
+      } else {
 
       const pathA = ch24 <= s.maxCh24           // was falling (ch24 < -5%)
                  && ch24 >= s.minCh24            // not dead (-92% floor)
@@ -545,18 +558,21 @@ function detectStrategy(pair, openStrategies) {
           else if (avgTrade < 30) score -= 10;
         }
       }
+      } // end STRATEGY_FILTERS_ACTIVE else
     }
 
     else if (s.id === 1) {
       // ── ACTIVE MOMENTUM ────────────────────────────────────────────────────
-      if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // 2h+ only — SC covers 0–2h
-      if (m5Txns < s.minM5Txns)  { match = false; }
-      if (m5Ch < s.minM5Ch)      { match = false; } // POSITIVE direction required (was abs)
-      if (ch1 < s.minCh1)        { match = false; }
-      if (buyPct < s.minBuyPct)  { match = false; }
-      if (liq < s.minLiq)        { match = false; }
-      // Anti-manipulation: require meaningful avg trade size (from strategy definition)
-      if (s.minAvgTrade != null && avgTrade !== null && avgTrade < s.minAvgTrade) { match = false; }
+      if (STRATEGY_FILTERS_ACTIVE) {
+        if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // 2h+ only — SC covers 0–24h
+        if (m5Txns < s.minM5Txns)  { match = false; }
+        if (m5Ch < s.minM5Ch)      { match = false; } // POSITIVE direction required (was abs)
+        if (ch1 < s.minCh1)        { match = false; }
+        if (buyPct < s.minBuyPct)  { match = false; }
+        if (liq < s.minLiq)        { match = false; }
+        // Anti-manipulation: require meaningful avg trade size (from strategy definition)
+        if (s.minAvgTrade != null && avgTrade !== null && avgTrade < s.minAvgTrade) { match = false; }
+      }
       if (match) {
         score += Math.min(20, m5Txns / 2);         // very active = more confidence
         if (m5Ch > 5)  score += 15; else if (m5Ch > 2) score += 8;
@@ -582,17 +598,19 @@ function detectStrategy(pair, openStrategies) {
     else if (s.id === 2) {
       // ── SURGE CATCH ────────────────────────────────────────────────────────
       // Primary signal: m5 activity — catch it WHILE it's happening
-      // Age gate: 0–2 hours only — SC is the infant-coin strategy
-      if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // over 2h → AM/BB/OR
-      if (m5Ch < s.minM5Ch)      { match = false; } // must be moving in last 5 min
-      if (m5Txns < s.minM5Txns)  { match = false; } // must be very active
-      if (ch1 < s.minCh1)        { match = false; } // h1 confirms uptrend
-      if (buyPct < s.minBuyPct)  { match = false; }
-      if (liq < s.minLiq)        { match = false; }
-      // Stricter anti-manipulation for Surge Catch (high-risk, bot-targeted strategy)
-      if (avgTrade !== null && avgTrade < ANTI_MANIP_SC_AVG_TRADE) { match = false; }
-      if (m5Txns > ANTI_MANIP_SC_TXNS_MAX)                         { match = false; }
-      if (mcLiqRatio > ANTI_MANIP_SC_MC_LIQ_MAX)                   { match = false; }
+      // Age gate: 0–24 hours (recently graduated coins surge post-migration)
+      if (STRATEGY_FILTERS_ACTIVE) {
+        if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // over 24h → AM/BB/OR
+        if (m5Ch < s.minM5Ch)      { match = false; } // must be moving in last 5 min
+        if (m5Txns < s.minM5Txns)  { match = false; } // must be very active
+        if (ch1 < s.minCh1)        { match = false; } // h1 confirms uptrend
+        if (buyPct < s.minBuyPct)  { match = false; }
+        if (liq < s.minLiq)        { match = false; }
+        // Stricter anti-manipulation for Surge Catch (high-risk, bot-targeted strategy)
+        if (avgTrade !== null && avgTrade < ANTI_MANIP_SC_AVG_TRADE) { match = false; }
+        if (m5Txns > ANTI_MANIP_SC_TXNS_MAX)                         { match = false; }
+        if (mcLiqRatio > ANTI_MANIP_SC_MC_LIQ_MAX)                   { match = false; }
+      }
       if (match) {
         score += Math.min(25, m5Ch * 3);             // bigger m5 move = higher score
         if (m5Txns > 50) score += 15; else if (m5Txns > 30) score += 10; else if (m5Txns > 20) score += 5;
@@ -617,17 +635,19 @@ function detectStrategy(pair, openStrategies) {
 
     else if (s.id === 3) {
       // ── OLD RECOVERY ───────────────────────────────────────────────────────
-      if (ageDays < s.minAgeDays)  { match = false; }
-      if (ch24 < s.minCh24)        { match = false; }
-      if (ch1 < s.minCh1)          { match = false; }
-      if (ch1 > s.maxCh1)          { match = false; } // spike guard
-      if (s.minCh6 != null && ch6 < s.minCh6) { match = false; } // 6h sustained momentum
-      // Enter quickly when momentum is live — m5 must also be positive right now
-      if (s.minM5Ch != null && m5Ch < s.minM5Ch) { match = false; }
-      if (buyPct < s.minBuyPct)    { match = false; }
-      if (liq < s.minLiq)          { match = false; }
-      if (buys24 < s.minBuys24)    { match = false; }
-      if (s.minAvgTrade != null && avgTrade !== null && avgTrade < s.minAvgTrade) { match = false; } // real buyers only
+      if (STRATEGY_FILTERS_ACTIVE) {
+        if (ageDays < s.minAgeDays)  { match = false; }
+        if (ch24 < s.minCh24)        { match = false; }
+        if (ch1 < s.minCh1)          { match = false; }
+        if (ch1 > s.maxCh1)          { match = false; } // spike guard
+        if (s.minCh6 != null && ch6 < s.minCh6) { match = false; } // 6h sustained momentum
+        // Enter quickly when momentum is live — m5 must also be positive right now
+        if (s.minM5Ch != null && m5Ch < s.minM5Ch) { match = false; }
+        if (buyPct < s.minBuyPct)    { match = false; }
+        if (liq < s.minLiq)          { match = false; }
+        if (buys24 < s.minBuys24)    { match = false; }
+        if (s.minAvgTrade != null && avgTrade !== null && avgTrade < s.minAvgTrade) { match = false; } // real buyers only
+      }
       if (match) {
         score += Math.min(15, ch24 / 3);
         if (ch1 > 8)  score += 12; else if (ch1 > 3) score += 6;
