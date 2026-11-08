@@ -443,21 +443,15 @@ function detectStrategy(pair, openStrategies) {
   // Even 1-2 transactions confirms the coin is live; scoring rewards higher activity.
   if (!m5Txns || m5Txns < 1) return null;
 
-  // ── GRADUATED-ONLY GATE ───────────────────────────────────────────────────────
-  // Only trade coins that have completed the pump.fun bonding curve and migrated
-  // to Raydium (or any other DEX). Un-graduated pump.fun coins are pre-migration,
-  // highly volatile, and rug-prone. This is the single most important quality gate.
-  if (dexId === 'pump-fun') return null;
+  // ── RAYDIUM-ONLY GATE ─────────────────────────────────────────────────────────
+  // Only trade coins on Raydium. Pump.fun-originated coins must have completed
+  // their bonding curve and migrated to Raydium to pass.
+  // Also blocks Meteora, Orca, Jupiter and any other DEX — those coins bypass
+  // the pump.fun migration quality check and may carry mintable/unreviewed risks.
+  if (dexId !== 'raydium') return null;
 
-  // UNIVERSAL AGE RANGE: 1 minute minimum — no hard upper cap (strategies own their age ranges).
-  // The 1-min floor just prevents millisecond-old garbage from slipping in.
+  // UNIVERSAL AGE RANGE: 1 minute minimum
   if (ageMinutes < 1) return null;
-
-  // PUMP.FUN YOUNG COIN extra requirements (1–90 min): minimal rug floor + buy pressure.
-  // These are the riskiest coins — ensure basic liquidity and genuine buy pressure.
-  // Relaxed thresholds: SC's anti-manipulation checks are the primary safety net.
-  if (isPumpFun && ageMinutes < 90 && liq < 5000) return null;
-  if (isPumpFun && ageMinutes < 90 && buyPct < 55)  return null;
 
   // ── RISING MOMENTUM GATE ──────────────────────────────────────────────────
   // The bot must only enter when the coin is actively moving UP — not during a
