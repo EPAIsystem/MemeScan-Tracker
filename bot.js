@@ -2886,8 +2886,24 @@ async function monitorPositions() {
         await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'STOP_LOSS', pnl });
         await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
         if (pnl <= 0) {
-          // Loss SL (initial 25% gate hit before capital secured) — block re-entry for 6h
-          recentSLCoins.set(pos.address, Date.now());
+          // Loss SL — strategy-aware re-entry gate:
+          // BB (id=0) and OR (id=3): recovery strategies — a normal dip past SL doesn't
+          //   invalidate the thesis. Allow same-day re-entry UNLESS slippage was high
+          //   (fill > 10% below SL level → thin liquidity / micro-rug → block 6h).
+          // AM (id=1) and SC (id=2): momentum strategies — SL at a loss = thesis broken;
+          //   always block 6h regardless of slippage.
+          const slippagePct = pos.currentSL > 0
+            ? (pos.currentSL - exitFillPrice) / pos.currentSL
+            : 0;
+          const highSlippage = slippagePct > 0.10;
+          const isRecovery   = pos.strategyId === 0 || pos.strategyId === 3;
+          if (isRecovery && !highSlippage) {
+            // Normal loss on a recovery strategy — dip went a bit deeper; allow re-entry
+            enteredToday.delete(pos.address);
+          } else {
+            // Momentum strategy OR high-slippage exit — block 6h
+            recentSLCoins.set(pos.address, Date.now());
+          }
         } else {
           // Profitable trailing SL (capital secured, positive P&L) — allow same-day re-entry
           enteredToday.delete(pos.address);
