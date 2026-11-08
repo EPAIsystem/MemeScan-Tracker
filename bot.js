@@ -2753,7 +2753,7 @@ async function monitorPositions() {
             const pnl     = (pos.pnl || 0) + exitPnl;
             await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'SURGE_STALE_LOSS', pnl });
             await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
-            enteredToday.delete(pos.address);
+            // Loss exit — keep in enteredToday (blocked for the rest of the day)
             await sendTelegram(
               `⏱ *SURGE STALE — EXIT WITH LOSS*\n\n` +
               `*${pos.symbol}* ${pos.strategyLabel}\n` +
@@ -2885,7 +2885,13 @@ async function monitorPositions() {
         const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial TP exits
         await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'STOP_LOSS', pnl });
         await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
-        recentSLCoins.set(pos.address, Date.now()); // block re-entry for 6h — prevents triple entries
+        if (pnl <= 0) {
+          // Loss SL (initial 25% gate hit before capital secured) — block re-entry for 6h
+          recentSLCoins.set(pos.address, Date.now());
+        } else {
+          // Profitable trailing SL (capital secured, positive P&L) — allow same-day re-entry
+          enteredToday.delete(pos.address);
+        }
         await sendTelegram(
           `🛑 *STOP LOSS HIT*\n\n` +
           `*${pos.symbol}* ${pos.strategyLabel}\n` +
