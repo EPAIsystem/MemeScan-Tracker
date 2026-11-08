@@ -28,13 +28,12 @@ const TELEGRAM_CHAT   = (process.env.TELEGRAM_CHAT_ID   || process.env.TELEGRAM_
 const POSITION_SIZE   = parseFloat(process.env.POSITION_SIZE || '100');
 const MAX_POSITIONS   = 20;
 const SURGE_RESERVED  = 5;   // last 5 slots reserved for Surge Catch (id 2) only
-const MIN_SCORE       = 35;  // minimum entry score — wider net; no upper cap (80, 90, 100 all pass)
+const MIN_SCORE       = 55;  // quality threshold — only confident entries (Oct-27 baseline was 60)
 
 // ── STRATEGY FILTER SWITCH ────────────────────────────────────────────────────
-// false = strategy-specific filters suspended (preserved in code, not erased).
-// Only the graduated gate + rising-momentum gate remain active.
-// Set true to re-enable all per-strategy filter checks.
-const STRATEGY_FILTERS_ACTIVE = false;
+// true  = all per-strategy filters active (normal operation — Oct-27 baseline)
+// false = filters suspended (use only during debugging when strategies don't appear)
+const STRATEGY_FILTERS_ACTIVE = true;
 const DAILY_LOSS_LIMIT= -0.30;
 const SCAN_INTERVAL   = 15000;  // 15s — entry scanner
 const PRICE_CHECK     =  3000;  //  3s — position monitor (all hot-path reads cached; ~5,760 reads/day total)
@@ -194,7 +193,7 @@ const STRATEGIES = [
     minCh6: -50,        // h6 allowed down to -50% — h1 + m5 confirm the actual turn
     minM5Ch: -0.5,      // m5 stabilising or turning green
     minBuyPct: 55,      // buyers coming in
-    minLiq: 8000,       // loosened — capital protection is the new safety net
+    minLiq: 15000,      // Oct-27 baseline — genuine bounce needs real liquidity
     minM5Txns: 5,       // real bounce needs real tx flow
     // ── TP / SL (standard 3-step) ──
     tp1x: 1.25, tp2x: 1.55, tp3x: 2.10,
@@ -208,8 +207,9 @@ const STRATEGIES = [
     desc: 'Price ticking every 5-15 min — strong live activity',
     // ── Entry criteria ──
     minAgeDays: 1/12,  // 2 hours+ only — SC handles infant coins (0–2h), AM takes over after
+    maxAgeDays: 3,     // 3-day cap — young, active coins only (Oct-27 baseline)
     minM5Ch: 1,        // must be moving positively right now — not entering on a stall
-    minM5Txns: 10,     // real live transaction flow — not a ghost coin
+    minM5Txns: 15,     // busy last 5 min — Oct-27 baseline (was 10)
     minBuyPct: 55,     // buyers must be in control
     minCh1: 3,         // h1 momentum confirmed — coin is genuinely moving up
     minLiq: 10000,     // liquidity floor — $10k minimum
@@ -229,7 +229,7 @@ const STRATEGIES = [
     // m5 catches it while it's still happening
     maxAgeDays: 1,     // 24 hours max — catches recently graduated coins (graduation at 1–4h, surge follows)
     minM5Ch: 3,        // must be actively surging in last 5 min — not just age-qualified
-    minM5Txns: 15,     // real activity — prevents entering stalled infant coins
+    minM5Txns: 20,     // very high activity — Oct-27 baseline (was 15)
     minCh1: 5,         // h1 already positive — surge has already started
     minBuyPct: 58,     // buyers must dominate — surge needs buy pressure
     minLiq: 5000,      // rug floor — $5k minimum for infant coins
@@ -246,13 +246,12 @@ const STRATEGIES = [
     desc: 'Established coin climbing back steadily',
     // ── Entry criteria ──
     minAgeDays: 15,      // the defining characteristic of OR — established coins only
-    minCh24: -60,        // was falling yesterday — not so far down it's dead (-60% floor)
-    maxCh24: -3,         // still negative on 24h — that's what makes it a recovery entry
-    minCh1: 1,           // h1 must be turning positive — actually recovering right now
+    minCh24: 3,          // 24h must be POSITIVE — recovery already confirmed (Oct-27 baseline)
+    minCh1: 1,           // h1 also positive — still climbing right now
     maxCh1: 15,          // h1 spike guard — not already mooned before we enter
     minBuyPct: 50,       // buyers in control — minimum viable signal
-    minLiq: 5000,        // absolute rug floor — platform ranking is the quality gate
-    minBuys24: 20,       // real 24h buyer activity — not a ghost coin with one lucky tick
+    minLiq: 60000,       // established coin floor — Oct-27 was $80k, restored to $60k
+    minBuys24: 50,       // real 24h buyer activity — Oct-27 baseline (was 20)
     // ── TP / SL (conservative) ──
     tp1x: 1.12, tp2x: 1.30, tp3x: 1.65,
     slx: 0.92,
@@ -566,6 +565,7 @@ function detectStrategy(pair, openStrategies) {
       // ── ACTIVE MOMENTUM ────────────────────────────────────────────────────
       if (STRATEGY_FILTERS_ACTIVE) {
         if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // 2h+ only — SC covers 0–24h
+        if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // 3-day cap — SC/BB handle older
         if (m5Txns < s.minM5Txns)  { match = false; }
         if (m5Ch < s.minM5Ch)      { match = false; } // POSITIVE direction required (was abs)
         if (ch1 < s.minCh1)        { match = false; }
