@@ -3737,59 +3737,6 @@ async function scanForEntries() {
     // Check slot still available (may have been filled earlier in this loop)
     if (slotCount[coin.strategy.id] >= coin.strategy.maxSlots) continue;
 
-    // ── PULLBACK GATE — wait for a dip before entering, not at the peak ────────
-    // Applied to SURGE_CATCH (id 2) and ACTIVE MOMENTUM (id 1) only.
-    // Bottom Bounce (id 0) and Old Recovery (id 3) are EXEMPT: their 24h drop
-    // IS the pullback — adding another intraday dip gate double-filters them and
-    // prevents any entries after a bot restart (surgeWatchlist is empty on deploy).
-    //
-    // Entry paths for id 1 (Active Momentum):
-    //   A) EXPLOSIVE BYPASS: m5 > 8% AND h1 > 25% AND buyPct > 70% — enter immediately
-    //   B) FULL PULLBACK CYCLE (via checkSurgePullback): ≥5% dip → ≥3% bounce
-    // Entry paths for id 2 (Surge Catch — via checkSurgePullback):
-    //   A) BUY-RATE CONFIRMATION: watched ≥1 min + m5BuyRate ≥8/min + avgTrade ≥$40 + uptrend
-    //   B) FULL PULLBACK CYCLE: ≥5% dip from peak → ≥3% bounce from that low
-
-    if (coin.strategy.id === 2) {
-      // Two paths through the gate (both handled inside checkSurgePullback):
-      //   A) BUY-RATE CONFIRMATION: watched ≥1 min + m5BuyRate ≥8/min + avgTrade ≥$40 + uptrend
-      //   B) FULL PULLBACK CYCLE: ≥5% dip from peak → ≥3% bounce from that low
-      const shouldEnter = checkSurgePullback(coin);
-      if (!shouldEnter) {
-        usedThisScan.add(coin.addr); // don't reprocess same coin twice this scan
-        continue;
-      }
-    }
-
-    if (coin.strategy.id === 1) {
-      const isExplosive = (coin.m5Ch || 0) >= 8 && (coin.ch1 || 0) >= 25 && (coin.buyPct || 0) >= 70;
-      if (coin._rangeReentry) {
-        // Range re-entry: support bounce confirmed — skip pullback gate, enter directly
-        console.log(`[AM-WATCH] ${coin.symbol} — RANGE RE-ENTRY bypass — entering at support bounce`);
-      } else if (isExplosive) {
-        console.log(`[AM-WATCH] ${coin.symbol} — EXPLOSIVE entry bypass (m5:${coin.m5Ch?.toFixed(1)}% h1:${coin.ch1?.toFixed(1)}% buy:${coin.buyPct?.toFixed(0)}%) — entering immediately`);
-        coin._explosiveEntry = true;
-      } else {
-        const watchEntry = surgeWatchlist.get(coin.addr);
-        const watchedMs  = watchEntry ? (Date.now() - watchEntry.watchedSince) : 0;
-        const isMomentumBypass = watchedMs > 5 * 60 * 1000
-          && (coin.m5Ch || 0) > 2 && (coin.buyPct || 0) > 62;
-        if (isMomentumBypass) {
-          console.log(`[AM-WATCH] ${coin.symbol} — MOMENTUM BYPASS (watched ${Math.round(watchedMs/60000)}min, m5:${coin.m5Ch?.toFixed(1)}%, buy:${coin.buyPct?.toFixed(0)}%) — entering`);
-          coin._momentumBypass = true;
-        } else {
-          const shouldEnter = checkSurgePullback(coin);
-          if (!shouldEnter) {
-            usedThisScan.add(coin.addr);
-            continue;
-          }
-        }
-      }
-    }
-
-    // id 0 (Bottom Bounce) and id 3 (Old Recovery): NO pullback gate.
-    // The 24h decline already confirmed the drawdown — enter when momentum turns positive.
-
     // ── RANGE-TOP GUARD (id 1 / id 2 only) ─────────────────────────────────────
     // If the bot has seen this coin ≥5 times AND its current price is in the top
     // 20% of the observed price range, the coin is ranging — we're about to buy
