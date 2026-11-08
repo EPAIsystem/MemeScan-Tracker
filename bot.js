@@ -202,6 +202,11 @@ const STRATEGIES = [
     desc: 'Price ticking every 5-15 min — strong live activity',
     // ── Entry criteria ──
     minAgeDays: 1/12,  // 2 hours+ only — SC handles infant coins (0–2h), AM takes over after
+    minM5Ch: 1,        // must be moving positively right now — not entering on a stall
+    minM5Txns: 10,     // real live transaction flow — not a ghost coin
+    minBuyPct: 55,     // buyers must be in control
+    minCh1: 3,         // h1 momentum confirmed — coin is genuinely moving up
+    minLiq: 10000,     // liquidity floor — $10k minimum
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.50, tp2x: 2.50, tp3x: 5.00,
     slx: 0.80,
@@ -217,6 +222,11 @@ const STRATEGIES = [
     // h1 is a lagging indicator — the surge may already be over by then
     // m5 catches it while it's still happening
     maxAgeDays: 1/12,  // 2 hours max — SC is for infant surges; older coins go to AM/BB/OR
+    minM5Ch: 3,        // must be actively surging in last 5 min — not just age-qualified
+    minM5Txns: 15,     // real activity — prevents entering stalled infant coins
+    minCh1: 5,         // h1 already positive — surge has already started
+    minBuyPct: 58,     // buyers must dominate — surge needs buy pressure
+    minLiq: 5000,      // rug floor — $5k minimum for infant coins
     // ── TP / SL (quick first profit, trail the rest) ──
     tp1x: 1.25, tp2x: 1.80, tp3x: 3.50,
     slx: 0.82,
@@ -230,8 +240,13 @@ const STRATEGIES = [
     desc: 'Established coin climbing back steadily',
     // ── Entry criteria ──
     minAgeDays: 15,      // the defining characteristic of OR — established coins only
+    minCh24: -60,        // was falling yesterday — not so far down it's dead (-60% floor)
+    maxCh24: -3,         // still negative on 24h — that's what makes it a recovery entry
+    minCh1: 1,           // h1 must be turning positive — actually recovering right now
+    maxCh1: 15,          // h1 spike guard — not already mooned before we enter
     minBuyPct: 50,       // buyers in control — minimum viable signal
     minLiq: 5000,        // absolute rug floor — platform ranking is the quality gate
+    minBuys24: 20,       // real 24h buyer activity — not a ghost coin with one lucky tick
     // ── TP / SL (conservative) ──
     tp1x: 1.12, tp2x: 1.30, tp3x: 1.65,
     slx: 0.92,
