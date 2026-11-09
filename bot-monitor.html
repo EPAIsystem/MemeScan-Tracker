@@ -988,12 +988,17 @@ function dailyPnlHTML() {
     const trades  = day.trades  || 0;
     const wins    = day.wins    || 0;
     const losses  = day.losses  || 0;
+    const capital = day.capitalDeployed || 0;
+    const returned = capital + pnl;
     const wr      = trades > 0 ? Math.round(wins / trades * 100) : null;
     const isToday = day.date === new Date().toISOString().slice(0, 10);
     const label   = isToday ? 'Today' : fmtDayLabel(day.date);
+    const capitalLine = capital > 0
+      ? `<div style="font-size:10px;color:var(--fg3);margin-top:2px;font-family:var(--mono)">In $${capital.toFixed(2)} → Out $${returned.toFixed(2)}</div>`
+      : '';
     return `<div class="daily-row">
       <div class="daily-date">${label}</div>
-      <div class="daily-trades">${trades} trade${trades !== 1 ? 's' : ''} · ${wins}W/${losses}L${wr != null ? ' · ' + wr + '%' : ''}</div>
+      <div class="daily-trades">${trades} trade${trades !== 1 ? 's' : ''} · ${wins}W/${losses}L${wr != null ? ' · ' + wr + '%' : ''}${capitalLine}</div>
       <div class="daily-pnl ${pnl >= 0 ? 'c-green' : 'c-red'}">${fmtPnl(pnl)}</div>
     </div>`;
   }).join('');
@@ -1050,17 +1055,22 @@ function render() {
     histHTML = `<div class="empty-state" style="margin-bottom:0"><div class="ei">📜</div><p>No closed trades yet</p></div>`;
   } else if (!S.loading) {
     const rows = S.history.map(t => {
-      const pnl = t.pnl || 0;
+      const pnl  = t.pnl || 0;
+      const size = t.size || 0;
+      const returned = size + pnl;
       const pct = t.entryPrice && t.exitPrice ? (t.exitPrice - t.entryPrice) / t.entryPrice * 100 : null;
       const stratLabel = t.strategyLabel || t.catLabel || '—';
       const stratShort = stratLabel.replace(/^[^\w]*/, '').split(' ').slice(0,2).join(' '); // strip emoji, keep first 2 words
+      const entRetLine = size > 0
+        ? `<div style="font-size:9px;color:var(--fg3);margin-top:2px;font-family:var(--mono)">$${size.toFixed(2)} → $${returned.toFixed(2)}</div>`
+        : '';
       return `<tr>
         <td class="td-sym">${t.symbol || '?'}</td>
         <td><span class="cat-badge ${getBadgeClass(t.strategyId)}" style="font-size:9px;padding:2px 6px">${stratShort}</span></td>
         <td>${fmtPrice(t.entryPrice)}</td>
         <td>${fmtPrice(t.exitPrice)}</td>
         <td class="${pct >= 0 ? 'c-green' : 'c-red'}">${pct != null ? fmtPct(pct) : '—'}</td>
-        <td class="${pnl >= 0 ? 'c-green' : 'c-red'}">${fmtPnl(pnl)}</td>
+        <td class="${pnl >= 0 ? 'c-green' : 'c-red'}">${fmtPnl(pnl)}${entRetLine}</td>
         <td style="color:${t.exitReason==='RUG_DETECTED'?'#ff6b35':t.exitReason==='MANUAL_CLOSE'?'#a78bfa':t.exitReason==='SURGE_STALE_PROFIT'?'#34d399':t.exitReason==='SURGE_STALE_LOSS'?'#f87171':'var(--fg2)'}">${t.exitReason==='SURGE_STALE_PROFIT'?'⏱ STALE PROFIT':t.exitReason==='SURGE_STALE_LOSS'?'⏱ STALE LOSS':t.exitReason || '—'}</td>
         <td style="color:var(--fg3)">${fmtDate(t.closedAt)}</td>
       </tr>`;
