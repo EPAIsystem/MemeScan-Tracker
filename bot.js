@@ -219,7 +219,7 @@ const STRATEGIES = [
     minM5Ch: 1.0,        // at least +1% in last 5 min — MUST be going UP
     minM5Txns: 15,       // busy last 5 min (Nov-5 baseline)
     minBuyPct: 55,
-    minCh1: 3,           // positive h1 trend
+    minCh1: 1,           // positive h1 trend (Nov-9: relaxed from 3 — early movers need room)
     minLiq: 8000,        // Nov-5 baseline
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.50, tp2x: 2.50, tp3x: 5.00,
@@ -237,7 +237,7 @@ const STRATEGIES = [
     // m5 catches it while it's still happening
     minM5Ch: 3,          // up 3%+ in last 5 min — actively surging NOW
     minM5Txns: 20,       // very high activity in last 5 min
-    minCh1: 3,           // h1 positive (confirming uptrend) (Nov-5 baseline)
+    minCh1: 0,           // h1 not negative (Nov-9: relaxed from 3 — newly graduated coins lack h1 history)
     minBuyPct: 58,       // buyers still in control
     minLiq: 4000,        // low bar — new coins surge fast (Nov-5 baseline)
     // ── TP / SL (quick first profit, trail the rest) ──
@@ -257,8 +257,8 @@ const STRATEGIES = [
     minCh1: 0.5,         // positive h1 (still climbing) (Nov-5 baseline)
     maxCh1: 30,          // not a sudden spike — steady recovery (Nov-5 baseline)
     minBuyPct: 50,
-    minLiq: 80000,       // established = decent liquidity (Nov-5 baseline)
-    minBuys24: 50,       // Nov-5 baseline
+    minLiq: 20000,       // Nov-9: relaxed from 80k — catches more real recovery coins
+    minBuys24: 30,       // Nov-9: relaxed from 50 — aligns with lower liq floor
     // ── TP / SL (conservative) ──
     tp1x: 1.12, tp2x: 1.30, tp3x: 1.65,
     slx: 0.92,
