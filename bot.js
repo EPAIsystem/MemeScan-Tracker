@@ -3437,20 +3437,24 @@ async function scanForEntries() {
       console.log(`[SCAN] Boosted (${boostEp.split('/')[1]}): ${boosted.length} total, ${solanaBoosted.length} Solana`);
       for (const b of solanaBoosted) {
         const addr = b.tokenAddress || '';
-        if (!addr || seen.has(addr)) continue;
+        // Skip only if we already have a Raydium pair for this token (not just seen it
+        // as a pump.fun pair from the keyword scan — same fix as trending PASS 1).
+        if (!addr || raydiumSeen.has(addr)) continue;
         seen.add(addr);
         dexBoostAddrs.add(addr.toLowerCase()); // track for trending cross-reference
         try {
           const r2 = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${addr}`);
           const d2 = JSON.parse(r2.body);
-          for (const p2 of (d2.pairs || []).slice(0, 2)) {
-            const a2 = p2.baseToken?.address || '';
-            if (a2 && !seen.has(a2)) {
-              seen.add(a2); candidates.push(p2);
-              if (p2.dexId === 'raydium') raydiumSeen.add(a2);
-            } else if (a2 === addr) {
-              candidates.push(p2); // include even if addr already seen (different pair)
-              if (p2.dexId === 'raydium') raydiumSeen.add(a2);
+          // Pick the Raydium pair specifically — don't just take the first 2 (which
+          // may both be pump.fun / other-DEX pairs if the coin has many pairs).
+          // Fall back to first pair only if no Raydium pair exists.
+          const raydiumPair = (d2.pairs || []).find(p => p.dexId === 'raydium');
+          const targetPair  = raydiumPair || (d2.pairs || [])[0];
+          if (targetPair) {
+            const a2 = targetPair.baseToken?.address || '';
+            if (a2 && !raydiumSeen.has(a2)) {
+              seen.add(a2); candidates.push(targetPair);
+              if (targetPair.dexId === 'raydium') raydiumSeen.add(a2);
             }
           }
         } catch(e) {}
