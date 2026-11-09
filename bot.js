@@ -348,6 +348,15 @@ function detectStrategy(pair, openStrategies) {
   // Calculate age before the dead coin guard — needed for the young-coin exemption
   const ageMinutes = (now - created) / 60000;
 
+  // ── YOUNG COIN STRICTER ENTRY GATE (< 1 day old) ─────────────────────────────
+  // Coins under 24 hours are prime rug-pull candidates.  Require stronger proof
+  // of genuine trading activity before we commit capital to them.
+  if (ageDays < 1) {
+    if (avgTrade !== null && avgTrade < 20) return null;  // need real traders, not micro-spam
+    if (buyPct < 60)                         return null;  // strongly buyer-dominated momentum required
+    if (m5Txns  < 25)                        return null;  // confirms genuine 5-min activity
+  }
+
   // DEAD COIN GUARD: reject coins where the 1h price change is missing or effectively flat.
   //
   // ch1 === null       → DexScreener returned no h1 data (coin too new / data gap)
@@ -1160,8 +1169,8 @@ async function enterPosition(coin, overrides = {}) {
   const posSize    = calcDynamicPositionSize(coin.liq || 0, coin.mcap || 0, ceiling);
   const rawSize    = (coin.liq || 0) * 0.01;  // 1% of liq before MC multiplier & ceiling
   const posSizeNote = posSize >= ceiling
-    ? `$${posSize} _(capped — liq 1% = $${rawSize.toFixed(0)})_`
-    : `$${posSize} _(liq × 1%)_`;
+    ? `$${posSize.toFixed(2)} _(capped — liq 1% = $${rawSize.toFixed(0)})_`
+    : `$${posSize.toFixed(2)} _(liq × 1%)_`;
   // ── Bidirectional size advisory (stored in position doc; dashboard shows as toast) ──
   // Compare user's set ceiling to what the bot would naturally recommend (no ceiling).
   const dynRec = calcDynamicPositionSize(coin.liq || 0, coin.mcap || 0, Infinity);
@@ -1207,6 +1216,16 @@ async function enterPosition(coin, overrides = {}) {
     ? simulateFillPrice(rawEntryPrice, posSize, liquidityAtEntry, true)
     : rawEntryPrice;
 
+  // ── YOUNG COIN TIGHTER SL (< 1 hour old) ────────────────────────────────────
+  // Rug pulls happen fastest on coins that just launched — cap the initial SL
+  // at 10% below entry so we don't ride a rug all the way to zero.
+  // If the strategy's normal SL is already tighter (slx > 0.90), keep it as-is.
+  const isYoungCoin   = (coin.ageMinutes || 999) < 60;
+  const youngSLFloor  = 0.90; // max 10% below entry for < 1h coins
+  const initialSLPrice = isYoungCoin
+    ? Math.max(effectiveEntry * s.slx, effectiveEntry * youngSLFloor)
+    : effectiveEntry * s.slx;
+
   const pos = {
     symbol: coin.symbol, name: coin.name, address: coin.addr,
     chain: coin.chain, strategyId: s.id, strategyLabel: s.label,
@@ -1217,8 +1236,8 @@ async function enterPosition(coin, overrides = {}) {
     tp1: effectiveEntry * s.tp1x,
     tp2: effectiveEntry * s.tp2x,
     tp3: effectiveEntry * s.tp3x,
-    sl:  effectiveEntry * s.slx,
-    currentSL: effectiveEntry * s.slx,
+    sl:  initialSLPrice,
+    currentSL: initialSLPrice,
     initialTrailPct: s.initialTrailPct,
     trailingActive: false,
     size: posSize,
@@ -1531,6 +1550,22 @@ async function getCurrentPrice(address, chain) {
     pairs.sort((a,b) => (b.liquidity?.usd||0) - (a.liquidity?.usd||0));
     return parseFloat(pairs[0].priceUsd || 0);
   } catch(e) { return null; }
+}
+
+// Returns { price, liq } for the main monitor loop — liq needed for rug-drain exit.
+// All other callers still use getCurrentPrice() above (price only).
+async function getCurrentPriceAndLiq(address, chain) {
+  try {
+    const r = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${address}`);
+    const d = JSON.parse(r.body);
+    const pairs = (d.pairs || []).filter(p => p.chainId === chain);
+    if (!pairs.length) return { price: null, liq: null };
+    pairs.sort((a,b) => (b.liquidity?.usd||0) - (a.liquidity?.usd||0));
+    return {
+      price: parseFloat(pairs[0].priceUsd || 0),
+      liq:   pairs[0].liquidity?.usd ?? null,
+    };
+  } catch(e) { return { price: null, liq: null }; }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2516,8 +2551,37 @@ async function monitorPositions() {
       continue;
     }
 
-    const price = await getCurrentPrice(pos.address, pos.chain);
+    const { price, liq: currentLiq } = await getCurrentPriceAndLiq(pos.address, pos.chain);
     if (!price || price <= 0) continue;
+
+    // ── LIQUIDITY DRAIN EXIT ──────────────────────────────────────────────────
+    // If pool liquidity drops below $2,500 we can no longer exit at any real price.
+    // Close immediately — before all other checks — to protect remaining capital.
+    if (currentLiq !== null && currentLiq < 2500 && !closingNow.has(pos.id)) {
+      closingNow.add(pos.id);
+      try {
+        const exitFillPrice = pos.tradingMode === 'paper'
+          ? simulateFillPrice(price, pos.size * pos.remaining, currentLiq, false)
+          : price;
+        const exitPnL = (exitFillPrice - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+        const pnl     = (pos.pnl || 0) + exitPnL;
+        await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'LIQ_DRAINED', pnl });
+        await updateDailyStats(exitPnL, exitPnL > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
+        await sendTelegram(
+          `⚠️ *LIQ DRAINED — EMERGENCY EXIT*\n\n` +
+          `*${pos.symbol}* ${pos.strategyLabel}\n` +
+          `💧 Liquidity collapsed to $${currentLiq < 1 ? '<1' : currentLiq.toFixed(0)} — rug pull risk\n` +
+          `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
+          `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})`
+        );
+        enteredToday.delete(pos.address);
+        console.log(`[BOT] LIQ_DRAINED ${pos.symbol}: liq=$${currentLiq?.toFixed(0)}`);
+      } catch(e) {
+        console.error(`[BOT] LIQ_DRAINED close failed for ${pos.symbol}:`, e);
+        closingNow.delete(pos.id);
+      }
+      continue;
+    }
 
     // ── SC RUG DETECTION ──────────────────────────────────────────────────────
     // Surge Catch only: young coins can rug in seconds — monitor a 15s price window.
