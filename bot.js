@@ -28,7 +28,7 @@ const TELEGRAM_CHAT   = (process.env.TELEGRAM_CHAT_ID   || process.env.TELEGRAM_
 const POSITION_SIZE   = parseFloat(process.env.POSITION_SIZE || '100');
 const MAX_POSITIONS   = 20;
 const SURGE_RESERVED  = 5;   // last 5 slots reserved for Surge Catch (id 2) only
-const MIN_SCORE       = 35;  // Nov-5 baseline — wider entry net; reverted from 55
+const MIN_SCORE       = 55;  // Nov-9 overhaul — requires positive bonuses above 50 base; filters marginal trades
 
 // ── STRATEGY FILTER SWITCH ────────────────────────────────────────────────────
 // true  = all per-strategy filters active (normal operation — Oct-27 baseline)
@@ -103,7 +103,7 @@ const surgeWatchlist        = new Map(); // addr → { symbol, peakPrice, pullba
 const SURGE_PULLBACK_MIN    = 0.05;     // ≥5% drop from peak = in pullback zone
 const SURGE_PULLBACK_MAX    = 0.35;     // >35% drop = dump — abandon watchlist entry
 const SURGE_BOUNCE_CONFIRM  = 0.03;     // 3% recovery from pullback low = entry signal
-const SURGE_WATCH_EXPIRY_MS = 5 * 60 * 1000;  // 5 min max watch window — more time to confirm pullback/bounce cycle
+const SURGE_WATCH_EXPIRY_MS = 15 * 60 * 1000; // 15 min — pullback/bounce cycles need time; 5 min was too tight
 const SURGE_BUY_RATE_MIN    = 8;        // ≥8 buys/min = confirmed real surge (m5Buys/5)
 const SURGE_CONFIRM_MIN_MS  = 60000;    // must watch ≥1 min before buy-rate entry fires
 const SURGE_AVG_TRADE_MIN   = 25;       // avg trade ≥$25 — young surging coins trade smaller; still above $20 anti-manip floor
@@ -127,7 +127,7 @@ const SL_TIGHTEN_PCT         = 0.85;           // after grace, if still below en
 const ANTI_MANIP_AVG_TRADE_FLOOR  = 8;    // global: avg trade must be ≥$8 (kills $0.01–$2 spam; lowered for slow markets)
 const ANTI_MANIP_M5_TXNS_MAX      = 200;  // global: >200 txns in 5min = 40/min = bots
 const ANTI_MANIP_MC_LIQ_RATIO_MAX = 30;   // global: mc/liq > 30× = thin pool, easy to manipulate
-const ANTI_MANIP_SC_AVG_TRADE     = 10;   // Surge Catch: lowered from $20 — infant coins trade smaller; $10 is still above micro-spam ($8 global floor)
+const ANTI_MANIP_SC_AVG_TRADE     = 15;   // Surge Catch own gate: $15 filters micro-spam while allowing young coin activity; SC bypasses the global $20 gate
 const ANTI_MANIP_SC_TXNS_MAX      = 150;  // Surge Catch only: 30/min ceiling
 const ANTI_MANIP_SC_MC_LIQ_MAX    = 30;   // Surge Catch: thin pools normal for young surges
 
@@ -212,18 +212,18 @@ const STRATEGIES = [
     maxSlots: 20, // unlimited — competes openly for global slots with id 1 and id 3
     desc: 'Oversold token reversing from its bottom',
     // ── Entry criteria ──
-    maxCh24: -10,       // was falling — 24h must be negative (Nov-5 baseline)
-    minCh24: -92,
-    maxCh1: 5,          // h1 not still crashing (< +5% = hasn't mooned yet)
-    minCh1: -20,        // h1 not in freefall — allows entry during early recovery (Nov-5 baseline)
-    minM5Ch: -0.5,      // m5 stabilising or turning green
-    minBuyPct: 55,      // buyers coming in
-    minLiq: 15000,
-    minM5Txns: 3,       // activity picking up (Nov-5 baseline)
+    maxCh24: -20,       // Nov-9: must have genuinely crashed (not just a dip)
+    minCh24: -85,       // Nov-9: not a dead coin
+    maxCh1: 12,         // Nov-9: h1 not already mooned
+    minCh1: -8,         // Nov-9: h1 turning; not in freefall
+    minM5Ch: 1.5,       // Nov-9: must be ACTIVELY bouncing (not just stabilising)
+    minBuyPct: 65,      // Nov-9: strong buyer dominance required at a true bottom
+    minLiq: 25000,      // Nov-9: pool depth for safe entry
+    minM5Txns: 12,      // Nov-9: genuine activity — not 1 trade every 2 min
     // ── TP / SL (standard 3-step) ──
-    tp1x: 1.25, tp2x: 1.55, tp3x: 2.10,
-    slx: 0.87,
-    initialTrailPct: 13,
+    tp1x: 1.20, tp2x: 1.45, tp3x: 2.00,
+    slx: 0.90,          // –10% SL: if a bounce thesis fails –10%, thesis is wrong
+    initialTrailPct: 12,
   },
   {
     id: 1,
@@ -231,16 +231,16 @@ const STRATEGIES = [
     maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 3
     desc: 'Price ticking every 5-15 min — strong live activity',
     // ── Entry criteria ──
-    maxAgeDays: 3,       // young, active coins (Nov-5 baseline)
-    minM5Ch: 1.0,        // at least +1% in last 5 min — MUST be going UP
-    minM5Txns: 15,       // busy last 5 min (Nov-5 baseline)
-    minBuyPct: 55,
-    minCh1: 1,           // positive h1 trend (Nov-9: relaxed from 3 — early movers need room)
-    minLiq: 8000,        // Nov-5 baseline
+    maxAgeDays: 3,       // young, active coins
+    minM5Ch: 2.5,        // Nov-9: 2.5% in 5 min = real momentum, not noise
+    minM5Txns: 20,       // Nov-9: match SC activity bar
+    minBuyPct: 62,       // Nov-9: buyers clearly in control
+    minCh1: 1,           // positive h1 trend
+    minLiq: 15000,       // Nov-9: meaningful pool depth
     // ── TP / SL (partial profit — sell in bits) ──
-    tp1x: 1.50, tp2x: 2.50, tp3x: 5.00,
-    slx: 0.80,
-    initialTrailPct: 20,
+    tp1x: 1.28, tp2x: 1.70, tp3x: 3.00,  // Nov-9: TP1 at +28% — captures the common 20–40% pop
+    slx: 0.86,           // Nov-9: –14% SL (was –20% — the single biggest loss driver)
+    initialTrailPct: 12, // Nov-9: tighter trail locks in gains faster
     usePartialProfit: true,  // stage-based selling like old Alpha
   },
   {
@@ -251,14 +251,15 @@ const STRATEGIES = [
     // ── Entry criteria — use m5 as primary signal, not h1 ──
     // h1 is a lagging indicator — the surge may already be over by then
     // m5 catches it while it's still happening
-    minM5Ch: 3,          // up 3%+ in last 5 min — actively surging NOW
-    minM5Txns: 20,       // very high activity in last 5 min
-    minCh1: 0,           // h1 not negative (Nov-9: relaxed from 3 — newly graduated coins lack h1 history)
-    minBuyPct: 58,       // buyers still in control
-    minLiq: 4000,        // low bar — new coins surge fast (Nov-5 baseline)
+    minM5Ch: 5,          // Nov-9: 5%+ in 5 min = genuine surge, not mild movement
+    minM5Txns: 25,       // Nov-9: very high activity bar for young coin entry
+    minCh1: 0,           // h1 not negative (newly graduated coins may lack h1 history)
+    minBuyPct: 68,       // Nov-9: strong buyer dominance — real surge has buyers in firm control
+    minLiq: 8000,        // Nov-9: meaningful pool depth (was $4k — too thin)
+    maxAgeDays: 1,       // Nov-9: SC is for young graduated coins only; AM handles 1–3 days
     // ── TP / SL (quick first profit, trail the rest) ──
-    tp1x: 1.25, tp2x: 1.80, tp3x: 3.50,
-    slx: 0.82,
+    tp1x: 1.30, tp2x: 2.00, tp3x: 4.00,  // Nov-9: genuine surges can run far
+    slx: 0.85,           // Nov-9: –15% SL for young coin volatility room
     initialTrailPct: 18,
     usePartialProfit: true,  // take bits on the way up
   },
@@ -269,12 +270,12 @@ const STRATEGIES = [
     desc: 'Established coin climbing back steadily',
     // ── Entry criteria ──
     minAgeDays: 15,      // the defining characteristic of OR — established coins only
-    minCh24: 3,          // 24h must be POSITIVE — recovery already confirmed (Oct-27 baseline)
-    minCh1: 0.5,         // positive h1 (still climbing) (Nov-5 baseline)
-    maxCh1: 30,          // not a sudden spike — steady recovery (Nov-5 baseline)
-    minBuyPct: 50,
-    minLiq: 20000,       // Nov-9: relaxed from 80k — catches more real recovery coins
-    minBuys24: 30,       // Nov-9: relaxed from 50 — aligns with lower liq floor
+    minCh24: 5,          // Nov-9: recovery must be clearly underway (not just barely positive)
+    minCh1: 1.5,         // Nov-9: still actively climbing this hour
+    maxCh1: 20,          // Nov-9: tighter spike guard — >20% in 1h on old coin is suspicious
+    minBuyPct: 58,       // Nov-9: meaningful buyer interest for established coins
+    minLiq: 40000,       // Nov-9: established coins should have real depth (was 20k, compromised)
+    minBuys24: 60,       // Nov-9: real recovery has real sustained trading activity
     // ── TP / SL (conservative) ──
     tp1x: 1.12, tp2x: 1.30, tp3x: 1.65,
     slx: 0.92,
@@ -283,11 +284,11 @@ const STRATEGIES = [
 ];
 
 // ── UNIVERSAL PROGRESSIVE TRAILING SL ────────────────────────────────────────
-// Strategy-specific trail functions removed. All positions use one universal system:
-//   • Activates at +50% gain from entry
+// All positions use one universal progressive trailing system:
+//   • Activates at +25% gain from entry (Nov-9: was +50% — most trades never reached it)
 //   • Trail starts at 50% below ATH, tightens 5% per +20% ATH move, floor 10%
 //   • SL never within 10% of current price (buffer)
-//   • SL never below entryPrice (zero-loss guarantee)
+//   • SL never below entryPrice (zero-loss guarantee after +25%)
 // See main position loop for the implementation.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -367,10 +368,17 @@ function detectStrategy(pair, openStrategies) {
   // ── YOUNG COIN STRICTER ENTRY GATE (< 1 day old) ─────────────────────────────
   // Coins under 24 hours are prime rug-pull candidates.  Require stronger proof
   // of genuine trading activity before we commit capital to them.
+  //
+  // EXEMPTION: Surge Catch (id 2) bypasses the global $20 avgTrade gate.
+  // SC has its own avgTrade gate (ANTI_MANIP_SC_AVG_TRADE = $15) applied below in
+  // strategy scoring. The $20 global gate was killing SC candidates before SC's
+  // own gate ever ran. buyPct and m5Txns gates still apply to ALL young coins.
+  const scIsOpen = openStrategies.some(st => st.id === 2);
   if (ageDays < 1) {
-    if (avgTrade !== null && avgTrade < 20) return null;  // need real traders, not micro-spam
-    if (buyPct < 60)                         return null;  // strongly buyer-dominated momentum required
-    if (m5Txns  < 25)                        return null;  // confirms genuine 5-min activity
+    // avgTrade gate: $20 for all strategies except SC (which uses its own $15 gate)
+    if (!scIsOpen && avgTrade !== null && avgTrade < 20) return null;
+    if (buyPct < 60)  return null;  // strongly buyer-dominated momentum required
+    if (m5Txns  < 25) return null;  // confirms genuine 5-min activity
   }
 
   // DEAD COIN GUARD: reject coins where the 1h price change is missing or effectively flat.
@@ -466,67 +474,35 @@ function detectStrategy(pair, openStrategies) {
     let match = true;
 
     if (s.id === 0) {
-      // ── BOTTOM BOUNCE — three entry paths ────────────────────────────────
-      //
-      // Path A: Classic oversold recovery — coin was falling, h1 turning up
-      // Path B: Trending pullback — uptrending coin takes a small dip (buy the dip)
-      // Path C: Steady restart — coin was flat/quiet, now starting to move up
+      // ── BOTTOM BOUNCE — Path A only (Nov-9 overhaul) ────────────────────
+      // Paths B (trending pullback) and C (steady restart) removed:
+      //   Path B was an AM signal mixed into BB — diluting BB quality.
+      //   Path C was too generic — caught too many non-bounce setups.
+      // BB is now ONLY for genuine oversold recovery: coin crashed 20–85%,
+      // h1 turning up, m5 actively bouncing NOW with strong buyer conviction.
       if (!STRATEGY_FILTERS_ACTIVE) {
-        // Filters suspended — accept any coin that reaches scoring
         match = true;
       } else {
 
-      const pathA = ch24 <= s.maxCh24           // was falling (ch24 < -5%)
-                 && ch24 >= s.minCh24            // not dead (-92% floor)
-                 && ch1 >= s.minCh1              // h1 turning positive
-                 && ch1 <= s.maxCh1              // h1 not already mooned
-                 && (s.minCh6 == null || ch6 >= s.minCh6)
-                 && m5Ch >= s.minM5Ch            // m5 stabilising
-                 && buyPct >= s.minBuyPct
-                 && liq >= s.minLiq
-                 && m5Txns >= s.minM5Txns;
-
-      // Path B: Trending coin dip — h1 uptrend + m5 small pullback (-5% to 0%)
-      const pathB = ch1 >= 2                    // confirmed uptrend (h1 > 2%)
-                 && m5Ch >= -5 && m5Ch < 0       // small momentary dip in last 5 min
-                 && buyPct >= 50                 // buyers still present
-                 && liq >= s.minLiq;
-
-      // Path C: Steady restart — coin was quiet (h6 flat), now starting to move
-      const pathC = ch6 >= -5 && ch6 <= 5       // h6 flat — coin was resting
-                 && ch1 >= 0                     // h1 not falling
-                 && m5Ch >= 0.5                  // just started moving up
-                 && buyPct >= 50
-                 && liq >= s.minLiq;
-
-      match = pathA || pathB || pathC;
+      match = ch24 <= s.maxCh24           // genuinely crashed (ch24 ≤ –20%)
+           && ch24 >= s.minCh24           // not a dead coin (≥ –85%)
+           && ch1 >= s.minCh1             // h1 turning — not in freefall
+           && ch1 <= s.maxCh1             // h1 not already mooned
+           && (s.minCh6 == null || ch6 >= s.minCh6)
+           && m5Ch >= s.minM5Ch           // ACTIVELY bouncing in last 5 min (≥+1.5%)
+           && buyPct >= s.minBuyPct       // strong buyer dominance (≥65%)
+           && liq >= s.minLiq
+           && m5Txns >= s.minM5Txns;
 
       if (match) {
-        if (pathA) {
-          // Classic oversold: score on depth of drop + reversal strength
-          score += Math.min(20, Math.abs(ch24) / 4);
-          if (m5Ch > 2)   score += 15; else if (m5Ch > 0) score += 8;
-          if (buyPct > 65) score += 15; else if (buyPct > 58) score += 8;
-          if (m5Txns > 20) score += 10; else if (m5Txns > 8) score += 5;
-          if (liq > 50000) score += 8; else if (liq > 20000) score += 4;
-          if (ch1 > 0)    score += 10; // confirmed reversal
-          if (volMcap > 0.3) score += 5;
-        } else if (pathB) {
-          // Trending pullback: score on uptrend strength + shallowness of dip
-          score += Math.min(15, ch1 / 2);        // stronger uptrend = more confidence
-          if (m5Ch >= -2) score += 15; else if (m5Ch >= -4) score += 8; // shallow dip better
-          if (buyPct > 60) score += 15; else if (buyPct > 50) score += 8;
-          if (liq > 50000) score += 8; else if (liq > 20000) score += 4;
-          if (m5Txns > 15) score += 10; else if (m5Txns > 5) score += 5;
-          score += 8; // structural bonus: buying a confirmed uptrend's dip
-        } else { // pathC
-          // Steady restart: score on momentum quality
-          if (m5Ch > 2)   score += 15; else if (m5Ch > 0.5) score += 8;
-          if (buyPct > 60) score += 15; else if (buyPct > 50) score += 8;
-          if (liq > 30000) score += 8; else if (liq > 15000) score += 4;
-          if (m5Txns > 10) score += 8; else if (m5Txns > 5) score += 4;
-        }
-        // Common bonuses for all paths
+        // Classic oversold: score on depth of drop + reversal strength
+        score += Math.min(20, Math.abs(ch24) / 4);
+        if (m5Ch > 3)    score += 15; else if (m5Ch > 1.5) score += 8;
+        if (buyPct > 70) score += 15; else if (buyPct > 65) score += 8;
+        if (m5Txns > 25) score += 10; else if (m5Txns > 12) score += 5;
+        if (liq > 50000) score += 8;  else if (liq > 25000) score += 4;
+        if (ch1 > 2)     score += 10; // confirmed reversal underway
+        if (volMcap > 0.3) score += 5;
         if (mcSweetSpot) score += 10;
         if (avgTrade !== null) {
           if (avgTrade > 80) score += 5;
@@ -3268,8 +3244,8 @@ async function monitorPositions() {
           );
         }
 
-      } else if (gainPct >= 50) {
-        // ── UNIVERSAL TRAIL: activates at +50% gain ──────────────────────
+      } else if (gainPct >= 25) {
+        // ── UNIVERSAL TRAIL: activates at +25% gain (Nov-9: was +50% — most trades never reached it) ──
         const ATH = currentPeak; // highest price seen for this position
 
         // Initialise on first activation
