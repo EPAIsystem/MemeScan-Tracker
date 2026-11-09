@@ -256,75 +256,14 @@ const STRATEGIES = [
   },
 ];
 
-// Trailing SL: tightens as price rises, floors at 5%
-// gain = % gain e.g. 50 for +50%
-// Tightening: faster than before — at 80% gain, Active Momentum locks within 7% of price
-function calcTrailPct(initialTrailPct, gainPct) {
-  // Tighten twice as fast for big gains (÷7 instead of ÷10)
-  return Math.max(5, initialTrailPct - (gainPct / 7));
-}
-
-// ── TIERED PROFIT LOCK — Active Momentum & Surge Catch ───────────────────────
-// Locks in a floor at this fraction of gain. Returns null = no lock yet.
-// Floor activates at 10% gain so small moves still run free.
-function calcAMSCProfitLock(gainPct) {
-  if (gainPct < 10)  return null;   // <10% — no lock, let it breathe
-  if (gainPct < 50)  return 0.80;   // 10–50%: lock in 80% of gains
-  if (gainPct < 100) return 0.85;   // 50–100%: tighten to 85%
-  if (gainPct < 200) return 0.90;   // 100–200%: tighten to 90%
-  return 0.95;                       // 200%+: near-full lock at 95%
-}
-
-// ── TIERED TRAILING STOP — Bottom Bounce ─────────────────────────────────────
-// Wide trail at entry to survive early volatility; tightens as gains build
-function calcBBTrail(gainPct) {
-  if (gainPct < 10)  return 50;   // wide allowance — let it dance
-  if (gainPct < 20)  return 40;   // starting to rise — still generous
-  if (gainPct < 50)  return 35;   // solid gain — moderate trail
-  return 25;                       // 50%+ — tighten to standard
-}
-
-// Profit lock for BB — only kicks in at 50%+ gain
-function calcBBProfitLock(gainPct) {
-  if (gainPct < 50)  return null;   // <50% — no lock, let it find footing
-  if (gainPct < 100) return 0.50;   // 50–100%: protect half the gain
-  if (gainPct < 200) return 0.60;   // 100–200%: tighten to 60%
-  return 0.70;                       // 200%+: lock in 70%
-}
-
-// ── TIERED TRAILING STOP — Old Recovery ──────────────────────────────────────
-// OR coins are more mature/stable — slightly tighter trail than BB
-function calcORTrail(gainPct) {
-  if (gainPct < 10)  return 40;   // early hold — room to breathe
-  if (gainPct < 20)  return 30;   // building — moderate
-  if (gainPct < 50)  return 25;   // solid — tighten up
-  return 20;                       // 50%+ — snug trail
-}
-
-// Profit lock for OR — activates at 50%+ gain (more conservative than BB)
-function calcORProfitLock(gainPct) {
-  if (gainPct < 50)  return null;   // <50% — no lock
-  if (gainPct < 100) return 0.40;   // 50–100%: protect 40%
-  if (gainPct < 200) return 0.55;   // 100–200%: tighten to 55%
-  return 0.65;                       // 200%+: lock in 65%
-}
-
-// ── CAPITAL PROTECTION — Phase 1 SL floor ────────────────────────────────────
-// SL is always floored at entryPrice (zero-loss guarantee from day 1).
-// As gains build, the floor rises: 50% of gain is locked in at all times.
-// This replaces the per-strategy profit lock once capital is withdrawn.
-function calcCapitalFloor(entryPrice, gain) {
-  if (gain <= 0) return entryPrice; // never below entry — zero loss max
-  return entryPrice * (1 + gain * 0.50); // lock in 50% of gain above entry
-}
-
-// ── CAPITAL PROTECTION — Phase 2 profit trail ────────────────────────────────
-// After capital is withdrawn, remaining tokens are pure profit.
-// Trail starts at 50%, tightens 5% per additional 50% gain, min 5%.
-// profitGainPct = gain from capitalWithdrawPrice (not entryPrice)
-function calcProfitTrail(profitGainPct) {
-  return Math.max(5, 50 - Math.floor(Math.max(0, profitGainPct) / 50) * 5);
-}
+// ── UNIVERSAL PROGRESSIVE TRAILING SL ────────────────────────────────────────
+// Strategy-specific trail functions removed. All positions use one universal system:
+//   • Activates at +50% gain from entry
+//   • Trail starts at 50% below ATH, tightens 5% per +20% ATH move, floor 10%
+//   • SL never within 10% of current price (buffer)
+//   • SL never below entryPrice (zero-loss guarantee)
+// See main position loop for the implementation.
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Dynamic position size: 1% of pool liquidity × market cap multiplier, capped at ceiling.
 // MC sweet spot ($25k–$200k) gets a 1.3× boost — these coins can 2x–5x fast for small traders.
@@ -1279,8 +1218,13 @@ async function enterPosition(coin, overrides = {}) {
     freeRide:        usePartial ? false : null,
     isManual:        overrides.isManual || false,
     advisoryNote:    advisoryNote,  // non-null = dashboard shows advisory toast on next refresh
-    // Young coin mode: quick 10/20/30% exits for Active Momentum coins < 1h old
+    // Young coin mode flag (kept for reference — no longer drives TP exits)
     youngCoin: (s.id === 1 && (coin.ageMinutes || 0) < 60),
+    // Age at entry — reference only
+    coinAgeDays: coin.ageDays || 0,
+    // Universal progressive trail state (null = not activated yet — activates at +50% gain)
+    trailPct:    null,   // current trail % (50 → 45 → ... → 10)
+    tightenBase: null,   // ATH at last tighten event
     // Surge momentum: skip TP1/TP2, ride to 80%+ then full-exit & reinvest
     surgeMomentum: isSurge,
     // Moon bag: funded from surge reinvestment — uses graduated SL, no TP exits
@@ -2916,7 +2860,7 @@ async function monitorPositions() {
           `🛑 *STOP LOSS HIT*\n\n` +
           `*${pos.symbol}* ${pos.strategyLabel}\n` +
           `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
-          `🛑 SL: $${fmtPrice(pos.currentSL)} | Trail: ${pos.capitalWithdrawn && pos.capitalWithdrawPrice ? calcProfitTrail((price - pos.capitalWithdrawPrice) / pos.capitalWithdrawPrice * 100).toFixed(1) : (pos.strategyId === 0 ? calcBBTrail(gainPct) : pos.strategyId === 3 ? calcORTrail(gainPct) : calcTrailPct(pos.initialTrailPct, gainPct)).toFixed(1)}%\n` +
+          `🛑 SL: $${fmtPrice(pos.currentSL)} | Trail: ${pos.trailPct != null ? pos.trailPct : '—'}%\n` +
           `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})`
         );
       } finally {
@@ -2926,14 +2870,12 @@ async function monitorPositions() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // ── CAPITAL WITHDRAWAL (Phase 1 → Phase 2 transition) ─────────────────
-    // Sell enough tokens to recover the full original capital ($pos.size).
-    // SC: triggers at 20% gain (rug-pull risk — recover fast).
-    // AM/BB/OR: triggers at 100% gain (position has doubled — time to house money).
-    // After this fires, all further TP sells are skipped — Phase 2 profit trail only.
+    // ── CAPITAL WITHDRAWAL (+100% gain — universal all strategies) ─────────
+    // Sell the minimum fraction needed to recover original capital ($pos.size).
+    // Triggers at +100% for all coins. After this, trailing SL rides the profit.
     // ══════════════════════════════════════════════════════════════════════
     if (!pos.capitalWithdrawn) {
-      const capThreshold = pos.strategyId === 2 ? 0.20 : 1.00; // SC=20%, others=100%
+      const capThreshold = 1.00; // +100% gain — universal
       if (gain >= capThreshold && pos.remaining > 0.01) {
         const totalRecovered = pos.recoveredAmount || 0;
         const stillNeeded    = pos.size - totalRecovered; // capital still at risk
@@ -2956,10 +2898,9 @@ async function monitorPositions() {
           await updatePosition(pos.id, capUpdates);
           await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, capitalFrac));
           Object.assign(pos, capUpdates);
-          const stratLabel = pos.strategyId === 2 ? '20% (SC fast-exit)' : '100% (house money)';
           alertMsg = `🛡️ *CAPITAL PROTECTED*\n\n` +
             `*${pos.symbol}* ${pos.strategyLabel}\n` +
-            `📥 Entry: $${fmtPrice(pos.entryPrice)} | Trigger: +${stratLabel}\n` +
+            `📥 Entry: $${fmtPrice(pos.entryPrice)} | Trigger: +100% (house money)\n` +
             `💰 Sold ${(capitalFrac * 100).toFixed(1)}% → recovered $${newRecovered.toFixed(2)}\n` +
             `🎯 ${(newRemaining * 100).toFixed(1)}% remains — pure profit, trailing SL only\n` +
             `🔗 [Chart](${pos.dexUrl})`;
@@ -2972,176 +2913,11 @@ async function monitorPositions() {
       }
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    // ── TAKE PROFIT (skipped when tpDisabled — trailing SL rides the surge)
-    // ══════════════════════════════════════════════════════════════════════
-    // TWO MODES for Active Momentum:
-    //
-    // 🔥 YOUNG COIN (< 1h old at entry): quick exits — 10 / 20 / 30% gains
-    //    Sell 30% at each stage, keep 10% for trailing SL ride
-    //    These coins pump fast then rug — don't chase 50/100/200%
-    //
-    // 📈 NORMAL (≥ 1h old): standard stages — 50 / 100 / 200% gains
-    //    Sell 25% / 30% / 15%, let the rest ride
-    // ══════════════════════════════════════════════════════════════════════
-    if (!pos.tpDisabled && pos.partialStage !== null && !(pos.surgeMomentum && !pos.isMoonBag)) {
-      const stage  = pos.partialStage || 0;
-      const target = pos.size * 1.2; // recover 120% of investment
-
-      if (pos.youngCoin) {
-        // ── YOUNG COIN MODE: quick 10 / 20 / 30% ──────────────────────────
-        if (stage === 0 && price >= pos.entryPrice * 1.10) {
-          const frac     = 0.30;
-          const proceeds = frac * pos.size * (exitFillPrice / pos.entryPrice);
-          const partPnL  = proceeds - frac * pos.size;
-          const newRec   = (pos.recoveredAmount || 0) + proceeds;
-          updates = { partialStage:1, remaining: pos.remaining - frac,
-            recoveredAmount: newRec, pnl: (pos.pnl || 0) + partPnL };
-          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, frac));
-          alertMsg = `🔥 *YOUNG COIN — 30% SOLD (+10%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-            `⚡ Quick exit: coin is <1h old\n` +
-            `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
-            `🎯 Riding 70% — next exit at +20%\n🔗 [Chart](${pos.dexUrl})`;
-          Object.assign(pos, updates);
-        }
-        else if (stage === 1 && price >= pos.entryPrice * 1.20) {
-          const frac     = 0.30;
-          const proceeds = frac * pos.size * (exitFillPrice / pos.entryPrice);
-          const partPnL  = proceeds - frac * pos.size;
-          const newRec   = (pos.recoveredAmount || 0) + proceeds;
-          updates = { partialStage:2, remaining: pos.remaining - frac,
-            recoveredAmount: newRec, pnl: (pos.pnl || 0) + partPnL };
-          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, frac));
-          alertMsg = `🔥 *YOUNG COIN — 30% MORE SOLD (+20%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-            `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
-            `🎯 Riding 40% — next exit at +30%\n🔗 [Chart](${pos.dexUrl})`;
-          Object.assign(pos, updates);
-        }
-        else if (stage === 2 && price >= pos.entryPrice * 1.30) {
-          const frac     = 0.30;
-          const proceeds = frac * pos.size * (exitFillPrice / pos.entryPrice);
-          const partPnL  = proceeds - frac * pos.size;
-          const newRec   = (pos.recoveredAmount || 0) + proceeds;
-          // After 3 quick exits: 10% remains riding on tight trailing SL only
-          updates = { partialStage:3, remaining: pos.remaining - frac,
-            recoveredAmount: newRec, freeRide: newRec >= target,
-            pnl: (pos.pnl || 0) + partPnL,
-            // Tighten SL to 5% after final quick exit — protect the last 10%
-            currentSL: price * 0.95, initialTrailPct: 8 };
-          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, frac));
-          alertMsg = `🔥 *YOUNG COIN — FINAL QUICK EXIT (+30%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-            `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
-            `🎯 10% remains on tight 5% trailing SL — ride or die!\n🔗 [Chart](${pos.dexUrl})`;
-          Object.assign(pos, updates);
-        }
-      } else {
-        // ── NORMAL MODE: standard 50 / 100 / 200% stages ─────────────────
-        if (stage === 0 && price >= pos.entryPrice * 1.5) {
-          const frac     = 0.25;
-          const proceeds = frac * pos.size * (exitFillPrice / pos.entryPrice);
-          const partPnL  = proceeds - frac * pos.size;
-          const newRec   = (pos.recoveredAmount || 0) + proceeds;
-          updates = { partialStage:1, remaining: pos.remaining - frac,
-            recoveredAmount: newRec, pnl: (pos.pnl || 0) + partPnL };
-          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, frac));
-          alertMsg = `⚡ *STAGE 1 — 25% SOLD (+50%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-            `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
-            `🎯 Recovered $${newRec.toFixed(2)} / $${target.toFixed(2)} — riding 75%\n🔗 [Chart](${pos.dexUrl})`;
-          Object.assign(pos, updates);
-        }
-        else if (stage === 1 && price >= pos.entryPrice * 2.0) {
-          const frac     = 0.30;
-          const proceeds = frac * pos.size * (exitFillPrice / pos.entryPrice);
-          const partPnL  = proceeds - frac * pos.size;
-          const newRec   = (pos.recoveredAmount || 0) + proceeds;
-          const fr       = newRec >= target;
-          updates = { partialStage:2, remaining: pos.remaining - frac,
-            recoveredAmount: newRec, freeRide: fr, pnl: (pos.pnl || 0) + partPnL };
-          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, frac));
-          alertMsg = `⚡ *STAGE 2 — 30% SOLD (+100%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-            `💰 Proceeds: $${proceeds.toFixed(2)} | P&L: +$${partPnL.toFixed(2)}\n` +
-            `🎯 Recovered $${newRec.toFixed(2)}${fr?' ✅ FREE RIDE!':''}\n🔗 [Chart](${pos.dexUrl})`;
-          Object.assign(pos, updates);
-        }
-        else if (stage === 2 && price >= pos.entryPrice * 3.0) {
-          const frac     = Math.min(0.15, pos.remaining - 0.10);
-          const proceeds = frac * pos.size * (exitFillPrice / pos.entryPrice);
-          const partPnL  = proceeds - frac * pos.size;
-          const newRec   = (pos.recoveredAmount || 0) + proceeds;
-          updates = { partialStage:3, remaining: pos.remaining - frac,
-            recoveredAmount: newRec, freeRide: true, pnl: (pos.pnl || 0) + partPnL };
-          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, frac));
-          alertMsg = `🚀 *STAGE 3 — FREE RIDE (+200%)*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-            `💰 Total recovered: $${newRec.toFixed(2)} | Remaining ${((pos.remaining-frac)*100).toFixed(0)}% is pure profit\n🔗 [Chart](${pos.dexUrl})`;
-          Object.assign(pos, updates);
-        }
-      }
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // ── STANDARD TP1 / TP2 / TP3 (Bottom Bounce + Old Recovery) ─────────
-    // ══════════════════════════════════════════════════════════════════════
-    else if (!pos.tpDisabled) {
-      // ── PROFIT-FIRST TP1 OVERRIDE: skip TP1 if strong uptrend still running ──
-      // Never sell into strength — trail SL instead and capture the bigger move.
-      // If tp1 was skipped but trend later fades (retests TP1), take the sell then.
-      if (!pos.tp1Hit && !pos.tp1Skipped && price >= pos.tp1) {
-        if (isTrendingUp(pos.address, 5)) {
-          // Trend strong — hold full position, tighten SL to protect the gain
-          const tightSL = Math.max(pos.currentSL, pos.tp1 * 0.97);
-          updates = { tp1Skipped: true, currentSL: tightSL, trailingActive: true };
-          alertMsg = `📈 *TP1 SKIPPED — TREND HOLDING*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-            `+${gainPct.toFixed(1)}% — momentum strong, holding full position for bigger move\n` +
-            `🔒 SL raised to $${fmtPrice(tightSL)}\n🔗 [Chart](${pos.dexUrl})`;
-          Object.assign(pos, updates);
-        } else {
-          // Trend not strong enough — take the standard TP1 partial
-          const partPnL = fillGain * pos.size * 0.50;
-          updates = { tp1Hit:true, remaining: pos.remaining - 0.50,
-            currentSL: pos.entryPrice * 1.01, trailingActive:true, pnl: (pos.pnl || 0) + partPnL };
-          await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, 0.50));
-          alertMsg = `✅ *TP1 HIT — 50% SOLD*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-            `Entry: $${fmtPrice(pos.entryPrice)} → $${fmtPrice(exitFillPrice)}\n` +
-            `💰 +$${partPnL.toFixed(2)} | SL → breakeven\n🔗 [Chart](${pos.dexUrl})`;
-          Object.assign(pos, updates);
-        }
-      }
-      // TP1 was skipped but trend has since faded — re-test, take the delayed sell
-      else if (!pos.tp1Hit && pos.tp1Skipped && price >= pos.tp1 && !isTrendingUp(pos.address, 3)) {
-        const partPnL = fillGain * pos.size * 0.50;
-        updates = { tp1Hit:true, tp1Skipped:false, remaining: pos.remaining - 0.50,
-          currentSL: pos.entryPrice * 1.01, trailingActive:true, pnl: (pos.pnl || 0) + partPnL };
-        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, 0.50));
-        alertMsg = `✅ *TP1 HIT (DELAYED) — 50% SOLD*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-          `Entry: $${fmtPrice(pos.entryPrice)} → $${fmtPrice(exitFillPrice)}\n` +
-          `💰 +$${partPnL.toFixed(2)} | SL → breakeven\n🔗 [Chart](${pos.dexUrl})`;
-        Object.assign(pos, updates);
-      }
-      // TP2: triggers whether TP1 was hit normally or skipped (sell combined 80% if skipped)
-      else if ((pos.tp1Hit || pos.tp1Skipped) && !pos.tp2Hit && price >= pos.tp2) {
-        const wasSkipped = pos.tp1Skipped && !pos.tp1Hit;
-        const sellFrac  = wasSkipped ? 0.80 : 0.30; // 80% combined if TP1 was held; 30% normal
-        const tp2Label  = wasSkipped ? 'TP2 HIT — 80% SOLD (TP1 held for uptrend)' : 'TP2 HIT — 30% SOLD';
-        const partPnL = fillGain * pos.size * sellFrac;
-        updates = { tp2Hit:true, tp1Hit:true, tp1Skipped:false, remaining: pos.remaining - sellFrac,
-          currentSL: pos.tp1 * 0.99, pnl: (pos.pnl || 0) + partPnL };
-        await updatePosition(pos.id, updates); await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, sellFrac));
-        alertMsg = `🎯 *${tp2Label}*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-          `💰 +$${partPnL.toFixed(2)} | SL → TP1 level\n🔗 [Chart](${pos.dexUrl})`;
-        Object.assign(pos, updates);
-      }
-      else if (pos.tp1Hit && pos.tp2Hit && price >= pos.tp3) {
-        const partPnL = fillGain * pos.size * pos.remaining;
-        await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason:'TP3', pnl: (pos.pnl || 0) + partPnL });
-        await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
-        enteredToday.delete(pos.address);
-        const tp3TotalPnl = (pos.pnl || 0) + partPnL;
-        await sendTelegram(`🏆 *TP3 — FULL EXIT*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
-          `Entry: $${fmtPrice(pos.entryPrice)} → $${fmtPrice(exitFillPrice)}\n` +
-          `${fmtTradeResult(pos.size, tp3TotalPnl)}\n🔗 [Chart](${pos.dexUrl})`);
-        continue;
-      }
-    }
+    // ── TP EXITS REMOVED ─────────────────────────────────────────────────────
+    // All TP exits replaced by universal trailing SL.
+    // Capital is recovered at +100% via CAPITAL WITHDRAWAL above.
+    // Everything else rides via progressive trailing SL below.
+    // ─────────────────────────────────────────────────────────────────────────
 
     // ══════════════════════════════════════════════════════════════════════
     // ── CAPITAL FLOOR — PRICE-BASED TRIGGER ──────────────────────────────
@@ -3177,16 +2953,18 @@ async function monitorPositions() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // ── PROGRESSIVE TRAILING SL — ALL STRATEGIES, EVERY TICK ─────────────
-    // Tightens as price rises, floors at 5%
+    // ── UNIVERSAL PROGRESSIVE TRAILING SL ────────────────────────────────
+    // Activates at +50% gain. Trail starts at 50% below ATH, tightens 5%
+    // per +20% ATH move, floor 10%. SL never within 10% of current price
+    // (buffer). SL never below entryPrice (zero-loss). Ratchet: only rises.
     // ══════════════════════════════════════════════════════════════════════
     if (gainPct > 0) {
       let newSL;
+
       if (pos.isMoonBag) {
-        // Moon bag: graduated SL schedule (25 → 20 → 15 → 10 → 5% floor)
+        // ── MOON BAG: graduated SL schedule (25 → 5% floor, unchanged) ────
         const targetPct = getMoonBagSL(gain);
         newSL = price * (1 - targetPct);
-        // Notify when the SL tier actually drops (not every tick)
         const prevGain  = ((pos.peakPrice || pos.entryPrice) - pos.entryPrice) / pos.entryPrice;
         const prevPct   = getMoonBagSL(prevGain);
         if (targetPct < prevPct && newSL > (updates.currentSL ?? pos.currentSL) * 1.005) {
@@ -3196,42 +2974,51 @@ async function monitorPositions() {
             `SL: ${(prevPct*100).toFixed(0)}% → *${(targetPct*100).toFixed(0)}%*\n🔗 [Chart](${pos.dexUrl})`
           );
         }
-      } else if (pos.capitalWithdrawn && pos.capitalWithdrawPrice) {
-        // ── PHASE 2: PROFIT TRAIL ──────────────────────────────────────────
-        // Capital is safe — trail remaining profit tokens only.
-        // Trail starts at 50%, tightens 5% per extra 50% gain from withdrawPrice, min 5%.
-        const profitGainPct = (price - pos.capitalWithdrawPrice) / pos.capitalWithdrawPrice * 100;
-        const trailPct      = calcProfitTrail(profitGainPct);
-        // Floor: never let SL fall below entry (absolute safety net)
-        newSL = Math.max(pos.entryPrice, price * (1 - trailPct / 100));
 
-      } else {
-        // ── PHASE 1: STRATEGY TRAIL + CAPITAL FLOOR ───────────────────────
-        // Capital floor replaces the old per-strategy profit lock.
-        // SL is always ≥ entryPrice (zero-loss from day 1) and rises as gain × 0.50.
-        let trailPct;
-        if (pos.strategyId === 0) {
-          trailPct = calcBBTrail(gainPct);
-        } else if (pos.strategyId === 3) {
-          trailPct = calcORTrail(gainPct);
-        } else {
-          trailPct = calcTrailPct(pos.initialTrailPct, gainPct);
+      } else if (gainPct >= 50) {
+        // ── UNIVERSAL TRAIL: activates at +50% gain ──────────────────────
+        const ATH = currentPeak; // highest price seen for this position
+
+        // Initialise on first activation
+        let trailPct    = pos.trailPct    ?? 50;
+        let tightenBase = pos.tightenBase ?? ATH;
+
+        // Tighten 5% each time ATH rises 20% from last tighten base; floor 10%
+        while (ATH >= tightenBase * 1.20 && trailPct > 10) {
+          trailPct    = Math.max(10, trailPct - 5);
+          tightenBase = ATH;
         }
-        // Trail applies to gain ABOVE entry only — never erodes capital.
-        // e.g. entry $1.00, price $1.34, trail 35% → SL = $1.00 + $0.34×0.65 = $1.221
-        // (old formula would give $1.34 × 0.65 = $0.871, which is BELOW entry — wrong)
-        const rawGain    = price - pos.entryPrice;
-        const trailSL    = rawGain > 0
-          ? pos.entryPrice + rawGain * (1 - trailPct / 100)   // trail on gain above entry
-          : price * (1 - trailPct / 100);                     // below entry — standard trail
-        const capitalSL  = calcCapitalFloor(pos.entryPrice, gain); // always ≥ entryPrice
-        newSL = Math.max(trailSL, capitalSL);
+
+        // Persist trailPct / tightenBase if changed
+        if (trailPct !== pos.trailPct || tightenBase !== pos.tightenBase) {
+          const prevTrail = pos.trailPct ?? 50;
+          updates.trailPct    = trailPct;
+          updates.tightenBase = tightenBase;
+          pos.trailPct        = trailPct;    // patch cache immediately
+          pos.tightenBase     = tightenBase;
+          if (trailPct !== prevTrail) {
+            sendTelegram(
+              `📐 *SL TIGHTENED — ${pos.symbol}*\n` +
+              `Trail: ${prevTrail}% → *${trailPct}%* | Floor: 10%\n` +
+              `ATH: $${fmtPrice(ATH)} | Gain: +${gainPct.toFixed(1)}%\n🔗 [Chart](${pos.dexUrl})`
+            ).catch(() => {});
+          }
+        }
+
+        // Compute SL: trail from ATH, with 10% buffer from current price
+        const idealSL  = ATH   * (1 - trailPct / 100); // e.g. ATH×0.90 at 10% trail
+        const bufferSL = price * 0.90;                  // always ≥10% below current price
+        const rawSL    = Math.min(idealSL, bufferSL);   // whichever gives more room
+        newSL = Math.max(pos.entryPrice, rawSL);         // zero-loss floor
       }
-      const currentSL = updates.currentSL ?? pos.currentSL;
-      // Only write if SL moved ≥ 0.5% — prevents thousands of tiny writes per day
-      if (newSL > currentSL * 1.005) {
-        updates.currentSL      = newSL;
-        updates.trailingActive = true;
+
+      if (newSL !== undefined) {
+        const currentSL = updates.currentSL ?? pos.currentSL;
+        // Only write if SL moved ≥ 0.5% — prevents thousands of tiny writes per day
+        if (newSL > currentSL * 1.005) {
+          updates.currentSL      = newSL;
+          updates.trailingActive = true;
+        }
       }
     }
 
