@@ -116,6 +116,16 @@ const ANTI_MANIP_SC_AVG_TRADE     = 10;   // Surge Catch: lowered from $20 — i
 const ANTI_MANIP_SC_TXNS_MAX      = 150;  // Surge Catch only: 30/min ceiling
 const ANTI_MANIP_SC_MC_LIQ_MAX    = 30;   // Surge Catch: thin pools normal for young surges
 
+// ─── ALLOWED DEX GATE ────────────────────────────────────────────────────────
+// Module-level so both detectStrategy() and scanForEntries() share one definition.
+// Only trade coins on established AMMs; ungraduated pump.fun bonding-curve ('pump-fun')
+// stays blocked.  PumpSwap variants cover likely DexScreener dexId spellings.
+const ALLOWED_DEXES = new Set([
+  'raydium',
+  'pumpswap', 'pump_amm', 'pump-amm', 'pump_swap', 'pump-swap',
+  'meteora',
+]);
+
 // ─── DYNAMIC POSITION SIZING ─────────────────────────────────────────────────
 // Position scales with liquidity (1% of pool ≈ <1% price impact) and market cap.
 // POSITION_SIZE env var is now the MAXIMUM cap — not a fixed amount.
@@ -379,18 +389,8 @@ function detectStrategy(pair, openStrategies) {
   if (!m5Txns || m5Txns < 1) return null;
 
   // ── GRADUATED-DEX GATE ───────────────────────────────────────────────────────
-  // Only trade coins on established AMMs — ungraduated pump.fun bonding-curve
-  // coins ('pump-fun') are blocked. Allowed DEXes:
-  //   • raydium            — classic graduation destination (older coins)
-  //   • pumpswap           — pump.fun's own AMM (new graduation destination, most coins)
-  //   • pump_amm / pump-amm / pump_swap / pump-swap — DexScreener variant spellings
-  //   • meteora            — popular Solana DLMM/AMM used by many legitimate meme coins
-  // All variants included so a DexScreener API change in dexId casing doesn't blind us.
-  const ALLOWED_DEXES = new Set([
-    'raydium',
-    'pumpswap', 'pump_amm', 'pump-amm', 'pump_swap', 'pump-swap',
-    'meteora',
-  ]);
+  // ALLOWED_DEXES defined at module level (shared with scanForEntries).
+  // Bonding-curve pump.fun ('pump-fun') stays blocked; only established AMMs allowed.
   if (!ALLOWED_DEXES.has(dexId)) return null;
 
   // UNIVERSAL AGE RANGE: 1 minute minimum
