@@ -1742,7 +1742,7 @@ async function pollTelegramCommands() {
         const grossProfit = stats.grossProfit  || 0;
         const grossLoss   = stats.grossLoss    || 0;
         const fees        = stats.dailyFees    || 0;
-        const netPnL      = grossProfit - grossLoss - fees;   // true net after fees
+        const netPnL      = grossProfit - grossLoss;   // fees already baked into fill-price PnL
         const currentBal  = startBal + netPnL;
         const netPct      = ((netPnL / startBal) * 100).toFixed(1);
         const netStr      = netPnL >= 0
@@ -1760,9 +1760,9 @@ async function pollTelegramCommands() {
           `💵 Current balance:  *$${currentBal.toFixed(2)}*\n\n` +
           `📈 Gross profit:   +$${grossProfit.toFixed(2)}\n` +
           `📉 Gross loss:     -$${grossLoss.toFixed(2)}\n` +
-          `💸 Fees & charges: -$${fees.toFixed(2)}\n` +
           `─────────────────────\n` +
-          `🏆 Net P&L: *${netStr}*\n\n` +
+          `🏆 Net P&L: *${netStr}*\n` +
+          `💸 Fees (in P&L):  $${fees.toFixed(2)}\n\n` +
           `Position size: *$${posSize.toFixed(2)}* · Limit: ${(DAILY_LOSS_LIMIT * 100).toFixed(0)}%\n` +
           `Scan #: ${scanCount}${pausedNote}\n\n` +
           `_/stats · /ping · /setsize · /mode paper|real · /wallets_`
@@ -1774,16 +1774,16 @@ async function pollTelegramCommands() {
         const grossProfit = stats.grossProfit    || 0;
         const grossLoss   = stats.grossLoss      || 0;
         const fees        = stats.dailyFees      || 0;
-        const netRevenue  = grossProfit - grossLoss - fees;
+        const netRevenue  = grossProfit - grossLoss;   // fees baked into fill-price PnL
         const capital     = stats.capitalDeployed || 0;
         const winRate     = stats.trades > 0 ? ((stats.wins/stats.trades)*100).toFixed(0) : '—';
         await sendTelegram(
           `📈 *DAILY REVENUE REPORT*\n\n` +
           `✅ Gross profit:  +$${grossProfit.toFixed(2)}\n` +
           `❌ Gross loss:    -$${grossLoss.toFixed(2)}\n` +
-          `💸 Fees paid:     -$${fees.toFixed(2)}\n` +
           `─────────────────────\n` +
-          `🏆 Net revenue:   ${netRevenue>=0?'+':''}$${netRevenue.toFixed(2)}\n\n` +
+          `🏆 Net revenue:   ${netRevenue>=0?'+':''}$${netRevenue.toFixed(2)}\n` +
+          `💸 Fees (in P&L): $${fees.toFixed(2)}\n\n` +
           `💼 Capital deployed: $${capital.toFixed(2)}\n` +
           `📊 Trades: ${stats.trades} · Win rate: ${winRate}% (${stats.wins}W/${stats.losses}L)\n` +
           `💰 Running P&L: ${stats.realizedPnL>=0?'+':''}$${stats.realizedPnL.toFixed(2)}`
@@ -2512,10 +2512,14 @@ async function monitorPositions() {
       console.log('[BOT] Daily loss limit hit — closing all positions');
       dayHaltedToday = true;
       for (const pos of remaining_positions) {
-        const price   = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
-        const exitPnl = (price - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
-        const pnl     = (pos.pnl || 0) + exitPnl;
-        await closePosition(pos.id, { exitPrice: price, exitReason: 'DAILY_LIMIT', pnl });
+        const price         = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
+        const exitFillPrice = pos.tradingMode === 'paper'
+          ? simulateFillPrice(price, pos.size * pos.remaining, pos.liquidityAtEntry || 0, false)
+          : price;
+        const exitPnl       = (exitFillPrice - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+        const pnl           = (pos.pnl || 0) + exitPnl;
+        await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'DAILY_LIMIT', pnl });
+        await updateDailyStats(exitPnl, exitPnl > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
         await sendTelegram(`🚨 *DAILY LOSS LIMIT*\n*${pos.symbol}* ${pos.strategyLabel}\n${fmtTradeResult(pos.size, pnl)}`);
       }
       const lostPct = Math.abs((stats.realizedPnL / stats.startBalance) * 100).toFixed(1);
