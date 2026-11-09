@@ -35,6 +35,21 @@ const MIN_SCORE       = 35;  // Nov-5 baseline — wider entry net; reverted fro
 // false = filters suspended (use only during debugging when strategies don't appear)
 const STRATEGY_FILTERS_ACTIVE = true;
 const DAILY_LOSS_LIMIT= -0.30;
+
+// ── PULLBACK WATCHLIST (Bottom Bounce id=0 + Old Recovery id=3) ───────────────
+// BB and OR don't enter immediately — they wait for price to settle at support
+// then confirm a 3% bounce before entering. SC and AM still enter immediately.
+const PULLBACK_FLAT_MIN    = -0.5;         // m5Ch lower bound for "at support" flat zone
+const PULLBACK_FLAT_MAX    =  0.5;         // m5Ch upper bound for "at support" flat zone
+const PULLBACK_BOUNCE_PCT  =  0.03;        // 3% bounce from the low to confirm support held
+const PULLBACK_EXPIRY_MS   = 25 * 60 * 1000; // 25 min — discard if no clean setup emerges
+const PULLBACK_MAX_DROP    =  0.25;        // discard if price drops 25%+ from qualified price
+
+// ── RESISTANCE EXIT ───────────────────────────────────────────────────────────
+// At entry we estimate overhead resistance from h1/h6/h24 price changes.
+// When live price reaches that level → 50% partial exit, rest rides with SL/trail.
+const RESISTANCE_MIN_GAP   =  0.08;        // resistance must be ≥8% above entry to be meaningful
+const RESISTANCE_EXIT_FRAC =  0.50;        // take 50% of remaining at resistance
 const SCAN_INTERVAL   = 15000;  // 15s — entry scanner
 const PRICE_CHECK     =  3000;  //  3s — position monitor (all hot-path reads cached; ~5,760 reads/day total)
 
@@ -635,6 +650,9 @@ const recentSLCoins = new Map();
 // Guards against concurrent-tick races: positions currently being closed
 // (added before the async Firestore write; cleared when done)
 const closingNow    = new Set();
+// Pullback watchlist — BB (id=0) and OR (id=3) coins wait here for support→bounce
+// before entering. Each entry: { qualifiedAt, qualifiedPrice, low, inFlatZone, coin, expiry }
+const pullbackWatchlist = new Map();
 const SL_BLOCK_MS   = 6 * 60 * 60 * 1000; // 6 hours
 let scanCount = 0;
 // Daily loss limit state — set true when limit hit, cleared on /restart
@@ -1216,6 +1234,20 @@ async function enterPosition(coin, overrides = {}) {
     ? simulateFillPrice(rawEntryPrice, posSize, liquidityAtEntry, true)
     : rawEntryPrice;
 
+  // ── RESISTANCE CALCULATION ───────────────────────────────────────────────────
+  // Estimate the nearest overhead resistance from DexScreener percentage change data.
+  // If a coin fell in h1/h6/h24, that prior price level is now resistance.
+  // Only meaningful if at least 8% above entry — closer levels are noise.
+  const ch1r  = coin.ch1  || 0;
+  const ch6r  = coin.ch6  || 0;
+  const ch24r = coin.ch24 || 0;
+  const resistanceCandidates = [];
+  if (ch1r  < 0) resistanceCandidates.push(effectiveEntry / (1 + ch1r  / 100));
+  if (ch6r  < 0) resistanceCandidates.push(effectiveEntry / (1 + ch6r  / 100));
+  if (ch24r < 0) resistanceCandidates.push(effectiveEntry / (1 + ch24r / 100));
+  const meaningfulR = resistanceCandidates.filter(r => r > effectiveEntry * (1 + RESISTANCE_MIN_GAP));
+  const resistancePrice = meaningfulR.length > 0 ? Math.min(...meaningfulR) : null;
+
   // ── YOUNG COIN TIGHTER SL (< 1 hour old) ────────────────────────────────────
   // Rug pulls happen fastest on coins that just launched — cap the initial SL
   // at 10% below entry so we don't ride a rug all the way to zero.
@@ -1250,6 +1282,9 @@ async function enterPosition(coin, overrides = {}) {
     freeRide:        usePartial ? false : null,
     isManual:        overrides.isManual || false,
     advisoryNote:    advisoryNote,  // non-null = dashboard shows advisory toast on next refresh
+    // Overhead resistance — 50% partial exit fires when price reaches this level
+    resistancePrice: resistancePrice,
+    resistanceHit:   false,
     // Young coin mode flag (kept for reference — no longer drives TP exits)
     youngCoin: (s.id === 1 && (coin.ageMinutes || 0) < 60),
     // Age at entry — reference only
@@ -1566,6 +1601,125 @@ async function getCurrentPriceAndLiq(address, chain) {
       liq:   pairs[0].liquidity?.usd ?? null,
     };
   } catch(e) { return { price: null, liq: null }; }
+}
+
+// ─── PULLBACK WATCHLIST PROCESSOR ────────────────────────────────────────────
+// Called each scan cycle. Checks BB and OR coins sitting in the watchlist.
+// When a coin hits the flat zone (-0.5% ≤ m5Ch ≤ +0.5%) and then bounces 3%
+// from its low, it's confirmed at support and we enter.
+async function processPullbackWatchlist(positions, slotCount, usedThisScan) {
+  if (pullbackWatchlist.size === 0) return;
+  const now = Date.now();
+
+  for (const [addr, entry] of pullbackWatchlist) {
+    // ── Expiry ───────────────────────────────────────────────────────────────
+    if (now > entry.expiry) {
+      console.log(`[PBW] ${entry.coin.symbol} expired — no clean support setup in 25min`);
+      pullbackWatchlist.delete(addr);
+      continue;
+    }
+    // ── Already entered / on cooldown ────────────────────────────────────────
+    if (enteredToday.has(addr) || recentSLCoins.has(addr)) {
+      pullbackWatchlist.delete(addr);
+      continue;
+    }
+    // ── Already in an open position ──────────────────────────────────────────
+    if (positions.find(p => p.address === addr)) {
+      pullbackWatchlist.delete(addr);
+      continue;
+    }
+
+    // ── Fetch fresh pair data ────────────────────────────────────────────────
+    let price, m5Ch, freshLiq;
+    try {
+      const r = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${addr}`);
+      const d = JSON.parse(r.body);
+      const pairs = (d.pairs || []).filter(p => p.chainId === entry.coin.chain);
+      if (!pairs.length) continue;
+      pairs.sort((a,b) => (b.liquidity?.usd||0) - (a.liquidity?.usd||0));
+      const pair = pairs[0];
+      price    = parseFloat(pair.priceUsd || 0);
+      m5Ch     = parseFloat(pair.priceChange?.m5 || 0);
+      freshLiq = pair.liquidity?.usd || entry.coin.liq;
+    } catch(e) { continue; }
+    if (!price || price <= 0) continue;
+
+    // ── Collapse guard — if dropped 25%+ from qualified price, discard ───────
+    if (price < entry.qualifiedPrice * (1 - PULLBACK_MAX_DROP)) {
+      console.log(`[PBW] ${entry.coin.symbol} collapsed — discarding watchlist entry`);
+      pullbackWatchlist.delete(addr);
+      continue;
+    }
+
+    // ── Track the low ────────────────────────────────────────────────────────
+    if (price < entry.low) entry.low = price;
+
+    // ── Detect flat zone (at support) ────────────────────────────────────────
+    if (m5Ch >= PULLBACK_FLAT_MIN && m5Ch <= PULLBACK_FLAT_MAX) {
+      if (!entry.inFlatZone) {
+        entry.inFlatZone = true;
+        console.log(`[PBW] ${entry.coin.symbol} in flat zone (m5:${m5Ch.toFixed(2)}%) at $${fmtPrice(price)} — waiting for bounce`);
+      }
+    }
+
+    // ── Confirm bounce (3% from low, only after flat zone detected) ──────────
+    if (entry.inFlatZone && price >= entry.low * (1 + PULLBACK_BOUNCE_PCT)) {
+      const pullPct   = ((1 - entry.low / entry.qualifiedPrice) * 100).toFixed(1);
+      const bouncePct = ((price / entry.low - 1) * 100).toFixed(1);
+      console.log(`[PBW] ${entry.coin.symbol} bounce confirmed: pulled ${pullPct}% → bounced ${bouncePct}% from $${fmtPrice(entry.low)} — entering`);
+      pullbackWatchlist.delete(addr);
+
+      // Check slots still available
+      if (positions.length >= MAX_POSITIONS) continue;
+      if (entry.coin.strategy.id !== 2 && positions.length >= MAX_POSITIONS - SURGE_RESERVED) continue;
+      if (slotCount[entry.coin.strategy.id] >= entry.coin.strategy.maxSlots) continue;
+
+      // Update coin with fresh price/liq/m5Ch and pullback badge data
+      const coin = { ...entry.coin, price, liq: freshLiq, m5Ch };
+      coin._pulledBackPct = pullPct;
+      coin._bouncedPct    = bouncePct;
+
+      enteredToday.add(addr);
+      usedThisScan.add(addr);
+      const pos = await enterPosition(coin);
+      if (!pos) {
+        enteredToday.delete(addr);
+        continue;
+      }
+      alertCooldown.set(addr, Date.now());
+      positions.push(pos);
+      slotCount[entry.coin.strategy.id]++;
+
+      // ── Telegram entry notification ───────────────────────────────────────
+      const s       = coin.strategy;
+      const ageLabel = coin.ageMinutes < 60
+        ? `${Math.round(coin.ageMinutes)}min old`
+        : `${(coin.ageDays * 24).toFixed(1)}h old`;
+      const tpInfo = s.usePartialProfit
+        ? `🎯 Stage 1 (+50%): sell 25%\n🎯 Stage 2 (+100%): sell 30%\n🎯 Stage 3 (+200%): sell 15% → free ride\n`
+        : `🎯 TP1: $${fmtPrice(coin.price * s.tp1x)} (+${((s.tp1x-1)*100).toFixed(0)}%) → 50%\n` +
+          `🎯 TP2: $${fmtPrice(coin.price * s.tp2x)} (+${((s.tp2x-1)*100).toFixed(0)}%) → 30%\n` +
+          `🎯 TP3: $${fmtPrice(coin.price * s.tp3x)} (+${((s.tp3x-1)*100).toFixed(0)}%) → 20%\n`;
+      const modeHeader = pos.tradingMode === 'real'
+        ? `💰 *BOT ENTERED — REAL TRADE*`
+        : `✅ *BOT ENTERED — PAPER TRADE*`;
+      await sendTelegram(
+        `${modeHeader}\n\n` +
+        `*${coin.symbol}* — ${coin.name}\n` +
+        `${s.label} · Score: *${coin.score}/100*\n` +
+        `📉 Pullback entry: -${pullPct}% → +${bouncePct}% bounce confirmed at support\n` +
+        `💡 ${s.desc}\n\n` +
+        `💵 Entry: $${fmtPrice(coin.price)}\n` +
+        `💰 Position: ${pos.sizeNote || '$'+pos.size}${pos.walletLabel ? ` · ${pos.walletLabel}` : ''}\n` +
+        `📊 Buy%: ${coin.buyPct.toFixed(0)}% | Liq: $${(coin.liq/1000).toFixed(0)}k\n` +
+        `📈 Age: ${ageLabel} | m5: ${m5Ch>0?'+':''}${m5Ch.toFixed(1)}% | h1: ${coin.ch1!=null?(coin.ch1>0?'+':'')+coin.ch1.toFixed(1)+'%':'<1h'}\n\n` +
+        tpInfo +
+        `🛑 SL: $${fmtPrice(coin.price * s.slx)} | Trail: ${s.initialTrailPct}% → floors at 5%\n\n` +
+        `\`${coin.addr}\`\n🔗 [Chart](${coin.dexUrl})`
+      );
+      console.log(`[BOT] Entered ${coin.symbol} via ${s.label} (pullback) at $${coin.price}`);
+    }
+  }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2990,6 +3144,39 @@ async function monitorPositions() {
       }
     }
 
+    // ── RESISTANCE EXIT — 50% partial at estimated overhead resistance ─────────
+    // Computed at entry from h1/h6/h24 DexScreener data. Fires once per position.
+    // Takes 50% — locks profit at the first overhead wall, lets rest ride with SL/trail.
+    if (pos.resistancePrice && !pos.resistanceHit && price >= pos.resistancePrice
+        && !closingNow.has(pos.id) && pos.remaining > 0.05) {
+      // exitFrac = fraction of *remaining* to sell (0.50 = sell half of what's left)
+      const exitFrac      = Math.min(RESISTANCE_EXIT_FRAC, 1 - 0.01 / pos.remaining);
+      const amountSold    = exitFrac * pos.remaining;          // as fraction of original position
+      const exitFillPrice = pos.tradingMode === 'paper'
+        ? simulateFillPrice(price, pos.size * amountSold, pos.liquidityAtEntry || 0, false)
+        : price;
+      const partPnL      = (exitFillPrice - pos.entryPrice) / pos.entryPrice * pos.size * amountSold;
+      const newRemaining = +(pos.remaining * (1 - exitFrac)).toFixed(6);
+      const resistUpdates = {
+        resistanceHit: true,
+        remaining:     newRemaining,
+        pnl:           (pos.pnl || 0) + partPnL,
+      };
+      await updatePosition(pos.id, resistUpdates);
+      await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, amountSold));
+      Object.assign(pos, resistUpdates);
+      await sendTelegram(
+        `🧱 *RESISTANCE — PARTIAL EXIT*\n\n` +
+        `*${pos.symbol}* ${pos.strategyLabel}\n` +
+        `📐 Resistance hit at $${fmtPrice(pos.resistancePrice)}\n` +
+        `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
+        `💰 P&L (${(exitFrac*100).toFixed(0)}%): *${partPnL >= 0 ? '+' : ''}$${partPnL.toFixed(2)}*\n` +
+        `📊 ${(newRemaining * 100).toFixed(0)}% remains — riding with SL & trail\n` +
+        `🔗 [Chart](${pos.dexUrl})`
+      );
+      console.log(`[BOT] RESISTANCE_EXIT ${pos.symbol}: hit $${fmtPrice(pos.resistancePrice)}, pnL +$${partPnL.toFixed(2)}`);
+    }
+
     // ── TP EXITS REMOVED ─────────────────────────────────────────────────────
     // All TP exits replaced by universal trailing SL.
     // Capital is recovered at +100% via CAPITAL WITHDRAWAL above.
@@ -3679,6 +3866,25 @@ async function scanForEntries() {
       }
     }
 
+    // ── PULLBACK WATCHLIST — BB (id=0) and OR (id=3) ────────────────────────────
+    // These strategies must enter at support, not mid-bounce.
+    // Add to watchlist and wait for flat zone → 3% bounce before entering.
+    // Exception: range re-entries already confirmed at support — enter immediately.
+    if ((coin.strategy.id === 0 || coin.strategy.id === 3) && !coin._rangeReentry) {
+      if (!pullbackWatchlist.has(coin.addr)) {
+        pullbackWatchlist.set(coin.addr, {
+          qualifiedAt:    Date.now(),
+          qualifiedPrice: coin.price,
+          low:            coin.price,
+          inFlatZone:     false,
+          coin:           { ...coin },
+          expiry:         Date.now() + PULLBACK_EXPIRY_MS,
+        });
+        console.log(`[PBW] ${coin.symbol} ${coin.strategy.label} → watchlist (waiting for support bounce)`);
+      }
+      continue; // do NOT enter immediately
+    }
+
     // Reserve coin BEFORE the async enterPosition call — a concurrent scan tick
     // starting during the Firestore await would otherwise find the coin absent
     // from enteredToday and enter it a second time. Roll back if entry fails.
@@ -3748,6 +3954,9 @@ async function scanForEntries() {
     );
     console.log(`[BOT] Entered ${coin.symbol} via ${s.label} at $${coin.price}`);
   }
+
+  // Process pullback watchlist — check BB and OR coins waiting for support bounce
+  await processPullbackWatchlist(positions, slotCount, usedThisScan);
 }
 
 // ─── HOURLY SUMMARY ───────────────────────────────────────────────────────────
