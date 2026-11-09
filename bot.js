@@ -415,7 +415,13 @@ function detectStrategy(pair, openStrategies) {
   // ── GRADUATED-DEX GATE ───────────────────────────────────────────────────────
   // ALLOWED_DEXES defined at module level (shared with scanForEntries).
   // Bonding-curve pump.fun ('pump-fun') stays blocked; only established AMMs allowed.
-  if (!ALLOWED_DEXES.has(dexId)) return null;
+  if (!ALLOWED_DEXES.has(dexId)) {
+    // Log rejected dexIds so we can confirm/expand ALLOWED_DEXES — remove once confirmed
+    if (dexId && dexId !== 'pump-fun' && dexId !== 'pumpfun') {
+      console.log(`[DEX-GATE] Blocked: dexId="${dexId}" symbol=${pair.baseToken?.symbol}`);
+    }
+    return null;
+  }
 
   // UNIVERSAL AGE RANGE: 1 minute minimum
   if (ageMinutes < 1) return null;
