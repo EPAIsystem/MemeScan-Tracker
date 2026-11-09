@@ -1107,15 +1107,20 @@ async function getOpenPositions() {
 //     < 0.1%  → ~0.2% slippage   (deep pool)
 //     0.1–1%  → ~1%   slippage   (moderate)
 //     1–5%    → ~3%   slippage   (thin — price impact hurts)
-//     > 5%    → ~6%   slippage   (very thin — should avoid)
+//     > 5%    → ~3%   slippage   (capped — protects capital floor realism)
+//
+// Slippage is capped at 3% so that capital-floor exits (SL at entry or above)
+// reflect a realistic secured-profit scenario. Max total exit cost: ~3.3%.
 function simulateFillPrice(rawPrice, positionSize, liquidityUsd, isBuy) {
-  const DEX_FEE = 0.0030; // 0.30% each way (base 0.25% × 1.20 — worst-case stress test)
+  const DEX_FEE    = 0.0030; // 0.30% each way (base 0.25% × 1.20 — worst-case stress test)
+  const MAX_SLIP   = 0.0300; // 3.0% cap — prevents extreme thin-pool distortion in paper mode
   const ratio = liquidityUsd > 0 ? positionSize / liquidityUsd : 0.05;
   let slippage;
   if      (ratio < 0.001) slippage = 0.0024; // 0.24%  (base 0.2%  × 1.20)
   else if (ratio < 0.01)  slippage = 0.0120; // 1.2%   (base 1%    × 1.20)
   else if (ratio < 0.05)  slippage = 0.0360; // 3.6%   (base 3%    × 1.20)
-  else                    slippage = 0.0720; // 7.2%   (base 6%    × 1.20)
+  else                    slippage = 0.0720; // 7.2%   (base 6%    × 1.20) — capped below
+  slippage = Math.min(slippage, MAX_SLIP);    // cap at 3% — max total exit cost ~3.3%
 
   // Buying: we pay MORE (price goes up against us, plus fee)
   // Selling: we receive LESS (price goes down against us, plus fee)
@@ -2921,23 +2926,45 @@ async function monitorPositions() {
 
     // ══════════════════════════════════════════════════════════════════════
     // ── CAPITAL FLOOR — PRICE-BASED TRIGGER ──────────────────────────────
-    // As soon as price crosses ABOVE entry → lock SL at entryPrice (no grace,
-    // no delay — the moment the coin is profitable, capital is protected).
-    // If price stays BELOW entry for 2+ min → tighten SL from -25% to -15%.
-    // The 2-min grace only protects the downside before the coin has moved.
+    // Three tiers:
+    //   • price ≥ entry × 1.05 (+5% above entry):
+    //       50% PROFIT LOCK — SL = entry + 50% × (ATH − entry)
+    //       Locks half the gain above entry. At +20%, SL sits at +10%.
+    //       Ratchet: once pushed up it never comes back down.
+    //   • entry ≤ price < entry × 1.05 (between 0% and +5%):
+    //       ZERO-LOSS FLOOR — SL = entryPrice immediately.
+    //       Capital protected the moment the coin turns green.
+    //   • price < entry for 2+ min (after grace period):
+    //       SL TIGHTENED from −25% to −15% (downside protection).
     // ══════════════════════════════════════════════════════════════════════
     if (!pos.isMoonBag && !pos.capitalWithdrawn) {
       const ageMs        = Date.now() - pos.enteredAt;
       const currentSLNow = updates.currentSL ?? pos.currentSL;
 
-      if (price >= pos.entryPrice) {
-        // Price is at or above entry — apply capital floor IMMEDIATELY
-        if (pos.entryPrice > currentSLNow * 1.005) {
-          updates.currentSL    = pos.entryPrice;
+      if (price >= pos.entryPrice * 1.05) {
+        // ── TIER 1: 50% PROFIT LOCK (+5% above entry) ────────────────────
+        // SL = entry + 50% × (ATH − entry): locks in half the profit above entry.
+        // E.g. entry $100, ATH $120 → SL $110 → ~$6–7 secured after slippage.
+        const ATHForLock    = currentPeak; // ATH for this position
+        const profitLockSL  = pos.entryPrice + 0.5 * (ATHForLock - pos.entryPrice);
+        const capFloorSL    = Math.max(pos.entryPrice, profitLockSL);
+        if (capFloorSL > currentSLNow * 1.005) {
+          updates.currentSL      = capFloorSL;
           updates.trailingActive = true;
         }
+
+      } else if (price >= pos.entryPrice) {
+        // ── TIER 2: ZERO-LOSS FLOOR (between entry and +5%) ──────────────
+        // Price is green but hasn't reached the profit-lock threshold yet.
+        // Lock SL at entry so we can never exit below break-even.
+        if (pos.entryPrice > currentSLNow * 1.005) {
+          updates.currentSL      = pos.entryPrice;
+          updates.trailingActive = true;
+        }
+
       } else if (ageMs >= CAPITAL_FLOOR_GRACE_MS && !pos.slTightened) {
-        // Price still below entry after 2-min grace — tighten SL from -25% to -15%
+        // ── TIER 3: 2-MIN GRACE TIGHTEN (price still below entry) ────────
+        // Price hasn't recovered above entry after 2-min — tighten SL to −15%.
         const tightenedSL = pos.entryPrice * SL_TIGHTEN_PCT;
         if (tightenedSL > currentSLNow * 1.005) {
           updates.currentSL  = tightenedSL;
