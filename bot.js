@@ -139,6 +139,7 @@ const ALLOWED_DEXES = new Set([
   'raydium',
   'pumpswap', 'pump_amm', 'pump-amm', 'pump_swap', 'pump-swap',
   'meteora',
+  'orca',          // Solana AMM — confirmed blocked in logs (should be allowed)
 ]);
 
 // ─── DYNAMIC POSITION SIZING ─────────────────────────────────────────────────
