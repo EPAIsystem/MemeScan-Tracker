@@ -314,6 +314,35 @@ const STRATEGIES = [
     slx: 0.92,
     initialTrailPct: 8,
   },
+  {
+    id: 4,
+    label: '🎯 PUMP SPEC',
+    maxSlots: 5,  // tight cap — these are high-risk speculative entries
+    desc: 'Pump.fun + PumpSwap on pullback — capital recovery + profit trail',
+    // ── Entry criteria ──
+    minLiq: 3000,
+    minLiqLocked: 3000,
+    minH1Ch: 5,          // h1 must be strongly up — confirms an uptrend is running
+    minM5Ch: -5,         // allow pullback entry — not chasing the top
+    maxM5Ch: 2,          // not at the very peak of a move
+    minM5Sells: 1,       // at least one sell — confirms real 2-sided trading
+    minBuyPct: 55,       // buyers in control
+    minM5Txns: 10,       // meaningful 5-min activity
+    maxMcLiqRatio: 60,   // more lenient ratio for thin pump pools
+    rugCheckMaxRisk: 50, // stricter rug threshold (50 vs standard 60)
+    // ── SL / TP (custom schedule — handled in monitor loop for id=4) ──
+    slx: 0.60,           // initial SL = entry − 40%
+    maxPositionSize: 50, // hard cap at $50 — overrides dynamic ceiling
+    // SL phases (see monitorPositions Strategy 5 block):
+    //   0–19%:   flat −40% from entry
+    //  20–59%:   break-even lock (SL = entry)
+    //  60–79%:   −35% trail from ATH
+    //  80–99%:   −30% trail from ATH
+    // 100%+:     capital recovery (sell enough to recover invested amount)
+    //  post-recovery: −25% → −20% → −15% → −10% floor trail
+    //   at 4× (300% gain): profit halving — sell 50% of remaining
+    initialTrailPct: 40,  // used for display only; actual trail managed in monitor
+  },
 ];
 
 // ── UNIVERSAL PROGRESSIVE TRAILING SL ────────────────────────────────────────
@@ -409,11 +438,19 @@ function detectStrategy(pair, openStrategies) {
   // strategy scoring. The $20 global gate was killing SC candidates before SC's
   // own gate ever ran. buyPct and m5Txns gates still apply to ALL young coins.
   const scIsOpen = openStrategies.some(st => st.id === 2);
+  const s5OpenForYoung = isPumpFun && openStrategies.some(st => st.id === 4);
   if (ageDays < 1) {
-    // avgTrade gate: $20 for all strategies except SC (which uses its own $15 gate)
-    if (!scIsOpen && avgTrade !== null && avgTrade < 20) return rej('young');
-    if (buyPct < 60)  return rej('young');  // strongly buyer-dominated momentum required
-    if (m5Txns  < 25) return rej('young');  // confirms genuine 5-min activity
+    // avgTrade gate: $20 for all strategies except SC and pump.fun→S5
+    // SC has its own $15 gate; pump.fun coins for S5 use the global floor ($8) only.
+    if (!scIsOpen && !s5OpenForYoung && avgTrade !== null && avgTrade < 20) return rej('young');
+    if (s5OpenForYoung) {
+      // Pump.fun → Strategy 5: use S5's own (more lenient) thresholds
+      if (buyPct < 55) return rej('young');  // S5 minBuyPct
+      if (m5Txns  < 10) return rej('young'); // S5 minM5Txns
+    } else {
+      if (buyPct < 60)  return rej('young'); // strongly buyer-dominated momentum required
+      if (m5Txns  < 25) return rej('young'); // confirms genuine 5-min activity
+    }
   }
 
   // DEAD COIN GUARD: reject coins where the 1h price change is missing or effectively flat.
@@ -458,13 +495,18 @@ function detectStrategy(pair, openStrategies) {
 
   // ── GRADUATED-DEX GATE ───────────────────────────────────────────────────────
   // ALLOWED_DEXES defined at module level (shared with scanForEntries).
-  // Bonding-curve pump.fun ('pump-fun') stays blocked; only established AMMs allowed.
+  // Bonding-curve pump.fun ('pump-fun') normally blocked; allowed through ONLY when
+  // Strategy 5 (Pump Speculative) is open — it has its own entry criteria for them.
   if (!ALLOWED_DEXES.has(dexId)) {
-    // Log rejected dexIds so we can confirm/expand ALLOWED_DEXES — remove once confirmed
-    if (dexId && dexId !== 'pump-fun' && dexId !== 'pumpfun') {
-      console.log(`[DEX-GATE] Blocked: dexId="${dexId}" symbol=${pair.baseToken?.symbol}`);
+    const s5Open = openStrategies.some(st => st.id === 4);
+    if (!(isPumpFun && s5Open)) {
+      // Log unknown dexIds so we can expand ALLOWED_DEXES — remove once confirmed
+      if (dexId && dexId !== 'pump-fun' && dexId !== 'pumpfun') {
+        console.log(`[DEX-GATE] Blocked: dexId="${dexId}" symbol=${pair.baseToken?.symbol}`);
+      }
+      return rej('dex');
     }
-    return rej('dex');
+    // pump.fun + Strategy 5 open — fall through to Strategy 5 evaluation
   }
 
   // UNIVERSAL AGE RANGE: 1 minute minimum
@@ -481,7 +523,12 @@ function detectStrategy(pair, openStrategies) {
   //
   // Exception: Bottom Bounce (id=0) is designed to enter on oversold recovery —
   // it can have a slightly negative m5 as the coin is stabilising. Allow m5Ch ≥ -1%.
-  if (m5Ch !== null && m5Ch < -1) return rej('mom'); // declining — wait for it to turn around
+  // Strategy 5 (Pump Spec) enters on pullbacks — allow m5Ch down to -5% when s5 is open.
+  // All other strategies require m5Ch ≥ -1% (no meaningful decline allowed).
+  if (m5Ch !== null && m5Ch < -1) {
+    const s5Open = openStrategies.some(st => st.id === 4);
+    if (!s5Open || m5Ch < -5) return rej('mom'); // declining too hard — skip
+  }
 
   const liveHist = priceHistory.get(addr) || [];
   if (liveHist.length >= 3) {
@@ -510,12 +557,14 @@ function detectStrategy(pair, openStrategies) {
 
     if (s.id === 0) {
       // ── BOTTOM BOUNCE — Path A only (Nov-9 overhaul) ────────────────────
+      // Pump.fun bonding-curve coins ONLY go to Strategy 5; skip for BB.
+      if (isPumpFun) { match = false; }
       // Paths B (trending pullback) and C (steady restart) removed:
       //   Path B was an AM signal mixed into BB — diluting BB quality.
       //   Path C was too generic — caught too many non-bounce setups.
       // BB is now ONLY for genuine oversold recovery: coin crashed 20–85%,
       // h1 turning up, m5 actively bouncing NOW with strong buyer conviction.
-      if (!STRATEGY_FILTERS_ACTIVE) {
+      else if (!STRATEGY_FILTERS_ACTIVE) {
         match = true;
       } else {
 
@@ -549,7 +598,9 @@ function detectStrategy(pair, openStrategies) {
 
     else if (s.id === 1) {
       // ── ACTIVE MOMENTUM ────────────────────────────────────────────────────
-      if (STRATEGY_FILTERS_ACTIVE) {
+      // Pump.fun bonding-curve coins ONLY go to Strategy 5; skip for AM.
+      if (isPumpFun) { match = false; }
+      else if (STRATEGY_FILTERS_ACTIVE) {
         if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // 2h+ only — SC covers 0–24h
         if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // 3-day cap — SC/BB handle older
         if (m5Txns < s.minM5Txns)  { match = false; }
@@ -580,9 +631,11 @@ function detectStrategy(pair, openStrategies) {
 
     else if (s.id === 2) {
       // ── SURGE CATCH ────────────────────────────────────────────────────────
+      // Pump.fun bonding-curve coins ONLY go to Strategy 5; skip for SC.
+      if (isPumpFun) { match = false; }
       // Primary signal: m5 activity — catch it WHILE it's happening
       // Age gate: 0–24 hours (recently graduated coins surge post-migration)
-      if (STRATEGY_FILTERS_ACTIVE) {
+      else if (STRATEGY_FILTERS_ACTIVE) {
         if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // over 24h → AM/BB/OR
         if (m5Ch < s.minM5Ch)      { match = false; } // must be moving in last 5 min
         if (m5Txns < s.minM5Txns)  { match = false; } // must be very active
@@ -618,7 +671,9 @@ function detectStrategy(pair, openStrategies) {
 
     else if (s.id === 3) {
       // ── OLD RECOVERY ───────────────────────────────────────────────────────
-      if (STRATEGY_FILTERS_ACTIVE) {
+      // Pump.fun bonding-curve coins ONLY go to Strategy 5; skip for OR.
+      if (isPumpFun) { match = false; }
+      else if (STRATEGY_FILTERS_ACTIVE) {
         if (ageDays < s.minAgeDays)  { match = false; }
         if (ch24 < s.minCh24)        { match = false; }
         if (ch1 < s.minCh1)          { match = false; }
@@ -643,6 +698,41 @@ function detectStrategy(pair, openStrategies) {
         if (avgTrade !== null) {
           if (avgTrade > 80) score += 5;
           else if (avgTrade < 30) score -= 10;
+        }
+      }
+    }
+
+    else if (s.id === 4) {
+      // ── PUMP SPECULATIVE (pump.fun + PumpSwap on pullback) ────────────────
+      // pump.fun bonding-curve OR PumpSwap graduated coins only.
+      const isPumpSwap = ['pumpswap','pump_amm','pump-amm','pump_swap','pump-swap'].includes(dexId);
+      if (!isPumpFun && !isPumpSwap) {
+        match = false;
+      } else if (STRATEGY_FILTERS_ACTIVE) {
+        // h1 must be strongly up — confirms an uptrend is running
+        if (ch1 === null || ch1 < s.minH1Ch)              { match = false; }
+        // m5 in pullback zone — not at the peak, not in freefall
+        if (m5Ch < s.minM5Ch || m5Ch > s.maxM5Ch)         { match = false; }
+        // at least one sell — confirms real 2-sided trading (not 100% buy-only pump)
+        if (m5Sells < (s.minM5Sells || 1))                 { match = false; }
+        if (buyPct < s.minBuyPct)                          { match = false; }
+        if (m5Txns < s.minM5Txns)                          { match = false; }
+        if (liq < s.minLiq)                                { match = false; }
+        if (mcLiqRatio > s.maxMcLiqRatio)                  { match = false; }
+      }
+
+      if (match) {
+        score += Math.min(20, m5Txns * 2);           // activity confidence
+        if (ch1 > 20)   score += 15; else if (ch1 > 10) score += 8;
+        if (buyPct > 70) score += 10; else if (buyPct > 60) score += 5;
+        // Shallow pullback is the ideal entry (-2% to 0% m5)
+        if (m5Ch >= -2 && m5Ch <= 0) score += 10;
+        else if (m5Ch > 0 && m5Ch <= 1) score += 6; // modest positive fine too
+        if (mcSweetSpot) score += 10;
+        if (liq > 10000) score += 5; else if (liq > 5000) score += 2;
+        if (avgTrade !== null) {
+          if (avgTrade > 50) score += 5;
+          else if (avgTrade < 10) score -= 5;
         }
       }
     }
@@ -1208,8 +1298,10 @@ async function enterPosition(coin, overrides = {}) {
   // ── Trading mode & wallet ──────────────────────────────────────────────────
   const cfg        = await getTradingConfig();
   // positionSize: dynamic sizing (liq × 1% × MC multiplier), capped at /setsize override or POSITION_SIZE env var
-  const ceiling    = overrides.size || parseFloat(cfg.positionSize) || POSITION_SIZE;
-  const posSize    = calcDynamicPositionSize(coin.liq || 0, coin.mcap || 0, ceiling);
+  const ceiling      = overrides.size || parseFloat(cfg.positionSize) || POSITION_SIZE;
+  // Strategy 5 (Pump Spec) has a hard $50 cap to limit exposure on volatile bonding-curve coins
+  const stratCeiling = s.maxPositionSize ? Math.min(s.maxPositionSize, ceiling) : ceiling;
+  const posSize      = calcDynamicPositionSize(coin.liq || 0, coin.mcap || 0, stratCeiling);
   const rawSize    = (coin.liq || 0) * 0.01;  // 1% of liq before MC multiplier & ceiling
   const posSizeNote = posSize >= ceiling
     ? `$${posSize.toFixed(2)} _(capped — liq 1% = $${rawSize.toFixed(0)})_`
@@ -1277,7 +1369,9 @@ async function enterPosition(coin, overrides = {}) {
   // Rug pulls happen fastest on coins that just launched — cap the initial SL
   // at 10% below entry so we don't ride a rug all the way to zero.
   // If the strategy's normal SL is already tighter (slx > 0.90), keep it as-is.
-  const isYoungCoin   = (coin.ageMinutes || 999) < 60;
+  // Strategy 5 (Pump Spec) deliberately uses a wide −40% SL (slx=0.60); skip the
+  // young-coin floor so it isn't overridden to −10%, which would trigger immediately.
+  const isYoungCoin   = (coin.ageMinutes || 999) < 60 && s.id !== 4;
   const youngSLFloor  = 0.90; // max 10% below entry for < 1h coins
   const initialSLPrice = isYoungCoin
     ? Math.max(effectiveEntry * s.slx, effectiveEntry * youngSLFloor)
@@ -1319,6 +1413,8 @@ async function enterPosition(coin, overrides = {}) {
     tightenBase: null,   // ATH at last tighten event
     // Surge momentum: skip TP1/TP2, ride to 80%+ then full-exit & reinvest
     surgeMomentum: isSurge,
+    // Strategy 5 (Pump Spec) profit-halving at 4× — false until triggered, null for other strategies
+    s5ProfitHalved: s.id === 4 ? false : undefined,
     // Moon bag: funded from surge reinvestment — uses graduated SL, no TP exits
     isMoonBag: overrides.isMoonBag || false,
     isReinvest: overrides.isReinvest || false,
@@ -2836,8 +2932,11 @@ async function filterByLpLock(matches) {
       }
 
       // ── 5: Risk score gate ────────────────────────────────────────────────
-      if (rc.riskScore > 60) {
-        console.log(`[RUGCHECK] ❌ ${coin.symbol} — risk score ${rc.riskScore}/100 (>60), rejected`);
+      // Strategy 5 (Pump Spec) uses a stricter threshold (50 vs standard 60)
+      // because pump.fun / PumpSwap coins carry higher inherent rug risk.
+      const maxRiskScore = coin.strategy?.rugCheckMaxRisk ?? 60;
+      if (rc.riskScore > maxRiskScore) {
+        console.log(`[RUGCHECK] ❌ ${coin.symbol} — risk score ${rc.riskScore}/100 (>${maxRiskScore}), rejected`);
         lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
         continue;
       }
@@ -2850,15 +2949,27 @@ async function filterByLpLock(matches) {
         continue;
       }
 
+      // ── 6b: Strategy 5 pump.fun bonding-curve coins — no traditional LP ───
+      // Bonding-curve tokens have no separate LP pool; rug risk is captured by
+      // the risk score alone. If score ≤ 50, allow through directly.
+      if (coin.isPumpFun && coin.strategy?.id === 4) {
+        console.log(`[RUGCHECK] ✅ ${coin.symbol} — pump.fun bonding-curve, risk ${rc.riskScore}/100, PASSED (S5)`);
+        lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
+        passed.add(coin.addr);
+        continue;
+      }
+
       // ── 7: LP NOT locked — strict floor check → probation or hard block ───
       const strictLiq   = coin.strategy?.minLiq || Infinity;
       const strictRatio = ANTI_MANIP_MC_LIQ_RATIO_MAX; // 30×
       const liqOk       = coin.liq >= strictLiq;
       const ratioOk     = (coin.mcLiqRatio || 999) <= strictRatio;
+      // S5 PumpSwap unlocked: allow if risk ≤ 40 (same as standard unlocked threshold)
+      const maxUnlockedRisk = 40;
 
-      if (rc.riskScore > 40) {
+      if (rc.riskScore > maxUnlockedRisk) {
         // Too risky even for probation
-        console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked, risk ${rc.riskScore}/100 (>40), rejected`);
+        console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked, risk ${rc.riskScore}/100 (>${maxUnlockedRisk}), rejected`);
         lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
       } else if (!liqOk) {
         // Thin pool without LP lock guarantee — too dangerous
@@ -3410,6 +3521,41 @@ async function monitorPositions() {
       }
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // ── STRATEGY 5 — PROFIT HALVING at 4× entry (300% gain) ─────────────
+    // After capital recovery, sell 50% of remaining at 4× — locks substantial
+    // profit while letting the other 50% ride the -10% floor trail to max upside.
+    // Fires once (s5ProfitHalved flag prevents repeat).
+    // ══════════════════════════════════════════════════════════════════════
+    if (pos.strategyId === 4 && pos.capitalWithdrawn && !pos.s5ProfitHalved
+        && gain >= 3.0 && pos.remaining > 0.01 && !closingNow.has(pos.id)) {
+      const halveFrac    = 0.50;
+      const amountSold   = halveFrac * pos.remaining;
+      const halveExit    = pos.tradingMode === 'paper'
+        ? simulateFillPrice(price, pos.size * amountSold, pos.liquidityAtEntry || 0, false)
+        : price;
+      const proceeds     = amountSold * pos.size * (halveExit / pos.entryPrice);
+      const partPnL      = fillGain * pos.size * amountSold;
+      const newRemaining = +(pos.remaining * (1 - halveFrac)).toFixed(6);
+      const halvUpdates  = {
+        s5ProfitHalved: true,
+        remaining:      newRemaining,
+        pnl:            (pos.pnl || 0) + partPnL,
+      };
+      await updatePosition(pos.id, halvUpdates);
+      await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, halveExit, amountSold));
+      Object.assign(pos, halvUpdates);
+      await sendTelegram(
+        `📤 *PROFIT HALVED — LOCKED*\n\n` +
+        `*${pos.symbol}* ${pos.strategyLabel}\n` +
+        `📥 Entry: $${fmtPrice(pos.entryPrice)} | Now: 4× (+${gainPct.toFixed(0)}%)\n` +
+        `💰 Sold 50% → $${proceeds.toFixed(2)} locked\n` +
+        `🎯 ${(newRemaining * 100).toFixed(1)}% remains — riding −10% trail\n` +
+        `🔗 [Chart](${pos.dexUrl})`
+      );
+      console.log(`[BOT] S5_PROFIT_HALVED ${pos.symbol}: +${gainPct.toFixed(0)}%, locked $${proceeds.toFixed(2)}, ${(newRemaining*100).toFixed(1)}% remains`);
+    }
+
     // ── RESISTANCE EXIT — 50% partial at estimated overhead resistance ─────────
     // Computed at entry from h1/h6/h24 DexScreener data. Fires once per position.
     // Takes 50% — locks profit at the first overhead wall, lets rest ride with SL/trail.
@@ -3462,7 +3608,9 @@ async function monitorPositions() {
     //   • price < entry for 2+ min (after grace period):
     //       SL TIGHTENED from −25% to −15% (downside protection).
     // ══════════════════════════════════════════════════════════════════════
-    if (!pos.isMoonBag && !pos.capitalWithdrawn) {
+    // Strategy 5 has its own ATH-based trailing SL schedule (see below);
+    // skip the universal capital floor so they don't conflict.
+    if (!pos.isMoonBag && !pos.capitalWithdrawn && pos.strategyId !== 4) {
       const ageMs        = Date.now() - pos.enteredAt;
       const currentSLNow = updates.currentSL ?? pos.currentSL;
 
@@ -3505,12 +3653,45 @@ async function monitorPositions() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
+    // ── STRATEGY 5 — ATH-BASED TRAILING SL ───────────────────────────────
+    // Phase-based schedule tied to ATH, not flat entry:
+    //  <20% gain:   flat −40% from entry (slx=0.60)
+    //  20–59%:      break-even lock (SL = entry)
+    //  60–79%:      −35% trail from ATH
+    //  80–99%:      −30% trail from ATH
+    //  post-capital: −25% → −20% → −15% → −10% floor
+    // ══════════════════════════════════════════════════════════════════════
+    if (pos.strategyId === 4 && !pos.isMoonBag) {
+      const ATH = currentPeak;
+      let s5SL;
+      if (!pos.capitalWithdrawn) {
+        if (gainPct < 20)       s5SL = pos.entryPrice * 0.60; // flat −40%
+        else if (gainPct < 60)  s5SL = pos.entryPrice;         // break-even lock
+        else if (gainPct < 80)  s5SL = ATH * 0.65;             // −35% trail
+        else                    s5SL = ATH * 0.70;             // −30% trail
+      } else {
+        if (gainPct < 120)      s5SL = ATH * 0.75; // −25% from ATH
+        else if (gainPct < 140) s5SL = ATH * 0.80; // −20% from ATH
+        else if (gainPct < 160) s5SL = ATH * 0.85; // −15% from ATH
+        else                    s5SL = ATH * 0.90; // −10% floor
+      }
+      // Break-even ratchet: once in profit, SL never drops below entry
+      if (gainPct >= 20) s5SL = Math.max(s5SL, pos.entryPrice);
+      const currentSLNow = updates.currentSL ?? pos.currentSL;
+      if (s5SL > currentSLNow * 1.005) {
+        updates.currentSL      = s5SL;
+        updates.trailingActive = gainPct >= 60;
+      }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
     // ── UNIVERSAL PROGRESSIVE TRAILING SL ────────────────────────────────
     // Activates at +50% gain. Trail starts at 50% below ATH, tightens 5%
     // per +20% ATH move, floor 10%. SL never within 10% of current price
     // (buffer). SL never below entryPrice (zero-loss). Ratchet: only rises.
     // ══════════════════════════════════════════════════════════════════════
-    if (gainPct > 0) {
+    // Strategy 5 uses its own ATH-based schedule above — skip universal trail.
+    if (gainPct > 0 && pos.strategyId !== 4) {
       let newSL;
 
       if (pos.isMoonBag) {
