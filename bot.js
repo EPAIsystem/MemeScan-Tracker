@@ -232,7 +232,7 @@ const STRATEGIES = [
     desc: 'Price ticking every 5-15 min — strong live activity',
     // ── Entry criteria ──
     maxAgeDays: 3,       // young, active coins
-    minM5Ch: 2.5,        // Nov-9: 2.5% in 5 min = real momentum, not noise
+    minM5Ch: 1.5,        // Nov-10: relaxed 2.5→1.5 — 2.5% was blocking nearly all AM candidates
     minM5Txns: 20,       // Nov-9: match SC activity bar
     minBuyPct: 62,       // Nov-9: buyers clearly in control
     minCh1: 1,           // positive h1 trend
