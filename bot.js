@@ -235,7 +235,7 @@ const STRATEGIES = [
     minM5Ch: 1.5,        // Nov-10: relaxed 2.5→1.5 — 2.5% was blocking nearly all AM candidates
     minM5Txns: 20,       // Nov-9: match SC activity bar
     minBuyPct: 62,       // Nov-9: buyers clearly in control
-    minCh1: 1,           // positive h1 trend
+    minCh1: 0,           // Nov-10: relaxed 1→0 — flat-to-up hour fine; m5 surge is the signal
     minLiq: 15000,       // Nov-9: meaningful pool depth
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.28, tp2x: 1.70, tp3x: 3.00,  // Nov-9: TP1 at +28% — captures the common 20–40% pop
@@ -3252,9 +3252,15 @@ async function monitorPositions() {
         let trailPct    = pos.trailPct    ?? 50;
         let tightenBase = pos.tightenBase ?? ATH;
 
-        // Tighten 5% each time ATH rises 20% from last tighten base; floor 10%
-        while (ATH >= tightenBase * 1.20 && trailPct > 10) {
-          trailPct    = Math.max(10, trailPct - 5);
+        // AM/SC held < 1 hour: 7% tighten per +20% ATH, floor 5% — highly slippery coins
+        // All others: 5% tighten per +20% ATH, floor 10%
+        const holdMs      = Date.now() - pos.enteredAt;
+        const isFastHold  = (pos.strategyId === 1 || pos.strategyId === 2) && holdMs < 60 * 60 * 1000;
+        const tightenStep = isFastHold ? 7 : 5;
+        const trailFloor  = isFastHold ? 5 : 10;
+
+        while (ATH >= tightenBase * 1.20 && trailPct > trailFloor) {
+          trailPct    = Math.max(trailFloor, trailPct - tightenStep);
           tightenBase = ATH;
         }
 
@@ -3268,7 +3274,7 @@ async function monitorPositions() {
           if (trailPct !== prevTrail) {
             sendTelegram(
               `📐 *SL TIGHTENED — ${pos.symbol}*\n` +
-              `Trail: ${prevTrail}% → *${trailPct}%* | Floor: 10%\n` +
+              `Trail: ${prevTrail}% → *${trailPct}%* | Floor: ${trailFloor}%\n` +
               `ATH: $${fmtPrice(ATH)} | Gain: +${gainPct.toFixed(1)}%\n🔗 [Chart](${pos.dexUrl})`
             ).catch(() => {});
           }
