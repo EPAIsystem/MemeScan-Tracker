@@ -252,9 +252,9 @@ const STRATEGIES = [
     // h1 is a lagging indicator — the surge may already be over by then
     // m5 catches it while it's still happening
     minM5Ch: 5,          // Nov-9: 5%+ in 5 min = genuine surge, not mild movement
-    minM5Txns: 25,       // Nov-9: very high activity bar for young coin entry
+    minM5Txns: 20,       // Nov-10: restored to original — 25 stacked too tightly with other gates
     minCh1: 0,           // h1 not negative (newly graduated coins may lack h1 history)
-    minBuyPct: 68,       // Nov-9: strong buyer dominance — real surge has buyers in firm control
+    minBuyPct: 62,       // Nov-10: 68→62; strong buyer dominance without over-restricting real surges
     minLiq: 8000,        // Nov-9: meaningful pool depth (was $4k — too thin)
     maxAgeDays: 1,       // Nov-9: SC is for young graduated coins only; AM handles 1–3 days
     // ── TP / SL (quick first profit, trail the rest) ──
