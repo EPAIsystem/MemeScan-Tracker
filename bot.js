@@ -168,6 +168,8 @@ const ALLOWED_DEXES = new Set([
   'meteora',
   'orca',          // Solana AMM — confirmed blocked in logs (should be allowed)
 ]);
+// ─── DIAGNOSTIC GATE COUNTERS (temporary — remove once root cause identified) ─
+const gateStats = { total:0, chain:0, liqFloor:0, price:0, honey:0, txns:0, avgT:0, ratio:0, young:0, dead:0, noAct:0, dex:0, age:0, mom:0, live:0, noMatch:0 };
 
 // ─── DYNAMIC POSITION SIZING ─────────────────────────────────────────────────
 // Position scales with liquidity (1% of pool ≈ <1% price impact) and market cap.
@@ -382,16 +384,18 @@ function detectStrategy(pair, openStrategies) {
   // Universal hard filters
   const isSolana = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr);
   const isEVM    = /^0x[0-9a-fA-F]{40}$/.test(addr);
-  if (!isSolana && !isEVM) return null;
-  if (liq < 3000)  return null;
-  if (price <= 0)  return null;
-  if (sells24 === 0 && buys24 > 10) return null; // honeypot guard
+  gateStats.total++;
+  const rej = gate => { gateStats[gate]++; return null; };
+  if (!isSolana && !isEVM) return rej('chain');
+  if (liq < 3000)  return rej('liqFloor');
+  if (price <= 0)  return rej('price');
+  if (sells24 === 0 && buys24 > 10) return rej('honey'); // honeypot guard
 
   // ── ANTI-MANIPULATION GLOBAL FILTERS ─────────────────────────────────────────
   // Reject bot farms and thin-pool manipulation before wasting scoring cycles.
-  if (m5Txns > ANTI_MANIP_M5_TXNS_MAX) return null;                        // 40+ txns/min = bot spam
-  if (avgTrade !== null && avgTrade < ANTI_MANIP_AVG_TRADE_FLOOR) return null; // micro-trade spam
-  if (mcLiqRatio > ANTI_MANIP_MC_LIQ_RATIO_MAX_LOCKED) return null;          // thin pool gate — 40× (LP lock check tightens to 30× for unlocked Solana coins)
+  if (m5Txns > ANTI_MANIP_M5_TXNS_MAX) return rej('txns');                        // 40+ txns/min = bot spam
+  if (avgTrade !== null && avgTrade < ANTI_MANIP_AVG_TRADE_FLOOR) return rej('avgT'); // micro-trade spam
+  if (mcLiqRatio > ANTI_MANIP_MC_LIQ_RATIO_MAX_LOCKED) return rej('ratio');          // thin pool gate — 40× (LP lock check tightens to 30× for unlocked Solana coins)
 
   // Calculate age before the dead coin guard — needed for the young-coin exemption
   const ageMinutes = (now - created) / 60000;
@@ -407,9 +411,9 @@ function detectStrategy(pair, openStrategies) {
   const scIsOpen = openStrategies.some(st => st.id === 2);
   if (ageDays < 1) {
     // avgTrade gate: $20 for all strategies except SC (which uses its own $15 gate)
-    if (!scIsOpen && avgTrade !== null && avgTrade < 20) return null;
-    if (buyPct < 60)  return null;  // strongly buyer-dominated momentum required
-    if (m5Txns  < 25) return null;  // confirms genuine 5-min activity
+    if (!scIsOpen && avgTrade !== null && avgTrade < 20) return rej('young');
+    if (buyPct < 60)  return rej('young');  // strongly buyer-dominated momentum required
+    if (m5Txns  < 25) return rej('young');  // confirms genuine 5-min activity
   }
 
   // DEAD COIN GUARD: reject coins where the 1h price change is missing or effectively flat.
@@ -435,12 +439,12 @@ function detectStrategy(pair, openStrategies) {
   if (ch1 === null) {
     const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2)
               || (m5Ch >= 3);
-    if (!pass) return null;
+    if (!pass) return rej('dead');
   } else if (Math.abs(ch1) < 0.5) {
     const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2) // young coin pumping
               || (ch24 <= -5 && buyPct >= 50 && liq >= 10000)         // bottom bounce stabilising (matches BB maxCh24 -5%)
               || (m5Ch >= 3);                                           // actively surging now
-    if (!pass) return null;
+    if (!pass) return rej('dead');
   }
   const dexId      = pair.dexId || '';
   const isPumpFun  = dexId === 'pump-fun';
@@ -450,7 +454,7 @@ function detectStrategy(pair, openStrategies) {
   // m5Txns = number of transactions in the last 5 minutes (DexScreener).
   // Zero transactions in 5 minutes means the coin has gone quiet — skip it.
   // Even 1-2 transactions confirms the coin is live; scoring rewards higher activity.
-  if (!m5Txns || m5Txns < 1) return null;
+  if (!m5Txns || m5Txns < 1) return rej('noAct');
 
   // ── GRADUATED-DEX GATE ───────────────────────────────────────────────────────
   // ALLOWED_DEXES defined at module level (shared with scanForEntries).
@@ -460,11 +464,11 @@ function detectStrategy(pair, openStrategies) {
     if (dexId && dexId !== 'pump-fun' && dexId !== 'pumpfun') {
       console.log(`[DEX-GATE] Blocked: dexId="${dexId}" symbol=${pair.baseToken?.symbol}`);
     }
-    return null;
+    return rej('dex');
   }
 
   // UNIVERSAL AGE RANGE: 1 minute minimum
-  if (ageMinutes < 1) return null;
+  if (ageMinutes < 1) return rej('age');
 
   // ── RISING MOMENTUM GATE ──────────────────────────────────────────────────
   // The bot must only enter when the coin is actively moving UP — not during a
@@ -477,13 +481,13 @@ function detectStrategy(pair, openStrategies) {
   //
   // Exception: Bottom Bounce (id=0) is designed to enter on oversold recovery —
   // it can have a slightly negative m5 as the coin is stabilising. Allow m5Ch ≥ -1%.
-  if (m5Ch !== null && m5Ch < -1) return null; // declining — wait for it to turn around
+  if (m5Ch !== null && m5Ch < -1) return rej('mom'); // declining — wait for it to turn around
 
   const liveHist = priceHistory.get(addr) || [];
   if (liveHist.length >= 3) {
     const newest = liveHist[liveHist.length - 1]?.price;
     const older  = liveHist[liveHist.length - 3]?.price; // ~6 seconds ago
-    if (newest && older && newest < older * 0.999) return null; // price declining in live feed
+    if (newest && older && newest < older * 0.999) return rej('live'); // price declining in live feed
   }
 
   const base = {
@@ -649,7 +653,7 @@ function detectStrategy(pair, openStrategies) {
     }
   }
 
-  if (matches.length === 0) return null;
+  if (matches.length === 0) return rej('noMatch');
   // Return the highest-scoring match
   matches.sort((a, b) => b.score - a.score);
   return matches[0];
@@ -4130,6 +4134,12 @@ async function scanForEntries() {
 
   // Always log scan summary so Fly.io logs show activity
   console.log(`[SCAN] #${scanCount}: ${candidates.length} candidates → ${matches.length} above threshold, ${nearMissCount} near misses (threshold: ${scoreThreshold})`);
+  // ── GATE DIAGNOSTIC (temporary — shows which filter is blocking all coins) ──
+  if (gateStats.total > 0) {
+    const g = gateStats;
+    console.log(`[SCAN-DIAG] dex:${g.dex} mom:${g.mom} dead:${g.dead} young:${g.young} ratio:${g.ratio} avgT:${g.avgT} noAct:${g.noAct} noMatch:${g.noMatch} | honey:${g.honey} txns:${g.txns} chain:${g.chain} liqFloor:${g.liqFloor} price:${g.price} age:${g.age} live:${g.live} | TOTAL:${g.total}`);
+    Object.keys(gateStats).forEach(k => { gateStats[k] = 0; });
+  }
 
   // ── PERIODIC "WATCHING" REPORT — every 60 scans (~15 min) ───────────────────
   // Tells Telegram what the bot is monitoring but has NOT entered yet.
