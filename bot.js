@@ -233,8 +233,8 @@ const STRATEGIES = [
     // ── Entry criteria ──
     maxAgeDays: 3,       // young, active coins
     minM5Ch: 1.5,        // Nov-10: relaxed 2.5→1.5 — 2.5% was blocking nearly all AM candidates
-    minM5Txns: 20,       // Nov-9: match SC activity bar
-    minBuyPct: 62,       // Nov-9: buyers clearly in control
+    minM5Txns: 15,       // Nov-10: restored to original — 20 stacked too tightly with other gates
+    minBuyPct: 58,       // Nov-10: midpoint 55→62; buyers in control without over-restricting
     minCh1: 0,           // Nov-10: relaxed 1→0 — flat-to-up hour fine; m5 surge is the signal
     minLiq: 15000,       // Nov-9: meaningful pool depth
     // ── TP / SL (partial profit — sell in bits) ──
