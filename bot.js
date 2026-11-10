@@ -36,6 +36,17 @@ const MIN_SCORE       = 55;  // Nov-9 overhaul — requires positive bonuses abo
 const STRATEGY_FILTERS_ACTIVE = true;
 const DAILY_LOSS_LIMIT= -0.30;
 
+// ── BACKGROUND SLOT TIMING ────────────────────────────────────────────────────
+// AM / SC (fast-moving): background after 5h if gain < 25%
+// BB / OR (patient):     background after 24h if gain < 10%
+// A backgrounded coin regains a visible slot if it jumps +50% within 1 hour
+const BG_AMSC_TIMEOUT_MS    = 5  * 60 * 60 * 1000;  // 5 hours
+const BG_BBOR_TIMEOUT_MS    = 24 * 60 * 60 * 1000;  // 24 hours
+const BG_AMSC_MIN_GAIN      = 0.25;  // 25% — AM/SC must sustain this to stay visible
+const BG_BBOR_MIN_GAIN      = 0.10;  // 10% — BB/OR must reach this to stay visible
+const BG_REACTIVATE_GAIN    = 0.50;  // +50% in 1h triggers pop-back to visible
+const BG_REACTIVATE_WIN_MS  = 60 * 60 * 1000;       // 1-hour rolling window for reactivation
+
 // ── PULLBACK WATCHLIST (Bottom Bounce id=0 + Old Recovery id=3) ───────────────
 // BB and OR don't enter immediately — they wait for price to settle at support
 // then confirm a 3% bounce before entering. SC and AM still enter immediately.
@@ -1113,6 +1124,13 @@ async function getOpenPositions() {
   return _posCache;
 }
 
+// Returns only positions that occupy a visible dashboard slot (not backgrounded).
+// Backgrounded positions still have SL/TP active but don't count toward MAX_POSITIONS.
+async function getVisiblePositions() {
+  const all = await getOpenPositions();
+  return all.filter(p => !p.backgrounded);
+}
+
 // ─── FIREBASE HELPERS ─────────────────────────────────────────────────────────
 
 // ─── PAPER TRADE COST SIMULATION ─────────────────────────────────────────────
@@ -1324,7 +1342,7 @@ async function processManualQueue() {
       .get();
     if (snap.empty) return;
 
-    const positions = await getOpenPositions();
+    const positions = await getVisiblePositions();
     for (const doc of snap.docs) {
       if (positions.length >= MAX_POSITIONS) break;
 
@@ -1793,7 +1811,7 @@ async function drainTelegramQueue() {
 // Polls for commands from the authorized chat. Runs every 30 s.
 async function pollTelegramCommands() {
   try {
-    const path = `/bot${TELEGRAM_TOKEN}/getUpdates?offset=${telegramOffset}&timeout=5&allowed_updates=${encodeURIComponent('["message"]')}`;
+    const path = `/bot${TELEGRAM_TOKEN}/getUpdates?offset=${telegramOffset}&timeout=5&allowed_updates=${encodeURIComponent('["message","callback_query"]')}`;
     const r = await httpGet('api.telegram.org', path);
 
     // ── Diagnose poll failures visibly in Telegram, not just console ────────────
@@ -1824,6 +1842,41 @@ async function pollTelegramCommands() {
     for (const update of d.result) {
       telegramOffset = update.update_id + 1;
       try { // ── per-message guard: one bad command won't kill the rest ─────────
+
+      // ── Handle callback_query (inline button taps from /hidden) ──────────────
+      if (update.callback_query) {
+        const cbq      = update.callback_query;
+        const cbChatId = String(cbq.message?.chat?.id || '');
+        if (cbChatId !== TELEGRAM_CHAT) continue;
+        await answerCallbackQuery(cbq.id);
+
+        const data = cbq.data || '';
+        if (data.startsWith('bg_view:')) {
+          // User tapped a hidden coin row — show its full status
+          const posId   = data.slice('bg_view:'.length);
+          const allPos  = await getOpenPositions();
+          const pos     = allPos.find(p => p.id === posId);
+          if (!pos) {
+            await sendTelegram(`ℹ️ Position not found — it may have already closed.`);
+          } else {
+            const price   = pos.currentPrice || pos.entryPrice;
+            const gain    = (price - pos.entryPrice) / pos.entryPrice * 100;
+            const holdH   = ((Date.now() - pos.enteredAt) / 3600000).toFixed(1);
+            await sendTelegram(
+              `📦 *HIDDEN — ${pos.symbol}* ${pos.strategyLabel}\n\n` +
+              `💵 Entry: $${fmtPrice(pos.entryPrice)}\n` +
+              `📈 Now: $${fmtPrice(price)} · Gain: ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}%\n` +
+              `⏱ Held: ${holdH}h\n` +
+              `🛑 SL: $${fmtPrice(pos.currentSL || 0)}\n` +
+              `📊 Remaining: ${(pos.remaining * 100).toFixed(0)}%\n` +
+              `🔗 [Chart](${pos.dexUrl})\n\n` +
+              `_Use /clearall or the dashboard to close manually._`
+            );
+          }
+        }
+        continue;
+      }
+
       const text    = (update.message?.text || '').trim().toLowerCase();
       const rawText = (update.message?.text || '').trim();          // preserve case for PRO signal parser
       const chatId  = String(update.message?.chat?.id || '');
@@ -2072,6 +2125,31 @@ async function pollTelegramCommands() {
         }
       }
 
+      // ── /hidden — show backgrounded positions with inline detail buttons ────────
+      if (text === '/hidden') {
+        const allPos    = await getOpenPositions();
+        const bgCoins   = allPos.filter(p => p.backgrounded);
+        if (!bgCoins.length) {
+          await sendTelegram(`📦 *HIDDEN POSITIONS* — none right now\n\n_Dormant coins will appear here once backgrounded._`);
+        } else {
+          const lines = bgCoins.map((p, i) => {
+            const price   = p.currentPrice || p.entryPrice;
+            const gain    = (price - p.entryPrice) / p.entryPrice * 100;
+            const holdH   = ((Date.now() - p.enteredAt) / 3600000).toFixed(1);
+            return `${i + 1}. *${p.symbol}* ${p.strategyLabel} · ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}% · ${holdH}h`;
+          });
+          const keyboard = bgCoins.map(p => [
+            { text: `${p.symbol} · tap for details`, callback_data: `bg_view:${p.id}` }
+          ]);
+          await sendTelegramWithButtons(
+            `📦 *HIDDEN POSITIONS* (${bgCoins.length})\n\n` +
+            lines.join('\n') +
+            `\n\n_SL/TP active on all. Tap any to see full details._`,
+            keyboard
+          );
+        }
+      }
+
       // ── /help ─────────────────────────────────────────────────────────────────
       if (text === '/help') {
         await sendTelegram(
@@ -2079,6 +2157,7 @@ async function pollTelegramCommands() {
           `/status — P&L, mode, balance\n` +
           `/stats — daily revenue: profit, losses, fees, net\n` +
           `/watching — coins being monitored (near threshold)\n` +
+          `/hidden — view backgrounded positions (dormant slots)\n` +
           `/mode paper — switch to paper trading\n` +
           `/mode real — switch to real (Solana) trading\n` +
           `/wallets — list connected wallets\n` +
@@ -2220,7 +2299,7 @@ async function openSurgeReinvest(pos, exitPrice, totalPnL) {
   if (totalPnL <= 0) return;
 
   // Check slots
-  const openPositions = await getOpenPositions();
+  const openPositions = await getVisiblePositions();
   const slotsLeft = MAX_POSITIONS - openPositions.length;
   if (slotsLeft < 1) {
     await sendTelegram(`⚠️ *SURGE REINVEST SKIPPED — ${pos.symbol}*\nNo open slots (${openPositions.length}/${MAX_POSITIONS})`);
@@ -3299,6 +3378,58 @@ async function monitorPositions() {
 
     if (Object.keys(updates).length > 0) await updatePosition(pos.id, updates);
     if (alertMsg) await sendTelegram(alertMsg);
+
+    // ── BACKGROUND SLOT MANAGEMENT ─────────────────────────────────────────────
+    // Backgrounded positions: SL/TP still processed above; check for reactivation.
+    // Visible positions: check if they've gone dormant and should be backgrounded.
+    if (pos.backgrounded) {
+      // ── Reactivation check: +50% gain within a rolling 1-hour window ─────────
+      const { positions: posCol } = await getCollections();
+      const bgNow = Date.now();
+      let refPrice = pos.bgHourlyRefPrice || pos.entryPrice;
+      let refAt    = pos.bgHourlyRefAt    || pos.backgroundedAt || bgNow;
+
+      // Roll the reference price every hour
+      if (bgNow - refAt >= BG_REACTIVATE_WIN_MS) {
+        refPrice = price;
+        refAt    = bgNow;
+        await db.collection(posCol).doc(pos.id).update({
+          bgHourlyRefPrice: refPrice,
+          bgHourlyRefAt:    refAt,
+        });
+        if (_posCache) {
+          const cp = _posCache.find(p => p.id === pos.id);
+          if (cp) { cp.bgHourlyRefPrice = refPrice; cp.bgHourlyRefAt = refAt; }
+        }
+      }
+
+      if (price >= refPrice * (1 + BG_REACTIVATE_GAIN)) {
+        // Find the most dormant visible position to swap to background
+        const allOpen   = await getOpenPositions();
+        const visible   = allOpen.filter(p => !p.backgrounded && p.id !== pos.id);
+        // "Most dormant" = lowest current gain. Use stored currentPrice for speed.
+        const dormant = visible.sort((a, b) => {
+          const gA = ((a.currentPrice || a.entryPrice) - a.entryPrice) / a.entryPrice;
+          const gB = ((b.currentPrice || b.entryPrice) - b.entryPrice) / b.entryPrice;
+          return gA - gB;
+        })[0] || null;
+        await reactivatePosition(pos, dormant);
+      }
+    } else {
+      // ── Dormancy check: should this visible position be backgrounded? ─────────
+      if (!closingNow.has(pos.id)) {
+        const holdMs    = Date.now() - pos.enteredAt;
+        const isAMSC    = pos.strategyId === 1 || pos.strategyId === 2;
+        const isBBOR    = pos.strategyId === 0 || pos.strategyId === 3;
+        const timeout   = isAMSC ? BG_AMSC_TIMEOUT_MS : BG_BBOR_TIMEOUT_MS;
+        const minGain   = isAMSC ? BG_AMSC_MIN_GAIN   : BG_BBOR_MIN_GAIN;
+
+        if (holdMs >= timeout && gain < minGain) {
+          await backgroundPosition(pos, gainPct);
+        }
+      }
+    }
+    // ── END BACKGROUND SLOT MANAGEMENT ────────────────────────────────────────
   }
 }
 
@@ -3405,6 +3536,68 @@ async function fetchTrendingAddrs() {
   console.log(`[TRENDING] Cache updated: ${fresh.size} unique trending addrs (pump.fun + DexScreener new + Birdeye)`);
 }
 
+// ─── BACKGROUND SLOT HELPERS ─────────────────────────────────────────────────
+
+async function backgroundPosition(pos, gainPct) {
+  const { positions } = await getCollections();
+  const now = Date.now();
+  await db.collection(positions).doc(pos.id).update({
+    backgrounded:       true,
+    backgroundedAt:     now,
+    bgHourlyRefPrice:   pos.currentPrice || pos.entryPrice,
+    bgHourlyRefAt:      now,
+  });
+  if (_posCache) {
+    const p = _posCache.find(p => p.id === pos.id);
+    if (p) Object.assign(p, { backgrounded: true, backgroundedAt: now });
+  }
+  const holdH = ((now - pos.enteredAt) / 3600000).toFixed(1);
+  await sendTelegram(
+    `📦 *BACKGROUNDED* — *${pos.symbol}* ${pos.strategyLabel}\n` +
+    `Held ${holdH}h · Gain: ${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(1)}%\n` +
+    `_SL/TP still active · /hidden to review_`
+  );
+  console.log(`[BG] ${pos.symbol} backgrounded after ${holdH}h (gain ${gainPct.toFixed(1)}%)`);
+}
+
+async function reactivatePosition(bgPos, mostDormantVisible) {
+  const { positions } = await getCollections();
+  const now = Date.now();
+  // Bring background coin back to visible
+  await db.collection(positions).doc(bgPos.id).update({
+    backgrounded:    false,
+    reactivatedAt:   now,
+  });
+  if (_posCache) {
+    const p = _posCache.find(p => p.id === bgPos.id);
+    if (p) { p.backgrounded = false; p.reactivatedAt = now; }
+  }
+  // Push the most dormant visible coin to background
+  if (mostDormantVisible) {
+    await db.collection(positions).doc(mostDormantVisible.id).update({
+      backgrounded:     true,
+      backgroundedAt:   now,
+      bgHourlyRefPrice: mostDormantVisible.currentPrice || mostDormantVisible.entryPrice,
+      bgHourlyRefAt:    now,
+    });
+    if (_posCache) {
+      const p = _posCache.find(p => p.id === mostDormantVisible.id);
+      if (p) Object.assign(p, { backgrounded: true, backgroundedAt: now });
+    }
+    await sendTelegram(
+      `🔄 *REACTIVATED* — *${bgPos.symbol}* ${bgPos.strategyLabel}\n` +
+      `+50% surge detected · Back on dashboard\n` +
+      `📦 Swapped out: *${mostDormantVisible.symbol}* (most dormant)`
+    );
+  } else {
+    await sendTelegram(
+      `🔄 *REACTIVATED* — *${bgPos.symbol}* ${bgPos.strategyLabel}\n` +
+      `+50% surge detected · Back on dashboard`
+    );
+  }
+  console.log(`[BG] ${bgPos.symbol} reactivated — swapped ${mostDormantVisible?.symbol || 'nobody'} to background`);
+}
+
 // ─── SCANNER ─────────────────────────────────────────────────────────────────
 // ═════════════════════════════════════════════════════════════════════════════
 async function scanForEntries() {
@@ -3414,7 +3607,7 @@ async function scanForEntries() {
     await checkDayRestart(); // check if user sent /restart
     return;
   }
-  const positions = await getOpenPositions();
+  const positions = await getVisiblePositions();
   if (positions.length >= MAX_POSITIONS) return;
 
   const vacantSlots = MAX_POSITIONS - positions.length;
@@ -4113,6 +4306,48 @@ async function sendTelegram(text) {
       let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve(d));
     });
     req.on('error', e => { console.error('[TG]',e.message); resolve(null); });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.write(body); req.end();
+  });
+}
+
+async function sendTelegramWithButtons(text, inlineKeyboard) {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT) return;
+  const body = JSON.stringify({
+    chat_id: TELEGRAM_CHAT, text,
+    parse_mode: 'Markdown', disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: inlineKeyboard },
+  });
+  return new Promise(resolve => {
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: 10000,
+    }, res => {
+      let d = ''; res.on('data', c => d += c); res.on('end', () => resolve(d));
+    });
+    req.on('error', e => { console.error('[TG]', e.message); resolve(null); });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.write(body); req.end();
+  });
+}
+
+async function answerCallbackQuery(callbackQueryId, text = '') {
+  if (!TELEGRAM_TOKEN) return;
+  const body = JSON.stringify({ callback_query_id: callbackQueryId, text });
+  return new Promise(resolve => {
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${TELEGRAM_TOKEN}/answerCallbackQuery`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: 5000,
+    }, res => {
+      let d = ''; res.on('data', c => d += c); res.on('end', () => resolve(d));
+    });
+    req.on('error', e => { console.error('[TG-CBQ]', e.message); resolve(null); });
     req.on('timeout', () => { req.destroy(); resolve(null); });
     req.write(body); req.end();
   });
