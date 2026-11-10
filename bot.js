@@ -437,6 +437,9 @@ function detectStrategy(pair, openStrategies) {
   // SC has its own avgTrade gate (ANTI_MANIP_SC_AVG_TRADE = $15) applied below in
   // strategy scoring. The $20 global gate was killing SC candidates before SC's
   // own gate ever ran. buyPct and m5Txns gates still apply to ALL young coins.
+  const dexId      = pair.dexId || '';
+  const isPumpFun  = dexId === 'pump-fun';
+
   const scIsOpen = openStrategies.some(st => st.id === 2);
   const s5OpenForYoung = isPumpFun && openStrategies.some(st => st.id === 4);
   if (ageDays < 1) {
@@ -483,8 +486,6 @@ function detectStrategy(pair, openStrategies) {
               || (m5Ch >= 3);                                           // actively surging now
     if (!pass) return rej('dead');
   }
-  const dexId      = pair.dexId || '';
-  const isPumpFun  = dexId === 'pump-fun';
 
   // ── ACTIVITY RECENCY GATE ────────────────────────────────────────────────────
   // The coin must be actively trading RIGHT NOW — not stale or sleeping.
