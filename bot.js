@@ -3127,22 +3127,19 @@ async function monitorPositions() {
         await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'STOP_LOSS', pnl });
         await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
         if (pnl <= 0) {
-          // Loss SL — strategy-aware re-entry gate:
-          // BB (id=0) and OR (id=3): recovery strategies — a normal dip past SL doesn't
-          //   invalidate the thesis. Allow same-day re-entry UNLESS slippage was high
-          //   (fill > 10% below SL level → thin liquidity / micro-rug → block 6h).
-          // AM (id=1) and SC (id=2): momentum strategies — SL at a loss = thesis broken;
-          //   always block 6h regardless of slippage.
+          // Loss SL — allow same-day re-entry for ALL strategies as soon as indicators
+          // qualify again (a stop loss doesn't permanently invalidate the coin).
+          // Exception: if fill slipped >10% below the SL price (rug-like behaviour —
+          // price blew through the stop), block 6h regardless of strategy.
           const slippagePct = pos.currentSL > 0
             ? (pos.currentSL - exitFillPrice) / pos.currentSL
             : 0;
           const highSlippage = slippagePct > 0.10;
-          const isRecovery   = pos.strategyId === 0 || pos.strategyId === 3;
-          if (isRecovery && !highSlippage) {
-            // Normal loss on a recovery strategy — dip went a bit deeper; allow re-entry
+          if (!highSlippage) {
+            // Normal loss — free the coin; re-entry fires when scan indicators reset
             enteredToday.delete(pos.address);
           } else {
-            // Momentum strategy OR high-slippage exit — block 6h
+            // High-slippage exit (rug-like) — block 6h to avoid chasing a falling knife
             recentSLCoins.set(pos.address, Date.now());
           }
         } else {
