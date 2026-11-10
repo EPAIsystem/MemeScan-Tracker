@@ -216,10 +216,10 @@ const STRATEGIES = [
     minCh24: -85,       // Nov-9: not a dead coin
     maxCh1: 12,         // Nov-9: h1 not already mooned
     minCh1: -8,         // Nov-9: h1 turning; not in freefall
-    minM5Ch: 1.5,       // Nov-9: must be ACTIVELY bouncing (not just stabilising)
-    minBuyPct: 65,      // Nov-9: strong buyer dominance required at a true bottom
+    minM5Ch: 0,         // Nov-10: 1.5→0 — pullback watchlist confirms the bounce; scan detects stabilisation
+    minBuyPct: 60,      // Nov-10: 65→60 — 60% buy dominance is strong at a true bottom
     minLiq: 25000,      // Nov-9: pool depth for safe entry
-    minM5Txns: 12,      // Nov-9: genuine activity — not 1 trade every 2 min
+    minM5Txns: 5,       // Nov-10: 12→5 — crashed coins have thin volume; 5 confirms it's not dead
     // ── TP / SL (standard 3-step) ──
     tp1x: 1.20, tp2x: 1.45, tp3x: 2.00,
     slx: 0.90,          // –10% SL: if a bounce thesis fails –10%, thesis is wrong
