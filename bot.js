@@ -271,11 +271,11 @@ const STRATEGIES = [
     // ── Entry criteria ──
     minAgeDays: 15,      // the defining characteristic of OR — established coins only
     minCh24: 5,          // Nov-9: recovery must be clearly underway (not just barely positive)
-    minCh1: 1.5,         // Nov-9: still actively climbing this hour
+    minCh1: 0.5,         // Nov-10: 1.5→0.5 — ch24≥5% already confirms recovery; 0.5% checks h1 trend intact
     maxCh1: 20,          // Nov-9: tighter spike guard — >20% in 1h on old coin is suspicious
     minBuyPct: 58,       // Nov-9: meaningful buyer interest for established coins
-    minLiq: 40000,       // Nov-9: established coins should have real depth (was 20k, compromised)
-    minBuys24: 60,       // Nov-9: real recovery has real sustained trading activity
+    minLiq: 25000,       // Nov-10: 40k→25k — older coins rarely carry deep liquidity; 25k ensures real pool
+    minBuys24: 35,       // Nov-10: 60→35 — steady recovery, not surge-level activity; 35 filters noise
     // ── TP / SL (conservative) ──
     tp1x: 1.12, tp2x: 1.30, tp3x: 1.65,
     slx: 0.92,
