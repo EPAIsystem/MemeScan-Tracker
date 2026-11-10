@@ -156,7 +156,7 @@ const ANTI_MANIP_MC_LIQ_RATIO_MAX        = 30;   // global: mc/liq > 30× = thin
 const ANTI_MANIP_MC_LIQ_RATIO_MAX_LOCKED = 40;   // relaxed when LP is confirmed locked — dev can't drain the pool
 const ANTI_MANIP_SC_AVG_TRADE     = 15;   // Surge Catch own gate: $15 filters micro-spam while allowing young coin activity; SC bypasses the global $20 gate
 const ANTI_MANIP_SC_TXNS_MAX      = 150;  // Surge Catch only: 30/min ceiling
-const ANTI_MANIP_SC_MC_LIQ_MAX    = 30;   // Surge Catch: thin pools normal for young surges
+// ANTI_MANIP_SC_MC_LIQ_MAX removed Nov-10 — SC now uses ANTI_MANIP_MC_LIQ_RATIO_MAX_LOCKED (40×) same as other strategies
 
 // ─── ALLOWED DEX GATE ────────────────────────────────────────────────────────
 // Module-level so both detectStrategy() and scanForEntries() share one definition.
