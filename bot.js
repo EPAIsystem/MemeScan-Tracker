@@ -449,12 +449,14 @@ function detectStrategy(pair, openStrategies) {
     // SC has its own $15 gate; pump.fun coins for S5 use the global floor ($8) only.
     if (!scIsOpen && !s5OpenForYoung && avgTrade !== null && avgTrade < 20) return rej('young');
     if (s5OpenForYoung) {
-      // Pump.fun → Strategy 5: use S5's own (more lenient) thresholds
-      if (buyPct < 55) return rej('young');  // S5 minBuyPct
-      if (m5Txns  < 10) return rej('young'); // S5 minM5Txns
+      // Nov-11: aligned to PS's current thresholds (was 55/10, PS now accepts 50/6)
+      if (buyPct < 50) return rej('young');  // S5 minBuyPct (updated)
+      if (m5Txns  <  6) return rej('young'); // S5 minM5Txns (updated)
     } else {
-      if (buyPct < 60)  return rej('young'); // strongly buyer-dominated momentum required
-      if (m5Txns  < 25) return rej('young'); // confirms genuine 5-min activity
+      // Nov-11: lowered to match the most lenient strategy thresholds across all open strategies
+      // (was 60/25 — far stricter than any strategy's own filter, blocking most PumpSwap young coins)
+      if (buyPct < 50)  return rej('young'); // matches OR/PS minBuyPct (50)
+      if (m5Txns  <  6) return rej('young'); // matches PS minM5Txns (6, the lowest)
     }
   }
 
@@ -473,7 +475,8 @@ function detectStrategy(pair, openStrategies) {
   //      A coin that dropped -25% in 24h and is now flat in h1 has STOPPED falling.
   //      That stabilisation is the SIGNAL for a bounce — rejecting it misses BNB-type
   //      setups that MemeScan PRO rates 80+ (oversold + buyers coming in).
-  //      Allow if buyPct ≥ 50% (buyers are still present) and liq ≥ 10000.
+  //      Allow if buyPct ≥ 50% (buyers are still present) and liq ≥ 5000.
+  //      Nov-11: liq floor lowered 10000→5000 to match BB's updated minLiq (5k).
   //
   //   3. Strong m5 on any coin:
   //      If m5Ch ≥ 3% regardless of h1, the coin is moving RIGHT NOW.
@@ -485,7 +488,7 @@ function detectStrategy(pair, openStrategies) {
       if (!pass) return rej('dead');
     } else if (Math.abs(ch1) < 0.5) {
       const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2) // young coin pumping
-                || (ch24 <= -5 && buyPct >= 50 && liq >= 10000)         // bottom bounce stabilising (matches BB maxCh24 -5%)
+                || (ch24 <= -5 && buyPct >= 50 && liq >= 5000)          // bottom bounce stabilising — Nov-11: liq floor 10k→5k (matches BB minLiq)
                 || (m5Ch >= 3);                                           // actively surging now
       if (!pass) return rej('dead');
     }
