@@ -27,7 +27,7 @@ const TELEGRAM_TOKEN  = (process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_
 const TELEGRAM_CHAT   = (process.env.TELEGRAM_CHAT_ID   || process.env.TELEGRAM_CHAT   || '').trim();
 const POSITION_SIZE   = parseFloat(process.env.POSITION_SIZE || '100');
 const MAX_POSITIONS   = 20;
-const SURGE_RESERVED  = 5;   // last 5 slots reserved for Surge Catch (id 2) only
+const SURGE_RESERVED  = 0;   // Nov-11: removed slot reservation — all strategies compete freely for all 20 global slots
 const MIN_SCORE       = 45;  // Nov-11: lowered from 55; GeckoTerminal trending pre-filters the pool so a 55 bar was double-filtering
 
 // ── STRATEGY FILTER SWITCH ────────────────────────────────────────────────────
@@ -243,8 +243,8 @@ const STRATEGIES = [
     minCh1: -8,         // Nov-9: h1 turning; not in freefall
     minM5Ch: 0,         // Nov-10: 1.5→0 — pullback watchlist confirms the bounce; scan detects stabilisation
     minBuyPct: 60,      // Nov-10: 65→60 — 60% buy dominance is strong at a true bottom
-    minLiq: 25000,      // Nov-9: pool depth for safe entry (strict floor, enforced when LP not locked)
-    minLiqLocked: 15000, // Nov-10: relaxed floor when LP is confirmed locked (rug risk removed)
+    minLiq: 5000,       // Nov-11: 25k→5k — pump.fun/PumpSwap ecosystem has thin pools; RugCheck handles rug risk
+    minLiqLocked: 3000, // Nov-11: 15k→3k — relaxed floor for LP-locked coins
     minM5Txns: 5,       // Nov-10: 12→5 — crashed coins have thin volume; 5 confirms it's not dead
     // ── TP / SL (standard 3-step) ──
     tp1x: 1.20, tp2x: 1.45, tp3x: 2.00,
@@ -264,8 +264,8 @@ const STRATEGIES = [
     minM5Txns: 15,       // Nov-10: restored to original — 20 stacked too tightly with other gates
     minBuyPct: 58,       // Nov-10: midpoint 55→62; buyers in control without over-restricting
     minCh1: 0,           // Nov-10: relaxed 1→0 — flat-to-up hour fine; m5 surge is the signal
-    minLiq: 15000,       // Nov-9: meaningful pool depth (strict floor, enforced when LP not locked)
-    minLiqLocked: 10000, // Nov-10: relaxed floor when LP is confirmed locked
+    minLiq: 5000,        // Nov-11: 15k→5k — pump.fun/PumpSwap ecosystem; RugCheck handles rug risk
+    minLiqLocked: 3000,  // Nov-11: 10k→3k — relaxed floor for LP-locked coins
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.28, tp2x: 1.70, tp3x: 3.00,  // Nov-9: TP1 at +28% — captures the common 20–40% pop
     slx: 0.86,           // Nov-9: –14% SL (was –20% — the single biggest loss driver)
@@ -284,8 +284,8 @@ const STRATEGIES = [
     minM5Txns: 20,       // Nov-10: restored to original — 25 stacked too tightly with other gates
     minCh1: 0,           // h1 not negative (newly graduated coins may lack h1 history)
     minBuyPct: 62,       // Nov-10: 68→62; strong buyer dominance without over-restricting real surges
-    minLiq: 8000,        // Nov-9: meaningful pool depth (strict floor, enforced when LP not locked)
-    minLiqLocked: 5000,  // Nov-10: relaxed floor when LP is confirmed locked
+    minLiq: 3000,        // Nov-11: 8k→3k — pump.fun/PumpSwap ecosystem; RugCheck handles rug risk
+    minLiqLocked: 2000,  // Nov-11: 5k→2k — relaxed floor for LP-locked coins
     maxAgeDays: 1,       // Nov-9: SC is for young graduated coins only; AM handles 1–3 days
     // ── TP / SL (quick first profit, trail the rest) ──
     tp1x: 1.30, tp2x: 2.00, tp3x: 4.00,  // Nov-9: genuine surges can run far
@@ -304,8 +304,8 @@ const STRATEGIES = [
     minCh1: 0.5,         // Nov-10: 1.5→0.5 — ch24≥5% already confirms recovery; 0.5% checks h1 trend intact
     maxCh1: 20,          // Nov-9: tighter spike guard — >20% in 1h on old coin is suspicious
     minBuyPct: 58,       // Nov-9: meaningful buyer interest for established coins
-    minLiq: 25000,       // Nov-10: 40k→25k — older coins rarely carry deep liquidity; 25k ensures real pool (strict floor, enforced when LP not locked)
-    minLiqLocked: 15000, // Nov-10: relaxed floor when LP is confirmed locked
+    minLiq: 10000,       // Nov-11: 25k→10k — open to pump.fun ecosystem; RugCheck handles rug risk; OR still needs minAgeDays≥15
+    minLiqLocked: 5000,  // Nov-11: 15k→5k — relaxed floor for LP-locked coins
     minBuys24: 35,       // Nov-10: 60→35 — steady recovery, not surge-level activity; 35 filters noise
     // ── TP / SL (conservative) ──
     tp1x: 1.12, tp2x: 1.30, tp3x: 1.65,
@@ -315,7 +315,7 @@ const STRATEGIES = [
   {
     id: 4,
     label: '🎯 PUMP SPEC',
-    maxSlots: 5,  // tight cap — these are high-risk speculative entries
+    maxSlots: 20, // Nov-11: removed per-strategy cap — all strategies compete freely for the global 20 slots
     desc: 'Pump.fun + PumpSwap on pullback — capital recovery + profit trail',
     // ── Entry criteria ──
     minLiq: 3000,
@@ -562,14 +562,10 @@ function detectStrategy(pair, openStrategies) {
 
     if (s.id === 0) {
       // ── BOTTOM BOUNCE — Path A only (Nov-9 overhaul) ────────────────────
-      // Pump.fun bonding-curve coins ONLY go to Strategy 5; skip for BB.
-      if (isPumpFun) { match = false; }
-      // Paths B (trending pullback) and C (steady restart) removed:
-      //   Path B was an AM signal mixed into BB — diluting BB quality.
-      //   Path C was too generic — caught too many non-bounce setups.
-      // BB is now ONLY for genuine oversold recovery: coin crashed 20–85%,
+      // Nov-11: pump.fun/PumpSwap coins now allowed — all strategies compete freely.
+      // BB is ONLY for genuine oversold recovery: coin crashed 20–85%,
       // h1 turning up, m5 actively bouncing NOW with strong buyer conviction.
-      else if (!strategyFiltersActive) {
+      if (!strategyFiltersActive) {
         match = true;
       } else {
 
@@ -603,9 +599,8 @@ function detectStrategy(pair, openStrategies) {
 
     else if (s.id === 1) {
       // ── ACTIVE MOMENTUM ────────────────────────────────────────────────────
-      // Pump.fun bonding-curve coins ONLY go to Strategy 5; skip for AM.
-      if (isPumpFun) { match = false; }
-      else if (strategyFiltersActive) {
+      // Nov-11: pump.fun/PumpSwap coins now allowed — all strategies compete freely.
+      if (strategyFiltersActive) {
         if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // 2h+ only — SC covers 0–24h
         if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // age upper cap (AM has none — applies to any age)
         if (m5Txns < s.minM5Txns)  { match = false; }
@@ -636,11 +631,10 @@ function detectStrategy(pair, openStrategies) {
 
     else if (s.id === 2) {
       // ── SURGE CATCH ────────────────────────────────────────────────────────
-      // Pump.fun bonding-curve coins ONLY go to Strategy 5; skip for SC.
-      if (isPumpFun) { match = false; }
+      // Nov-11: pump.fun/PumpSwap coins now allowed — all strategies compete freely.
       // Primary signal: m5 activity — catch it WHILE it's happening
       // Age gate: 0–24 hours (recently graduated coins surge post-migration)
-      else if (strategyFiltersActive) {
+      if (strategyFiltersActive) {
         if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // over 24h → AM/BB/OR
         if (m5Ch < s.minM5Ch)      { match = false; } // must be moving in last 5 min
         if (m5Txns < s.minM5Txns)  { match = false; } // must be very active
@@ -676,9 +670,9 @@ function detectStrategy(pair, openStrategies) {
 
     else if (s.id === 3) {
       // ── OLD RECOVERY ───────────────────────────────────────────────────────
-      // Pump.fun bonding-curve coins ONLY go to Strategy 5; skip for OR.
-      if (isPumpFun) { match = false; }
-      else if (strategyFiltersActive) {
+      // Nov-11: pump.fun/PumpSwap coins now allowed — all strategies compete freely.
+      // OR still requires minAgeDays ≥ 15 so pump.fun bonding-curve coins rarely match.
+      if (strategyFiltersActive) {
         if (ageDays < s.minAgeDays)  { match = false; }
         if (ch24 < s.minCh24)        { match = false; }
         if (ch1 < s.minCh1)          { match = false; }
@@ -1809,7 +1803,6 @@ async function processPullbackWatchlist(positions, slotCount, usedThisScan) {
 
       // Check slots still available
       if (positions.length >= MAX_POSITIONS) continue;
-      if (entry.coin.strategy.id !== 2 && positions.length >= MAX_POSITIONS - SURGE_RESERVED) continue;
       if (slotCount[entry.coin.strategy.id] >= entry.coin.strategy.maxSlots) continue;
 
       // Update coin with fresh price/liq/m5Ch and pullback badge data
@@ -2944,11 +2937,12 @@ async function filterByLpLock(matches) {
       continue;
     }
 
-    // ── 3: pump.fun bonding-curve (strategy 4) — no traditional LP ─────
+    // ── 3: pump.fun bonding-curve — no traditional LP ───────────────────
     // Bonding-curve tokens have no separate LP pool; risk score is the
-    // only rug signal available. Already passed gate 1 above (≤50).
-    if (coin.isPumpFun && coin.strategy?.id === 4) {
-      console.log(`[RUGCHECK] ✅ ${coin.symbol} — pump.fun bonding-curve, risk ${rc.riskScore}/100, PASSED`);
+    // only rug signal available. Already passed gate 1 above (≤maxRiskScore).
+    // Nov-11: applies to ANY strategy, not just PS (all strategies compete freely).
+    if (coin.isPumpFun) {
+      console.log(`[RUGCHECK] ✅ ${coin.symbol} — pump.fun bonding-curve (${coin.strategy?.label}), risk ${rc.riskScore}/100, PASSED`);
       lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
       passed.add(coin.addr);
       continue;
@@ -4336,9 +4330,6 @@ async function scanForEntries() {
 
   for (const coin of qualityMatches) {
     if (positions.length >= MAX_POSITIONS) break;
-    // Reserve last SURGE_RESERVED slots exclusively for Surge Catch (id 2).
-    // Other strategies stop competing once positions reach MAX_POSITIONS - SURGE_RESERVED.
-    if (coin.strategy.id !== 2 && positions.length >= MAX_POSITIONS - SURGE_RESERVED) continue;
     if (usedThisScan.has(coin.addr)) continue;
     // Check cooldown
     const last = alertCooldown.get(coin.addr) || 0;
