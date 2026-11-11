@@ -416,15 +416,19 @@ function detectStrategy(pair, openStrategies) {
   gateStats.total++;
   const rej = gate => { gateStats[gate]++; return null; };
   if (!isSolana && !isEVM) return rej('chain');
-  if (liq < 3000)  return rej('liqFloor');
-  if (price <= 0)  return rej('price');
-  if (sells24 === 0 && buys24 > 10) return rej('honey'); // honeypot guard
+  if (!globalGatesBypass) {
+    if (liq < 3000)  return rej('liqFloor');
+  }
+  if (price <= 0)  return rej('price');  // always keep — zero price breaks arithmetic
+  if (!globalGatesBypass) {
+    if (sells24 === 0 && buys24 > 10) return rej('honey'); // honeypot guard
 
-  // ── ANTI-MANIPULATION GLOBAL FILTERS ─────────────────────────────────────────
-  // Reject bot farms and thin-pool manipulation before wasting scoring cycles.
-  if (m5Txns > ANTI_MANIP_M5_TXNS_MAX) return rej('txns');                        // 40+ txns/min = bot spam
-  if (avgTrade !== null && avgTrade < ANTI_MANIP_AVG_TRADE_FLOOR) return rej('avgT'); // micro-trade spam
-  if (mcLiqRatio > ANTI_MANIP_MC_LIQ_RATIO_MAX_LOCKED) return rej('ratio');          // thin pool gate — 40× (LP lock check tightens to 30× for unlocked Solana coins)
+    // ── ANTI-MANIPULATION GLOBAL FILTERS ───────────────────────────────────────
+    // Reject bot farms and thin-pool manipulation before wasting scoring cycles.
+    if (m5Txns > ANTI_MANIP_M5_TXNS_MAX) return rej('txns');                        // 40+ txns/min = bot spam
+    if (avgTrade !== null && avgTrade < ANTI_MANIP_AVG_TRADE_FLOOR) return rej('avgT'); // micro-trade spam
+    if (mcLiqRatio > ANTI_MANIP_MC_LIQ_RATIO_MAX_LOCKED) return rej('ratio');          // thin pool gate — 40× (LP lock check tightens to 30× for unlocked Solana coins)
+  }
 
   // Calculate age before the dead coin guard — needed for the young-coin exemption
   const ageMinutes = (now - created) / 60000;
@@ -442,7 +446,7 @@ function detectStrategy(pair, openStrategies) {
 
   const scIsOpen = openStrategies.some(st => st.id === 2);
   const s5OpenForYoung = isPumpFun && openStrategies.some(st => st.id === 4);
-  if (ageDays < 1) {
+  if (!globalGatesBypass && ageDays < 1) {
     // avgTrade gate: $20 for all strategies except SC and pump.fun→S5
     // SC has its own $15 gate; pump.fun coins for S5 use the global floor ($8) only.
     if (!scIsOpen && !s5OpenForYoung && avgTrade !== null && avgTrade < 20) return rej('young');
@@ -476,67 +480,69 @@ function detectStrategy(pair, openStrategies) {
   //   3. Strong m5 on any coin:
   //      If m5Ch ≥ 3% regardless of h1, the coin is moving RIGHT NOW.
   //
-  if (ch1 === null) {
-    const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2)
-              || (m5Ch >= 3);
-    if (!pass) return rej('dead');
-  } else if (Math.abs(ch1) < 0.5) {
-    const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2) // young coin pumping
-              || (ch24 <= -5 && buyPct >= 50 && liq >= 10000)         // bottom bounce stabilising (matches BB maxCh24 -5%)
-              || (m5Ch >= 3);                                           // actively surging now
-    if (!pass) return rej('dead');
-  }
-
-  // ── ACTIVITY RECENCY GATE ────────────────────────────────────────────────────
-  // The coin must be actively trading RIGHT NOW — not stale or sleeping.
-  // m5Txns = number of transactions in the last 5 minutes (DexScreener).
-  // Zero transactions in 5 minutes means the coin has gone quiet — skip it.
-  // Even 1-2 transactions confirms the coin is live; scoring rewards higher activity.
-  if (!m5Txns || m5Txns < 1) return rej('noAct');
-
-  // ── GRADUATED-DEX GATE ───────────────────────────────────────────────────────
-  // ALLOWED_DEXES defined at module level (shared with scanForEntries).
-  // Bonding-curve pump.fun ('pump-fun') normally blocked; allowed through ONLY when
-  // Strategy 5 (Pump Speculative) is open — it has its own entry criteria for them.
-  if (!ALLOWED_DEXES.has(dexId)) {
-    const s5Open = openStrategies.some(st => st.id === 4);
-    if (!(isPumpFun && s5Open)) {
-      // Log unknown dexIds so we can expand ALLOWED_DEXES — remove once confirmed
-      if (dexId && dexId !== 'pump-fun' && dexId !== 'pumpfun') {
-        console.log(`[DEX-GATE] Blocked: dexId="${dexId}" symbol=${pair.baseToken?.symbol}`);
-      }
-      return rej('dex');
+  if (!globalGatesBypass) {
+    if (ch1 === null) {
+      const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2)
+                || (m5Ch >= 3);
+      if (!pass) return rej('dead');
+    } else if (Math.abs(ch1) < 0.5) {
+      const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2) // young coin pumping
+                || (ch24 <= -5 && buyPct >= 50 && liq >= 10000)         // bottom bounce stabilising (matches BB maxCh24 -5%)
+                || (m5Ch >= 3);                                           // actively surging now
+      if (!pass) return rej('dead');
     }
-    // pump.fun + Strategy 5 open — fall through to Strategy 5 evaluation
-  }
 
-  // UNIVERSAL AGE RANGE: 1 minute minimum
-  if (ageMinutes < 1) return rej('age');
+    // ── ACTIVITY RECENCY GATE ──────────────────────────────────────────────────
+    // The coin must be actively trading RIGHT NOW — not stale or sleeping.
+    // m5Txns = number of transactions in the last 5 minutes (DexScreener).
+    // Zero transactions in 5 minutes means the coin has gone quiet — skip it.
+    // Even 1-2 transactions confirms the coin is live; scoring rewards higher activity.
+    if (!m5Txns || m5Txns < 1) return rej('noAct');
 
-  // ── RISING MOMENTUM GATE ──────────────────────────────────────────────────
-  // The bot must only enter when the coin is actively moving UP — not during a
-  // pullback or nosedive. Two checks, both must agree:
-  //
-  //   1. m5Ch > 0  — DexScreener confirms positive 5-min momentum at scan time
-  //   2. priceHistory rising — if we have live price readings for this coin,
-  //      the most recent reading must be ≥ the reading 2 ticks ago (6 seconds).
-  //      This catches coins that peaked between scans and are now coming down.
-  //
-  // Exception: Bottom Bounce (id=0) is designed to enter on oversold recovery —
-  // it can have a slightly negative m5 as the coin is stabilising. Allow m5Ch ≥ -1%.
-  // Strategy 5 (Pump Spec) enters on pullbacks — allow m5Ch down to -5% when s5 is open.
-  // All other strategies require m5Ch ≥ -1% (no meaningful decline allowed).
-  if (m5Ch !== null && m5Ch < -1) {
-    const s5Open = openStrategies.some(st => st.id === 4);
-    if (!s5Open || m5Ch < -5) return rej('mom'); // declining too hard — skip
-  }
+    // ── GRADUATED-DEX GATE ─────────────────────────────────────────────────────
+    // ALLOWED_DEXES defined at module level (shared with scanForEntries).
+    // Bonding-curve pump.fun ('pump-fun') normally blocked; allowed through ONLY when
+    // Strategy 5 (Pump Speculative) is open — it has its own entry criteria for them.
+    if (!ALLOWED_DEXES.has(dexId)) {
+      const s5Open = openStrategies.some(st => st.id === 4);
+      if (!(isPumpFun && s5Open)) {
+        // Log unknown dexIds so we can expand ALLOWED_DEXES — remove once confirmed
+        if (dexId && dexId !== 'pump-fun' && dexId !== 'pumpfun') {
+          console.log(`[DEX-GATE] Blocked: dexId="${dexId}" symbol=${pair.baseToken?.symbol}`);
+        }
+        return rej('dex');
+      }
+      // pump.fun + Strategy 5 open — fall through to Strategy 5 evaluation
+    }
 
-  const liveHist = priceHistory.get(addr) || [];
-  if (liveHist.length >= 3) {
-    const newest = liveHist[liveHist.length - 1]?.price;
-    const older  = liveHist[liveHist.length - 3]?.price; // ~6 seconds ago
-    if (newest && older && newest < older * 0.999) return rej('live'); // price declining in live feed
-  }
+    // UNIVERSAL AGE RANGE: 1 minute minimum
+    if (ageMinutes < 1) return rej('age');
+
+    // ── RISING MOMENTUM GATE ────────────────────────────────────────────────
+    // The bot must only enter when the coin is actively moving UP — not during a
+    // pullback or nosedive. Two checks, both must agree:
+    //
+    //   1. m5Ch > 0  — DexScreener confirms positive 5-min momentum at scan time
+    //   2. priceHistory rising — if we have live price readings for this coin,
+    //      the most recent reading must be ≥ the reading 2 ticks ago (6 seconds).
+    //      This catches coins that peaked between scans and are now coming down.
+    //
+    // Exception: Bottom Bounce (id=0) is designed to enter on oversold recovery —
+    // it can have a slightly negative m5 as the coin is stabilising. Allow m5Ch ≥ -1%.
+    // Strategy 5 (Pump Spec) enters on pullbacks — allow m5Ch down to -5% when s5 is open.
+    // All other strategies require m5Ch ≥ -1% (no meaningful decline allowed).
+    if (m5Ch !== null && m5Ch < -1) {
+      const s5Open = openStrategies.some(st => st.id === 4);
+      if (!s5Open || m5Ch < -5) return rej('mom'); // declining too hard — skip
+    }
+
+    const liveHist = priceHistory.get(addr) || [];
+    if (liveHist.length >= 3) {
+      const newest = liveHist[liveHist.length - 1]?.price;
+      const older  = liveHist[liveHist.length - 3]?.price; // ~6 seconds ago
+      if (newest && older && newest < older * 0.999) return rej('live'); // price declining in live feed
+    }
+  } // end globalGatesBypass check
 
   const base = {
     addr, price, liq, mcap, vol24, buyPct, buys24, ch1, ch6, ch24, m5Ch, m5Txns,
@@ -765,8 +771,9 @@ const pullbackWatchlist = new Map();
 const SL_BLOCK_MS   = 6 * 60 * 60 * 1000; // 6 hours
 let scanCount = 0;
 // Daily loss limit state — set true when limit hit, cleared on /restart
-let dayHaltedToday  = false;
-let telegramOffset  = 0; // for Telegram command polling
+let dayHaltedToday      = false;
+let globalGatesBypass   = false; // /skipgates toggle — bypasses all global filters for diagnostics
+let telegramOffset      = 0; // for Telegram command polling
 
 // ─── POSITION CACHE ───────────────────────────────────────────────────────────
 // Reduces Firestore reads from ~250K/day to ~1.5K/day
@@ -2244,6 +2251,28 @@ async function pollTelegramCommands() {
             `\n\n_Needs score ≥ ${MIN_SCORE} to enter automatically_`
           );
         }
+      }
+
+      // ── /skipgates — toggle global filter bypass for diagnostics ────────────────
+      if (text === '/skipgates') {
+        globalGatesBypass = !globalGatesBypass;
+        const state = globalGatesBypass ? 'OFF 🚫' : 'ON ✅';
+        const icon  = globalGatesBypass ? '⚠️' : '✅';
+        await sendTelegram(
+          `${icon} *GLOBAL GATES: ${state}*\n\n` +
+          (globalGatesBypass
+            ? `All global filters are now *bypassed*.\n\n` +
+              `Bypassed: liq floor, honeypot, anti-manip (avgTrade/txns/ratio), young coin gate, dead coin guard, activity gate, DEX gate, age gate, momentum gate, live price decline.\n\n` +
+              `*Only price > 0 and valid chain/address checks remain.*\n\n` +
+              `Coins now go straight to strategy-specific scoring.\n` +
+              `Watch the logs — if entries appear, global filters are the culprit.\n\n` +
+              `⚠️ _This mode trades aggressively — disable once diagnosis is done._\n` +
+              `Send /skipgates again to restore gates.`
+            : `All global filters are *restored* to normal operation.\n\n` +
+              `Run /status to confirm the bot is scanning correctly.`
+          )
+        );
+        continue;
       }
 
       // ── /hidden — show backgrounded positions with inline detail buttons ────────
@@ -4319,7 +4348,8 @@ async function scanForEntries() {
   // ── GATE DIAGNOSTIC (temporary — shows which filter is blocking all coins) ──
   if (gateStats.total > 0) {
     const g = gateStats;
-    console.log(`[SCAN-DIAG] dex:${g.dex} mom:${g.mom} dead:${g.dead} young:${g.young} ratio:${g.ratio} avgT:${g.avgT} noAct:${g.noAct} noMatch:${g.noMatch} | honey:${g.honey} txns:${g.txns} chain:${g.chain} liqFloor:${g.liqFloor} price:${g.price} age:${g.age} live:${g.live} | TOTAL:${g.total}`);
+    const bypassNote = globalGatesBypass ? ' [GLOBAL GATES BYPASSED]' : '';
+    console.log(`[SCAN-DIAG]${bypassNote} dex:${g.dex} mom:${g.mom} dead:${g.dead} young:${g.young} ratio:${g.ratio} avgT:${g.avgT} noAct:${g.noAct} noMatch:${g.noMatch} | honey:${g.honey} txns:${g.txns} chain:${g.chain} liqFloor:${g.liqFloor} price:${g.price} age:${g.age} live:${g.live} | TOTAL:${g.total}`);
     Object.keys(gateStats).forEach(k => { gateStats[k] = 0; });
   }
 
@@ -4374,7 +4404,8 @@ async function scanForEntries() {
       `Mode: *${mode}* · Open positions: ${openPositions.length}/${MAX_POSITIONS}\n` +
       `${candidates.length} candidates → ${matches.length} matched → ${lockedMatches.length} LP OK → ${qualityMatches.length} quality\n` +
       `${nearMissCount} near-misses (score ${MIN_SCORE - 8}-${scoreThreshold - 1})` +
-      (lpProbationCoins.size ? `\n🕐 ${lpProbationCoins.size} coin(s) on LP probation` : '')
+      (lpProbationCoins.size ? `\n🕐 ${lpProbationCoins.size} coin(s) on LP probation` : '') +
+      (globalGatesBypass ? `\n⚠️ _GLOBAL GATES BYPASSED — /skipgates to restore_` : '')
     ).catch(() => {});
   }
 
