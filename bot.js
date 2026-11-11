@@ -774,6 +774,7 @@ let scanCount = 0;
 // Daily loss limit state — set true when limit hit, cleared on /restart
 let dayHaltedToday      = false;
 let globalGatesBypass   = false; // /skipgates toggle — bypasses all global filters for diagnostics
+let lpLockBypass        = false; // /skiplp toggle  — bypasses filterByLpLock() for diagnostics
 let telegramOffset      = 0; // for Telegram command polling
 
 // ─── POSITION CACHE ───────────────────────────────────────────────────────────
@@ -2301,6 +2302,28 @@ async function pollTelegramCommands() {
               `If entries still don't appear, the problem is in data fetching — not filters.\n\n` +
               `⚠️ _Diagnostic mode — restore with /skipstrats when done._`
             : `Strategy filters *restored* to normal.\n\n` +
+              `Run /status to confirm.`
+          )
+        );
+        continue;
+      }
+
+      // ── /skiplp — toggle LP lock bypass for diagnostics ─────────────────────────
+      if (text === '/skiplp') {
+        lpLockBypass = !lpLockBypass;
+        const state = lpLockBypass ? 'BYPASSED ⚠️' : 'ACTIVE ✅';
+        const icon  = lpLockBypass ? '⚠️' : '✅';
+        await sendTelegram(
+          `${icon} *LP LOCK CHECK: ${state}*\n\n` +
+          (lpLockBypass
+            ? `GoPlus + RugCheck security check is now *bypassed*.\n\n` +
+              `Bypassed: LP lock check, mintable/freezable guard, risk score, strict liq floor for unlocked LP.\n\n` +
+              `*All coins that pass strategy scoring will now reach the quality gate.*\n\n` +
+              `Watch the logs — if entries appear, LP check was the last blocker.\n` +
+              `If entries still don't appear, the quality gate or scoring floor is blocking.\n\n` +
+              `⚠️ _Diagnostic mode — this skips real rug protection. Restore with /skiplp when done._`
+            : `LP lock check *restored* to normal.\n\n` +
+              `GoPlus + RugCheck security checks are active again.\n` +
               `Run /status to confirm.`
           )
         );
@@ -4359,6 +4382,7 @@ async function scanForEntries() {
     const bypassNote = [
       globalGatesBypass      ? 'GLOBAL BYPASSED' : '',
       !strategyFiltersActive ? 'STRATS BYPASSED' : '',
+      lpLockBypass           ? 'LP BYPASSED'     : '',
     ].filter(Boolean).join(' + ');
     const bypassPrefix = bypassNote ? ` [${bypassNote}]` : '';
     console.log(`[SCAN-DIAG]${bypassPrefix} dex:${g.dex} mom:${g.mom} dead:${g.dead} young:${g.young} ratio:${g.ratio} avgT:${g.avgT} noAct:${g.noAct} noMatch:${g.noMatch} | honey:${g.honey} txns:${g.txns} chain:${g.chain} liqFloor:${g.liqFloor} price:${g.price} age:${g.age} live:${g.live} | TOTAL:${g.total}`);
@@ -4382,11 +4406,17 @@ async function scanForEntries() {
 
   // Filter by LP lock (batch GoPlus check per chain)
   if (matches.length > 0) console.log(`[SCAN] ${candidates.length} candidates → ${matches.length} scored matches`);
-  const lockedMatches = await filterByLpLock(matches);
-  if (matches.length > 0) {
-    const dropped = matches.length - lockedMatches.length;
-    if (dropped > 0) console.log(`[LP LOCK] ${dropped}/${matches.length} matches skipped — LP not locked`);
-    else console.log(`[LP LOCK] All ${lockedMatches.length} matches passed LP check`);
+  let lockedMatches;
+  if (lpLockBypass) {
+    lockedMatches = matches;
+    if (matches.length > 0) console.log(`[LP LOCK] ⚠️ BYPASSED — passing all ${matches.length} matches through (diagnostic mode)`);
+  } else {
+    lockedMatches = await filterByLpLock(matches);
+    if (matches.length > 0) {
+      const dropped = matches.length - lockedMatches.length;
+      if (dropped > 0) console.log(`[LP LOCK] ${dropped}/${matches.length} matches skipped — LP not locked`);
+      else console.log(`[LP LOCK] All ${lockedMatches.length} matches passed LP check`);
+    }
   }
 
   // Apply price quality gate: only block coins in confirmed active decline
@@ -4418,7 +4448,8 @@ async function scanForEntries() {
       `${nearMissCount} near-misses (score ${MIN_SCORE - 8}-${scoreThreshold - 1})` +
       (lpProbationCoins.size ? `\n🕐 ${lpProbationCoins.size} coin(s) on LP probation` : '') +
       (globalGatesBypass      ? `\n⚠️ _GLOBAL GATES BYPASSED — /skipgates to restore_` : '') +
-      (!strategyFiltersActive ? `\n⚠️ _STRATEGY FILTERS BYPASSED — /skipstrats to restore_` : '')
+      (!strategyFiltersActive ? `\n⚠️ _STRATEGY FILTERS BYPASSED — /skipstrats to restore_` : '') +
+      (lpLockBypass           ? `\n⚠️ _LP CHECK BYPASSED — /skiplp to restore_` : '')
     ).catch(() => {});
   }
 
