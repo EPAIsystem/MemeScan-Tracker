@@ -33,7 +33,8 @@ const MIN_SCORE       = 55;  // Nov-9 overhaul — requires positive bonuses abo
 // ── STRATEGY FILTER SWITCH ────────────────────────────────────────────────────
 // true  = all per-strategy filters active (normal operation — Oct-27 baseline)
 // false = filters suspended (use only during debugging when strategies don't appear)
-const STRATEGY_FILTERS_ACTIVE = true;
+// Use /skipstrats command at runtime to toggle — do not change this line manually
+let strategyFiltersActive = true;
 const DAILY_LOSS_LIMIT= -0.30;
 
 // ── BACKGROUND SLOT TIMING ────────────────────────────────────────────────────
@@ -571,7 +572,7 @@ function detectStrategy(pair, openStrategies) {
       //   Path C was too generic — caught too many non-bounce setups.
       // BB is now ONLY for genuine oversold recovery: coin crashed 20–85%,
       // h1 turning up, m5 actively bouncing NOW with strong buyer conviction.
-      else if (!STRATEGY_FILTERS_ACTIVE) {
+      else if (!strategyFiltersActive) {
         match = true;
       } else {
 
@@ -600,14 +601,14 @@ function detectStrategy(pair, openStrategies) {
           else if (avgTrade < 30) score -= 10;
         }
       }
-      } // end STRATEGY_FILTERS_ACTIVE else
+      } // end strategyFiltersActive else
     }
 
     else if (s.id === 1) {
       // ── ACTIVE MOMENTUM ────────────────────────────────────────────────────
       // Pump.fun bonding-curve coins ONLY go to Strategy 5; skip for AM.
       if (isPumpFun) { match = false; }
-      else if (STRATEGY_FILTERS_ACTIVE) {
+      else if (strategyFiltersActive) {
         if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // 2h+ only — SC covers 0–24h
         if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // 3-day cap — SC/BB handle older
         if (m5Txns < s.minM5Txns)  { match = false; }
@@ -642,7 +643,7 @@ function detectStrategy(pair, openStrategies) {
       if (isPumpFun) { match = false; }
       // Primary signal: m5 activity — catch it WHILE it's happening
       // Age gate: 0–24 hours (recently graduated coins surge post-migration)
-      else if (STRATEGY_FILTERS_ACTIVE) {
+      else if (strategyFiltersActive) {
         if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // over 24h → AM/BB/OR
         if (m5Ch < s.minM5Ch)      { match = false; } // must be moving in last 5 min
         if (m5Txns < s.minM5Txns)  { match = false; } // must be very active
@@ -680,7 +681,7 @@ function detectStrategy(pair, openStrategies) {
       // ── OLD RECOVERY ───────────────────────────────────────────────────────
       // Pump.fun bonding-curve coins ONLY go to Strategy 5; skip for OR.
       if (isPumpFun) { match = false; }
-      else if (STRATEGY_FILTERS_ACTIVE) {
+      else if (strategyFiltersActive) {
         if (ageDays < s.minAgeDays)  { match = false; }
         if (ch24 < s.minCh24)        { match = false; }
         if (ch1 < s.minCh1)          { match = false; }
@@ -715,7 +716,7 @@ function detectStrategy(pair, openStrategies) {
       const isPumpSwap = ['pumpswap','pump_amm','pump-amm','pump_swap','pump-swap'].includes(dexId);
       if (!isPumpFun && !isPumpSwap) {
         match = false;
-      } else if (STRATEGY_FILTERS_ACTIVE) {
+      } else if (strategyFiltersActive) {
         // h1 must be strongly up — confirms an uptrend is running
         if (ch1 === null || ch1 < s.minH1Ch)              { match = false; }
         // m5 in pullback zone — not at the peak, not in freefall
@@ -2270,6 +2271,27 @@ async function pollTelegramCommands() {
               `Send /skipgates again to restore gates.`
             : `All global filters are *restored* to normal operation.\n\n` +
               `Run /status to confirm the bot is scanning correctly.`
+          )
+        );
+        continue;
+      }
+
+      // ── /skipstrats — toggle per-strategy filter bypass for diagnostics ─────────
+      if (text === '/skipstrats') {
+        strategyFiltersActive = !strategyFiltersActive;
+        const state = strategyFiltersActive ? 'ON ✅' : 'OFF 🚫';
+        const icon  = strategyFiltersActive ? '✅' : '⚠️';
+        await sendTelegram(
+          `${icon} *STRATEGY FILTERS: ${state}*\n\n` +
+          (!strategyFiltersActive
+            ? `All per-strategy filters are now *bypassed*.\n\n` +
+              `Bypassed: age gates, momentum thresholds, buy%, m5Txns, h1 requirements, liq floors, and all other strategy-specific scoring gates.\n\n` +
+              `*Any coin that reaches strategy scoring will now match.*\n\n` +
+              `Combined with /skipgates (global bypass), ALL filters are now off.\n` +
+              `If entries still don't appear, the problem is in data fetching — not filters.\n\n` +
+              `⚠️ _Diagnostic mode — restore with /skipstrats when done._`
+            : `Strategy filters *restored* to normal.\n\n` +
+              `Run /status to confirm.`
           )
         );
         continue;
@@ -4348,8 +4370,12 @@ async function scanForEntries() {
   // ── GATE DIAGNOSTIC (temporary — shows which filter is blocking all coins) ──
   if (gateStats.total > 0) {
     const g = gateStats;
-    const bypassNote = globalGatesBypass ? ' [GLOBAL GATES BYPASSED]' : '';
-    console.log(`[SCAN-DIAG]${bypassNote} dex:${g.dex} mom:${g.mom} dead:${g.dead} young:${g.young} ratio:${g.ratio} avgT:${g.avgT} noAct:${g.noAct} noMatch:${g.noMatch} | honey:${g.honey} txns:${g.txns} chain:${g.chain} liqFloor:${g.liqFloor} price:${g.price} age:${g.age} live:${g.live} | TOTAL:${g.total}`);
+    const bypassNote = [
+      globalGatesBypass      ? 'GLOBAL BYPASSED' : '',
+      !strategyFiltersActive ? 'STRATS BYPASSED' : '',
+    ].filter(Boolean).join(' + ');
+    const bypassPrefix = bypassNote ? ` [${bypassNote}]` : '';
+    console.log(`[SCAN-DIAG]${bypassPrefix} dex:${g.dex} mom:${g.mom} dead:${g.dead} young:${g.young} ratio:${g.ratio} avgT:${g.avgT} noAct:${g.noAct} noMatch:${g.noMatch} | honey:${g.honey} txns:${g.txns} chain:${g.chain} liqFloor:${g.liqFloor} price:${g.price} age:${g.age} live:${g.live} | TOTAL:${g.total}`);
     Object.keys(gateStats).forEach(k => { gateStats[k] = 0; });
   }
 
@@ -4405,7 +4431,8 @@ async function scanForEntries() {
       `${candidates.length} candidates → ${matches.length} matched → ${lockedMatches.length} LP OK → ${qualityMatches.length} quality\n` +
       `${nearMissCount} near-misses (score ${MIN_SCORE - 8}-${scoreThreshold - 1})` +
       (lpProbationCoins.size ? `\n🕐 ${lpProbationCoins.size} coin(s) on LP probation` : '') +
-      (globalGatesBypass ? `\n⚠️ _GLOBAL GATES BYPASSED — /skipgates to restore_` : '')
+      (globalGatesBypass      ? `\n⚠️ _GLOBAL GATES BYPASSED — /skipgates to restore_` : '') +
+      (!strategyFiltersActive ? `\n⚠️ _STRATEGY FILTERS BYPASSED — /skipstrats to restore_` : '')
     ).catch(() => {});
   }
 
