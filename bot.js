@@ -807,6 +807,16 @@ let trendingAddrs     = new Map();
 let trendingLastFetch = 0;
 const TRENDING_TTL_MS = 5 * 60 * 1000; // refresh every 5 min
 
+// ─── CANDIDATE POOL CACHE ────────────────────────────────────────────────────
+// DexScreener fetching decoupled from evaluation:
+//   refreshCandidatePool() — runs every 3 min, makes 100+ API calls
+//   scanForEntries()       — runs every 15s, evaluates cached pool only
+// Fixes rate-limiting (429 → silent 0 candidates) caused by 400+ req/min.
+let _candidatePool    = [];      // cached DexScreener pairs
+let _candidatePoolMap = new Map(); // cached trending map (addr → platform count)
+let _candidatePoolAt  = 0;       // last refresh timestamp (ms)
+const CANDIDATE_POOL_TTL = 3 * 60 * 1000; // refresh every 3 minutes
+
 async function getTradingConfig() {
   const now = Date.now();
   if (_tradingCfg && now - _tradingCfgAt < CFG_TTL) return _tradingCfg;
@@ -4035,37 +4045,12 @@ async function reactivatePosition(bgPos, mostDormantVisible) {
   console.log(`[BG] ${bgPos.symbol} reactivated — swapped ${mostDormantVisible?.symbol || 'nobody'} to background`);
 }
 
-// ─── SCANNER ─────────────────────────────────────────────────────────────────
-// ═════════════════════════════════════════════════════════════════════════════
-async function scanForEntries() {
-  if (!(await isBotRunning())) return;
-  // Fast in-memory check — no Firestore read needed when already halted
-  if (dayHaltedToday) {
-    await checkDayRestart(); // check if user sent /restart
-    return;
-  }
-  const positions = await getVisiblePositions();
-  if (positions.length >= MAX_POSITIONS) return;
-
-  const vacantSlots = MAX_POSITIONS - positions.length;
-
-  // Count open slots per strategy
-  const slotCount = {};
-  STRATEGIES.forEach(s => slotCount[s.id] = 0);
-  positions.forEach(p => { if (p.strategyId != null) slotCount[p.strategyId]++; });
-
-  const openStrategies = STRATEGIES.filter(s => slotCount[s.id] < s.maxSlots);
-  if (!openStrategies.length) return;
-
-  // ── Score threshold — never lower than MIN_SCORE regardless of vacant slots ──
-  // Resist the urge to fill slots with low-quality coins. Quality > quantity.
-  // Slight relief (−5) when 5+ slots empty, but never below MIN_SCORE.
-  const scoreThreshold = vacantSlots >= 5 ? Math.max(MIN_SCORE, MIN_SCORE - 5) : MIN_SCORE;
-  if (vacantSlots >= 3) console.log(`[BOT] ${vacantSlots} slots vacant — score threshold: ${scoreThreshold}`);
-
-  // Fetch candidates from DexScreener
-  // Diverse keyword set — covers meme coins, AI tokens, trending names, and general Solana ecosystem.
-  // 1–4 hour coins appear in these results as long as they have volume/activity.
+// ─── CANDIDATE POOL REFRESH ──────────────────────────────────────────────────
+// All DexScreener API traffic lives here. Called every 3 min by scanForEntries().
+// Results are cached in _candidatePool / _candidatePoolMap so the 15-second
+// evaluation loop never touches the DexScreener API directly.
+async function refreshCandidatePool() {
+  console.log('[POOL] Refreshing candidate pool from DexScreener...');
   const keywords = [
     // classic meme
     'meme','pepe','dog','cat','inu','shib','doge','frog','chad',
@@ -4076,23 +4061,20 @@ async function scanForEntries() {
     'sol','baby','floki','coin','token',
     // newer launches
     'new','launch','fair',
-    // ecosystem & DeFi (always included — ANSEM-type coins won't match meme keywords)
+    // ecosystem & DeFi
     'defi','swap','yield','nft','gaming','web3','dao','ape','based','surge',
+    // wide net — always included (was: only when 5+ slots vacant in old code)
+    'eth','avax','bonk','wif','bitcoin','hot','fire','gem','100x',
   ];
-  // When urgently filling (5+ vacant), cast an even wider net
-  if (vacantSlots >= 5) {
-    keywords.push('eth','avax','bonk','wif','trump','bitcoin','hot','fire','gem','100x');
-  }
-  const seen        = new Set();
-  const candidates  = [];
-  // graduatedSeen tracks token addresses for which we already have a *graduated-DEX pair*
-  // (Raydium, PumpSwap, Meteora, etc.) in candidates. Used to prevent the `seen` check
-  // from blocking the trending section from fetching the graduated-DEX pair of a coin
-  // that appeared earlier as a pump.fun bonding-curve pair (same token address → same
-  // `seen` entry, different pair).
+  const seen          = new Set();
+  const candidates    = [];
+  // graduatedSeen: token addresses for which a graduated-DEX pair is already in
+  // candidates — prevents the seen check from blocking a graduated pair when the
+  // same address appeared earlier as a pump.fun bonding-curve pair.
   const graduatedSeen = new Set();
-  const dexBoostAddrs = new Set(); // DexScreener boosted token addresses — merged into trending map below
+  const dexBoostAddrs = new Set(); // merged into trending map below
 
+  // ── keyword fetch ──────────────────────────────────────────────────────────
   for (const kw of keywords) {
     try {
       const r = await httpGet('api.dexscreener.com', `/latest/dex/search?q=${kw}`);
@@ -4121,32 +4103,23 @@ async function scanForEntries() {
     }
   } catch(e) {}
 
-  // ── DexScreener Boosted Tokens (same source as MemeScan PRO signals) ──────────
-  // MemeScan PRO uses /token-boosts/top/v1 and /token-boosts/latest/v1 to find
-  // promoted/trending coins. Without this, the bot only sees keyword matches and
-  // misses all boosted coins regardless of their names (e.g. HEXN, HYPERCHAN, etc.)
+  // ── DexScreener Boosted Tokens ─────────────────────────────────────────────
   const boostEndpoints = ['/token-boosts/top/v1', '/token-boosts/latest/v1'];
   for (const boostEp of boostEndpoints) {
     try {
       const r = await httpGet('api.dexscreener.com', boostEp);
       const d = JSON.parse(r.body);
-      // API returns array of {chainId, tokenAddress, amount, ...}
       const boosted = Array.isArray(d) ? d : [];
-      // Filter to Solana only, take top 50 per endpoint (was 25 — doubled to catch mid-range trending coins)
       const solanaBoosted = boosted.filter(b => b.chainId === 'solana').slice(0, 50);
-      console.log(`[SCAN] Boosted (${boostEp.split('/')[1]}): ${boosted.length} total, ${solanaBoosted.length} Solana`);
+      console.log(`[POOL] Boosted (${boostEp.split('/')[1]}): ${boosted.length} total, ${solanaBoosted.length} Solana`);
       for (const b of solanaBoosted) {
         const addr = b.tokenAddress || '';
-        // Skip only if we already have a graduated-DEX pair for this token (not just
-        // seen it as a pump.fun bonding-curve pair from the keyword scan).
         if (!addr || graduatedSeen.has(addr)) continue;
         seen.add(addr);
-        dexBoostAddrs.add(addr.toLowerCase()); // track for trending cross-reference
+        dexBoostAddrs.add(addr.toLowerCase());
         try {
           const r2 = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${addr}`);
           const d2 = JSON.parse(r2.body);
-          // Pick the best graduated-DEX pair (PumpSwap, Raydium, Meteora …).
-          // Fall back to first pair only if none of the allowed DEXes has a pair.
           const graduatedPair = (d2.pairs || []).find(p => ALLOWED_DEXES.has(p.dexId));
           const targetPair    = graduatedPair || (d2.pairs || [])[0];
           if (targetPair) {
@@ -4157,16 +4130,12 @@ async function scanForEntries() {
             }
           }
         } catch(e) {}
-        await sleep(80); // rate limit — DexScreener allows ~10 req/s
+        await sleep(80);
       }
-    } catch(e) { console.log(`[SCAN] Boosted endpoint error (${boostEp}): ${e.message}`); }
+    } catch(e) { console.log(`[POOL] Boosted endpoint error (${boostEp}): ${e.message}`); }
   }
 
-  // ── DexScreener Top Solana Pairs (by volume) ─────────────────────────────────
-  // Catches high-volume coins that don't match any keyword and aren't in the boosted
-  // list — e.g. "ANSEM / The Black Bear" with $1M daily volume.
-  // DexScreener's /latest/dex/tokens/{chain} returns top pairs by volume for a chain.
-  // We sweep the top 30 Solana pairs to surface any coin that is genuinely active.
+  // ── Top-volume sweep ───────────────────────────────────────────────────────
   try {
     const r = await httpGet('api.dexscreener.com', '/latest/dex/search?q=solana');
     const d = JSON.parse(r.body);
@@ -4180,15 +4149,10 @@ async function scanForEntries() {
         if (ALLOWED_DEXES.has(p.dexId)) graduatedSeen.add(a);
       }
     }
-    console.log(`[SCAN] Top-volume sweep: ${topPairs.length} Solana pairs (vol > $50k)`);
-  } catch(e) { console.log(`[SCAN] Top-volume sweep error: ${e.message}`); }
+    console.log(`[POOL] Top-volume sweep: ${topPairs.length} Solana pairs (vol > $50k)`);
+  } catch(e) { console.log(`[POOL] Top-volume sweep error: ${e.message}`); }
 
-  // ── Old Recovery candidate sweep (established Solana coins by liquidity) ──────
-  // OR (id=3) requires 15+ day old coins with $80k+ liq — the keyword scan never
-  // surfaces them because every keyword targets new/trending meme coins.
-  // This sweep uses a different DexScreener query (q=sol) and sorts by LIQUIDITY
-  // rather than volume, so established coins with deep pools rise to the top.
-  // A $50k liq floor pre-filters the result to candidates plausibly near OR's $80k bar.
+  // ── OR sweep (high-liquidity established coins) ────────────────────────────
   try {
     const rOr = await httpGet('api.dexscreener.com', '/latest/dex/search?q=sol');
     const dOr = JSON.parse(rOr.body);
@@ -4203,16 +4167,10 @@ async function scanForEntries() {
         if (ALLOWED_DEXES.has(p.dexId)) graduatedSeen.add(a);
       }
     }
-    console.log(`[SCAN] OR sweep: ${orPairs.length} high-liq Solana pairs (liq ≥ $50k)`);
-  } catch(e) { console.log(`[SCAN] OR sweep error: ${e.message}`); }
+    console.log(`[POOL] OR sweep: ${orPairs.length} high-liq Solana pairs (liq ≥ $50k)`);
+  } catch(e) { console.log(`[POOL] OR sweep error: ${e.message}`); }
 
-  // ── Graduated-DEX Active Pairs Sweep (direct graduated-coin candidate pool) ───
-  // Keywords return ~30 results sorted by DexScreener relevance — mostly pump.fun
-  // pre-graduation coins. This sweep re-queries with broader terms and filters
-  // CLIENT-SIDE to allowed DEXes only (Raydium, PumpSwap, Meteora …), sorted by
-  // 1h volume so the most active graduated coins (SC/AM/BB targets) come first.
-  // Covers graduated coins that don't match any meme keyword and wouldn't appear
-  // in the trending feeds.
+  // ── Graduated-DEX active pairs sweep ──────────────────────────────────────
   const gradActiveQueries = ['sol', 'meme', 'coin'];
   for (const rq of gradActiveQueries) {
     try {
@@ -4227,56 +4185,39 @@ async function scanForEntries() {
     } catch(e) {}
     await sleep(200);
   }
-  console.log(`[SCAN] Fetched ${candidates.length} unique candidates via ${keywords.length} keywords + boosts + vol sweep + graduated-DEX sweep (${graduatedSeen.size} graduated pairs)`);
+  console.log(`[POOL] Fetched ${candidates.length} unique candidates via ${keywords.length} keywords + boosts + vol sweep + graduated-DEX sweep (${graduatedSeen.size} graduated pairs)`);
 
-  // ── Trending cross-reference ──────────────────────────────────────────────
-  // Merge pump.fun + Birdeye (refreshed every 5 min) with DexScreener boosts
-  // (already fetched above) into one per-scan map: addr → platform count.
-  // trendCount 0 → use base scoreThreshold (MIN_SCORE)
-  // trendCount 1 → threshold drops by 4
-  // trendCount 2+ → threshold drops by 8
+  // ── Trending cross-reference ───────────────────────────────────────────────
   await fetchTrendingAddrs();
-  const scanTrendingMap = new Map(trendingAddrs); // start from pump.fun + Birdeye
+  const scanTrendingMap = new Map(trendingAddrs);
   for (const a of dexBoostAddrs) {
-    scanTrendingMap.set(a, (scanTrendingMap.get(a) || 0) + 1); // add DexScreener boost
+    scanTrendingMap.set(a, (scanTrendingMap.get(a) || 0) + 1);
   }
   const trendingTotal = scanTrendingMap.size;
-  if (trendingTotal > 0) console.log(`[TRENDING] ${trendingTotal} addrs in merged map (${dexBoostAddrs.size} DexBoost + pump.fun + Birdeye)`);
+  if (trendingTotal > 0) console.log(`[POOL] ${trendingTotal} addrs in trending map (${dexBoostAddrs.size} DexBoost + pump.fun + Birdeye)`);
 
-  // ── Trending-feed candidates (SC/AM primary source) ───────────────────────────
-  // Split into two passes to fix the graduated-coin blind spot (Fix 1):
-  //
-  // PASS 1 — graduated coins (pump.fun raydium_pool or pump_pool set → weight ≥ 5):
-  //   These are the coins SC and AM are hunting. The bug: a graduated coin may have
-  //   appeared earlier in keyword results as its pump.fun bonding-curve pair (same
-  //   token address → same `seen` entry), causing the trending section to skip it and
-  //   never fetch its PumpSwap/Raydium pair. Fix: filter PASS 1 by `graduatedSeen`
-  //   (not `seen`), so we skip only coins whose graduated-DEX pair is already in
-  //   candidates. For each one, fetch DexScreener and pick the best graduated pair.
-  //
-  // PASS 2 — other trending (Birdeye, DexBoost, non-graduated) not yet seen.
-  //   Original logic: filter by `seen`, take first 2 pairs as before.
+  // ── Trending passes 1 & 2 — fetch individual token pairs ──────────────────
   {
     const gradAddrs = [...scanTrendingMap.entries()]
       .filter(([, w]) => w >= 5)
       .sort((a, b) => b[1] - a[1])
       .map(([addr]) => addr)
-      .filter(a => !graduatedSeen.has(a))  // skip only if graduated-DEX pair already in candidates
+      .filter(a => !graduatedSeen.has(a))
       .slice(0, 50);
 
     const otherAddrs = [...scanTrendingMap.entries()]
       .filter(([, w]) => w < 5)
       .sort((a, b) => b[1] - a[1])
       .map(([addr]) => addr)
-      .filter(a => !seen.has(a))           // original behaviour for non-graduated
+      .filter(a => !seen.has(a))
       .slice(0, 50);
 
     const totalFetch = gradAddrs.length + otherAddrs.length;
     if (totalFetch > 0) {
-      console.log(`[TRENDING] Fetching ${totalFetch} addrs (${gradAddrs.length} Raydium graduates + ${otherAddrs.length} other trending)`);
+      console.log(`[POOL] Fetching ${totalFetch} addrs (${gradAddrs.length} grad pass + ${otherAddrs.length} other trending)`);
       let fetched = 0;
 
-      // Pass 1: graduated coins — look for Raydium pair specifically
+      // Pass 1: graduated coins — look for best graduated-DEX pair
       for (const ta of gradAddrs) {
         try {
           const r = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${ta}`);
@@ -4292,7 +4233,7 @@ async function scanForEntries() {
         await sleep(80);
       }
 
-      // Pass 2: non-graduated trending — original behaviour
+      // Pass 2: non-graduated trending
       for (const ta of otherAddrs) {
         try {
           const r = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${ta}`);
@@ -4308,9 +4249,54 @@ async function scanForEntries() {
         await sleep(80);
       }
 
-      console.log(`[TRENDING] Added ${fetched} new candidates from trending feeds (${gradAddrs.length} grad pass + ${otherAddrs.length} other pass)`);
+      console.log(`[POOL] Added ${fetched} new candidates from trending feeds`);
     }
   }
+
+  // ── Commit to module-level cache ───────────────────────────────────────────
+  _candidatePool    = candidates;
+  _candidatePoolMap = scanTrendingMap;
+  _candidatePoolAt  = Date.now();
+  console.log(`[POOL] Cache committed: ${candidates.length} candidates, ${scanTrendingMap.size} trending addrs`);
+}
+
+// ─── SCANNER ─────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+async function scanForEntries() {
+  if (!(await isBotRunning())) return;
+  // Fast in-memory check — no Firestore read needed when already halted
+  if (dayHaltedToday) {
+    await checkDayRestart(); // check if user sent /restart
+    return;
+  }
+  const positions = await getVisiblePositions();
+  if (positions.length >= MAX_POSITIONS) return;
+
+  const vacantSlots = MAX_POSITIONS - positions.length;
+
+  // Count open slots per strategy
+  const slotCount = {};
+  STRATEGIES.forEach(s => slotCount[s.id] = 0);
+  positions.forEach(p => { if (p.strategyId != null) slotCount[p.strategyId]++; });
+
+  const openStrategies = STRATEGIES.filter(s => slotCount[s.id] < s.maxSlots);
+  if (!openStrategies.length) return;
+
+  // ── Score threshold — never lower than MIN_SCORE regardless of vacant slots ──
+  // Resist the urge to fill slots with low-quality coins. Quality > quantity.
+  // Slight relief (−5) when 5+ slots empty, but never below MIN_SCORE.
+  const scoreThreshold = vacantSlots >= 5 ? Math.max(MIN_SCORE, MIN_SCORE - 5) : MIN_SCORE;
+  if (vacantSlots >= 3) console.log(`[BOT] ${vacantSlots} slots vacant — score threshold: ${scoreThreshold}`);
+
+  // ── Candidate pool — refreshed every 3 min; evaluation runs every 15s against cache ──
+  // This decouples the 100+ DexScreener API calls (fetch phase) from the fast
+  // detectStrategy evaluation loop — fixing the rate-limiting root cause of 0 candidates.
+  if (Date.now() - _candidatePoolAt > CANDIDATE_POOL_TTL) {
+    console.log('[POOL] Cache stale — refreshing DexScreener candidates...');
+    await refreshCandidatePool();
+  }
+  const candidates      = _candidatePool;
+  const scanTrendingMap = _candidatePoolMap;
 
   // Clean up expired SL blocks (older than 6h)
   const nowTs = Date.now();
