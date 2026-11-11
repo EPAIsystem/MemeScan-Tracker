@@ -237,12 +237,12 @@ const STRATEGIES = [
     maxSlots: 20, // unlimited — competes openly for global slots with id 1 and id 3
     desc: 'Oversold token reversing from its bottom',
     // ── Entry criteria ──
-    maxCh24: -20,       // Nov-9: must have genuinely crashed (not just a dip)
+    maxCh24: -5,        // Nov-11: -20→-5 — open to any meaningful pullback, not just big crashes
     minCh24: -85,       // Nov-9: not a dead coin
     maxCh1: 12,         // Nov-9: h1 not already mooned
     minCh1: -8,         // Nov-9: h1 turning; not in freefall
     minM5Ch: 0,         // Nov-10: 1.5→0 — pullback watchlist confirms the bounce; scan detects stabilisation
-    minBuyPct: 60,      // Nov-10: 65→60 — 60% buy dominance is strong at a true bottom
+    minBuyPct: 55,      // Nov-11: 60→55 — relaxed to accommodate pump.fun/PumpSwap ecosystem
     minLiq: 5000,       // Nov-11: 25k→5k — pump.fun/PumpSwap ecosystem has thin pools; RugCheck handles rug risk
     minLiqLocked: 3000, // Nov-11: 15k→3k — relaxed floor for LP-locked coins
     minM5Txns: 5,       // Nov-10: 12→5 — crashed coins have thin volume; 5 confirms it's not dead
@@ -260,10 +260,10 @@ const STRATEGIES = [
     // No age cap — AM applies to any coin with active momentum regardless of age.
     // SC (id=2) handles the aggressive surge signal for very young coins; AM and SC
     // compete on score when both criteria are met and the highest scorer wins.
-    minM5Ch: 1.5,        // Nov-10: relaxed 2.5→1.5 — 2.5% was blocking nearly all AM candidates
-    minM5Txns: 15,       // Nov-10: restored to original — 20 stacked too tightly with other gates
-    minBuyPct: 58,       // Nov-10: midpoint 55→62; buyers in control without over-restricting
-    minCh1: 0,           // Nov-10: relaxed 1→0 — flat-to-up hour fine; m5 surge is the signal
+    minM5Ch: 0.5,        // Nov-11: 1.5→0.5 — subtle positive momentum is a valid signal in pump ecosystem
+    minM5Txns: 8,        // Nov-11: 15→8 — pump.fun coins have thinner activity
+    minBuyPct: 52,       // Nov-11: 58→52 — marginal buyer edge is enough with RugCheck backing it
+    minCh1: -2,          // Nov-11: 0→-2 — allow slight h1 dip as long as m5 is positive
     minLiq: 5000,        // Nov-11: 15k→5k — pump.fun/PumpSwap ecosystem; RugCheck handles rug risk
     minLiqLocked: 3000,  // Nov-11: 10k→3k — relaxed floor for LP-locked coins
     // ── TP / SL (partial profit — sell in bits) ──
@@ -280,10 +280,10 @@ const STRATEGIES = [
     // ── Entry criteria — use m5 as primary signal, not h1 ──
     // h1 is a lagging indicator — the surge may already be over by then
     // m5 catches it while it's still happening
-    minM5Ch: 5,          // Nov-9: 5%+ in 5 min = genuine surge, not mild movement
-    minM5Txns: 20,       // Nov-10: restored to original — 25 stacked too tightly with other gates
+    minM5Ch: 3,          // Nov-11: 5→3 — 5% was too rare; 3% is still a genuine surge
+    minM5Txns: 10,       // Nov-11: 20→10 — allow thinner activity in pump ecosystem
     minCh1: 0,           // h1 not negative (newly graduated coins may lack h1 history)
-    minBuyPct: 62,       // Nov-10: 68→62; strong buyer dominance without over-restricting real surges
+    minBuyPct: 55,       // Nov-11: 62→55 — align with pump.fun ecosystem reality
     minLiq: 3000,        // Nov-11: 8k→3k — pump.fun/PumpSwap ecosystem; RugCheck handles rug risk
     minLiqLocked: 2000,  // Nov-11: 5k→2k — relaxed floor for LP-locked coins
     maxAgeDays: 1,       // Nov-9: SC is for young graduated coins only; AM handles 1–3 days
@@ -299,14 +299,14 @@ const STRATEGIES = [
     maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 1
     desc: 'Established coin climbing back steadily',
     // ── Entry criteria ──
-    minAgeDays: 15,      // the defining characteristic of OR — established coins only
-    minCh24: 5,          // Nov-9: recovery must be clearly underway (not just barely positive)
-    minCh1: 0.5,         // Nov-10: 1.5→0.5 — ch24≥5% already confirms recovery; 0.5% checks h1 trend intact
+    minAgeDays: 3,       // Nov-11: 15→3 — open to PumpSwap coins that have been around 3+ days
+    minCh24: 2,          // Nov-11: 5→2 — less aggressive recovery signal required
+    minCh1: 0.5,         // Nov-10: 1.5→0.5 — ch24≥2% already confirms recovery; 0.5% checks h1 trend intact
     maxCh1: 20,          // Nov-9: tighter spike guard — >20% in 1h on old coin is suspicious
-    minBuyPct: 58,       // Nov-9: meaningful buyer interest for established coins
-    minLiq: 10000,       // Nov-11: 25k→10k — open to pump.fun ecosystem; RugCheck handles rug risk; OR still needs minAgeDays≥15
+    minBuyPct: 50,       // Nov-11: 58→50 — marginal buyer dominance allowed with RugCheck backing
+    minLiq: 10000,       // Nov-11: 25k→10k — open to pump.fun ecosystem; RugCheck handles rug risk
     minLiqLocked: 5000,  // Nov-11: 15k→5k — relaxed floor for LP-locked coins
-    minBuys24: 35,       // Nov-10: 60→35 — steady recovery, not surge-level activity; 35 filters noise
+    minBuys24: 15,       // Nov-11: 35→15 — lower activity floor for pump ecosystem
     // ── TP / SL (conservative) ──
     tp1x: 1.12, tp2x: 1.30, tp3x: 1.65,
     slx: 0.92,
@@ -320,12 +320,12 @@ const STRATEGIES = [
     // ── Entry criteria ──
     minLiq: 3000,
     minLiqLocked: 3000,
-    minH1Ch: 5,          // h1 must be strongly up — confirms an uptrend is running
+    minH1Ch: 2,          // Nov-11: 5→2 — h1 just needs to show positive trend, not strongly up
     minM5Ch: -5,         // allow pullback entry — not chasing the top
-    maxM5Ch: 2,          // not at the very peak of a move
+    maxM5Ch: 4,          // Nov-11: 2→4 — wider pullback window; allows more entry points
     minM5Sells: 1,       // at least one sell — confirms real 2-sided trading
-    minBuyPct: 55,       // buyers in control
-    minM5Txns: 10,       // meaningful 5-min activity
+    minBuyPct: 50,       // Nov-11: 55→50 — marginal buyer edge enough for speculative entries
+    minM5Txns: 6,        // Nov-11: 10→6 — allow thinner activity
     maxMcLiqRatio: 60,   // more lenient ratio for thin pump pools
     rugCheckMaxRisk: 50, // stricter rug threshold (50 vs standard 60)
     // ── SL / TP (custom schedule — handled in monitor loop for id=4) ──
