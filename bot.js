@@ -260,9 +260,11 @@ const STRATEGIES = [
     id: 1,
     label: '⚡ ACTIVE MOMENTUM',
     maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 3
-    desc: 'Price ticking every 5-15 min — strong live activity',
+    desc: 'Price ticking every 5-15 min — strong live activity, any age',
     // ── Entry criteria ──
-    maxAgeDays: 3,       // young, active coins
+    // No age cap — AM applies to any coin with active momentum regardless of age.
+    // SC (id=2) handles the aggressive surge signal for very young coins; AM and SC
+    // compete on score when both criteria are met and the highest scorer wins.
     minM5Ch: 1.5,        // Nov-10: relaxed 2.5→1.5 — 2.5% was blocking nearly all AM candidates
     minM5Txns: 15,       // Nov-10: restored to original — 20 stacked too tightly with other gates
     minBuyPct: 58,       // Nov-10: midpoint 55→62; buyers in control without over-restricting
@@ -610,7 +612,7 @@ function detectStrategy(pair, openStrategies) {
       if (isPumpFun) { match = false; }
       else if (strategyFiltersActive) {
         if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // 2h+ only — SC covers 0–24h
-        if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // 3-day cap — SC/BB handle older
+        if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // age upper cap (AM has none — applies to any age)
         if (m5Txns < s.minM5Txns)  { match = false; }
         if (m5Ch < s.minM5Ch)      { match = false; } // POSITIVE direction required (was abs)
         if (ch1 < s.minCh1)        { match = false; }
