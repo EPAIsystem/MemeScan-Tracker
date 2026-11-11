@@ -4069,26 +4069,14 @@ async function reactivatePosition(bgPos, mostDormantVisible) {
 }
 
 // ─── CANDIDATE POOL REFRESH ──────────────────────────────────────────────────
-// All DexScreener API traffic lives here. Called every 3 min by scanForEntries().
-// Results are cached in _candidatePool / _candidatePoolMap so the 15-second
-// evaluation loop never touches the DexScreener API directly.
+// Source: GeckoTerminal trending pools (organic momentum, 6H) + new pools on
+// Solana — 5 pages × 20 = up to 100 from each list.  Each GT pool address is
+// looked up on DexScreener for full pair data (m5Txns etc).  DexScreener boost
+// tokens are added on top.  Called every 3 min by scanForEntries(); results are
+// cached in _candidatePool / _candidatePoolMap so the 15-second evaluation loop
+// never touches any external API directly.
 async function refreshCandidatePool() {
-  console.log('[POOL] Refreshing candidate pool from DexScreener...');
-  const keywords = [
-    // classic meme
-    'meme','pepe','dog','cat','inu','shib','doge','frog','chad',
-    // trending/viral & influencer names
-    'pump','moon','elon','trump','wojak','grok','ai',
-    'ansem','alpha','bull','bear','black',
-    // broader ecosystem
-    'sol','baby','floki','coin','token',
-    // newer launches
-    'new','launch','fair',
-    // ecosystem & DeFi
-    'defi','swap','yield','nft','gaming','web3','dao','ape','based','surge',
-    // wide net — always included (was: only when 5+ slots vacant in old code)
-    'eth','avax','bonk','wif','bitcoin','hot','fire','gem','100x',
-  ];
+  console.log('[POOL] Refreshing candidate pool — GeckoTerminal trending + new pools...');
   const seen          = new Set();
   const candidates    = [];
   // graduatedSeen: token addresses for which a graduated-DEX pair is already in
@@ -4097,34 +4085,79 @@ async function refreshCandidatePool() {
   const graduatedSeen = new Set();
   const dexBoostAddrs = new Set(); // merged into trending map below
 
-  // ── keyword fetch ──────────────────────────────────────────────────────────
-  for (const kw of keywords) {
+  // ── GeckoTerminal — trending Solana pools (6H) ─────────────────────────────
+  // Top 100 organic momentum coins — no paid boosts, purely tx/volume growth.
+  // Pages 1-5 × 20 results = up to 100 pools.
+  const MAX_FDV_USD     = 10_000_000; // skip coins with FDV > $10M (too large for $50 position to move meaningfully)
+  const gtTrendingPools = [];
+  for (let page = 1; page <= 5; page++) {
     try {
-      const r = await httpGet('api.dexscreener.com', `/latest/dex/search?q=${kw}`);
-      const d = JSON.parse(r.body);
-      for (const p of (d.pairs || [])) {
-        const addr = p.baseToken?.address || '';
-        if (!seen.has(addr)) {
-          seen.add(addr); candidates.push(p);
-          if (ALLOWED_DEXES.has(p.dexId)) graduatedSeen.add(addr);
+      const r = await httpGet('api.coingecko.com', `/api/v3/onchain/networks/solana/trending_pools?duration=6h&page=${page}`);
+      if (r.status === 401 || r.status === 403) {
+        console.log(`[POOL] GeckoTerminal trending: HTTP ${r.status} — API key may be required`); break;
+      }
+      const d     = JSON.parse(r.body);
+      const pools = d.data || [];
+      gtTrendingPools.push(...pools);
+      console.log(`[POOL] GT trending page ${page}: ${pools.length} pools`);
+      if (pools.length < 20) break; // end of data
+    } catch(e) { console.log(`[POOL] GT trending page ${page} error: ${e.message}`); break; }
+    await sleep(300);
+  }
+
+  // ── GeckoTerminal — new Solana pools ───────────────────────────────────────
+  // Newly launched coins gaining traction — equivalent to DexScreener "New Trending" tab.
+  const gtNewPools = [];
+  for (let page = 1; page <= 5; page++) {
+    try {
+      const r = await httpGet('api.coingecko.com', `/api/v3/onchain/networks/solana/new_pools?page=${page}`);
+      if (r.status === 401 || r.status === 403) {
+        console.log(`[POOL] GeckoTerminal new: HTTP ${r.status} — API key may be required`); break;
+      }
+      const d     = JSON.parse(r.body);
+      const pools = d.data || [];
+      gtNewPools.push(...pools);
+      console.log(`[POOL] GT new page ${page}: ${pools.length} pools`);
+      if (pools.length < 20) break;
+    } catch(e) { console.log(`[POOL] GT new page ${page} error: ${e.message}`); break; }
+    await sleep(300);
+  }
+
+  // ── Fetch DexScreener pair data for each GeckoTerminal pool ───────────────
+  // GT pool address = Raydium / PumpSwap pair address → lookup full pair data
+  // including m5Txns which GeckoTerminal does not expose directly.
+  const gtAllPools  = [...gtTrendingPools, ...gtNewPools];
+  const gtPoolAddrs = new Set();
+  let fdvFiltered   = 0;
+  let dexFetched    = 0;
+
+  for (const pool of gtAllPools) {
+    const a        = pool.attributes || {};
+    const poolAddr = a.address || '';
+    if (!poolAddr || gtPoolAddrs.has(poolAddr)) continue;
+
+    // FDV filter — skip established large-cap coins; $50 position can't move them
+    const fdv = parseFloat(a.fdv_usd) || 0;
+    if (fdv > MAX_FDV_USD) { fdvFiltered++; continue; }
+
+    gtPoolAddrs.add(poolAddr);
+
+    try {
+      const r    = await httpGet('api.dexscreener.com', `/latest/dex/pairs/solana/${poolAddr}`);
+      const d    = JSON.parse(r.body);
+      const pair = d.pair || (d.pairs || [])[0];
+      if (pair) {
+        const tokenAddr = pair.baseToken?.address || '';
+        if (tokenAddr && !seen.has(tokenAddr)) {
+          seen.add(tokenAddr); candidates.push(pair);
+          if (ALLOWED_DEXES.has(pair.dexId)) graduatedSeen.add(tokenAddr);
+          dexFetched++;
         }
       }
     } catch(e) {}
-    await sleep(200);
+    await sleep(100);
   }
-
-  // Also fetch trending/gainers for Surge detection
-  try {
-    const r = await httpGet('api.dexscreener.com', '/latest/dex/search?q=solana');
-    const d = JSON.parse(r.body);
-    for (const p of (d.pairs || [])) {
-      const addr = p.baseToken?.address || '';
-      if (!seen.has(addr)) {
-        seen.add(addr); candidates.push(p);
-        if (ALLOWED_DEXES.has(p.dexId)) graduatedSeen.add(addr);
-      }
-    }
-  } catch(e) {}
+  console.log(`[POOL] GT → DexScreener: ${dexFetched} pairs | ${fdvFiltered} skipped (FDV > $${(MAX_FDV_USD/1e6).toFixed(0)}M) | ${gtTrendingPools.length} trending + ${gtNewPools.length} new pools`);
 
   // ── DexScreener Boosted Tokens ─────────────────────────────────────────────
   const boostEndpoints = ['/token-boosts/top/v1', '/token-boosts/latest/v1'];
@@ -4157,58 +4190,6 @@ async function refreshCandidatePool() {
       }
     } catch(e) { console.log(`[POOL] Boosted endpoint error (${boostEp}): ${e.message}`); }
   }
-
-  // ── Top-volume sweep ───────────────────────────────────────────────────────
-  try {
-    const r = await httpGet('api.dexscreener.com', '/latest/dex/search?q=solana');
-    const d = JSON.parse(r.body);
-    const topPairs = (d.pairs || [])
-      .filter(p => p.chainId === 'solana' && p.volume?.h24 > 50000)
-      .slice(0, 30);
-    for (const p of topPairs) {
-      const a = p.baseToken?.address || '';
-      if (a && !seen.has(a)) {
-        seen.add(a); candidates.push(p);
-        if (ALLOWED_DEXES.has(p.dexId)) graduatedSeen.add(a);
-      }
-    }
-    console.log(`[POOL] Top-volume sweep: ${topPairs.length} Solana pairs (vol > $50k)`);
-  } catch(e) { console.log(`[POOL] Top-volume sweep error: ${e.message}`); }
-
-  // ── OR sweep (high-liquidity established coins) ────────────────────────────
-  try {
-    const rOr = await httpGet('api.dexscreener.com', '/latest/dex/search?q=sol');
-    const dOr = JSON.parse(rOr.body);
-    const orPairs = (dOr.pairs || [])
-      .filter(p => p.chainId === 'solana' && (p.liquidity?.usd || 0) >= 50000)
-      .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))
-      .slice(0, 50);
-    for (const p of orPairs) {
-      const a = p.baseToken?.address || '';
-      if (a && !seen.has(a)) {
-        seen.add(a); candidates.push(p);
-        if (ALLOWED_DEXES.has(p.dexId)) graduatedSeen.add(a);
-      }
-    }
-    console.log(`[POOL] OR sweep: ${orPairs.length} high-liq Solana pairs (liq ≥ $50k)`);
-  } catch(e) { console.log(`[POOL] OR sweep error: ${e.message}`); }
-
-  // ── Graduated-DEX active pairs sweep ──────────────────────────────────────
-  const gradActiveQueries = ['sol', 'meme', 'coin'];
-  for (const rq of gradActiveQueries) {
-    try {
-      const rGrad = await httpGet('api.dexscreener.com', `/latest/dex/search?q=${rq}`);
-      const dGrad = JSON.parse(rGrad.body);
-      const gradPairs = (dGrad.pairs || [])
-        .filter(p => p.chainId === 'solana' && ALLOWED_DEXES.has(p.dexId) && !graduatedSeen.has(p.baseToken?.address || ''));
-      for (const p of gradPairs) {
-        const a = p.baseToken?.address || '';
-        if (a) { seen.add(a); graduatedSeen.add(a); candidates.push(p); }
-      }
-    } catch(e) {}
-    await sleep(200);
-  }
-  console.log(`[POOL] Fetched ${candidates.length} unique candidates via ${keywords.length} keywords + boosts + vol sweep + graduated-DEX sweep (${graduatedSeen.size} graduated pairs)`);
 
   // ── Trending cross-reference ───────────────────────────────────────────────
   await fetchTrendingAddrs();
