@@ -2436,6 +2436,8 @@ async function pollTelegramCommands() {
             }
           }
           // score < 80 → silent ignore
+          // Nov-11: auto-delete the PRO signal message so the chat stays clean
+          await deleteTelegramMessage(chatId, update.message?.message_id).catch(() => {});
         } catch(e) { console.error('[PRO-BRIDGE]', e.message); }
       } // closes PRO bridge if block
 
@@ -4598,6 +4600,25 @@ function fmtTradeResult(size, totalPnl) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function deleteTelegramMessage(chatId, messageId) {
+  if (!TELEGRAM_TOKEN || !chatId || !messageId) return;
+  const body = JSON.stringify({ chat_id: chatId, message_id: messageId });
+  return new Promise(resolve => {
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${TELEGRAM_TOKEN}/deleteMessage`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: 10000,
+    }, res => {
+      let d = ''; res.on('data', c => d += c); res.on('end', () => resolve(d));
+    });
+    req.on('error', e => { console.error('[TG-DEL]', e.message); resolve(null); });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.write(body); req.end();
+  });
+}
 
 async function sendTelegram(text) {
   if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT) return;
