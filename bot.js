@@ -3595,9 +3595,8 @@ async function monitorPositions() {
     //   • price < entry for 2+ min (after grace period):
     //       SL TIGHTENED from −25% to −15% (downside protection).
     // ══════════════════════════════════════════════════════════════════════
-    // Strategy 5 has its own ATH-based trailing SL schedule (see below);
-    // skip the universal capital floor so they don't conflict.
-    if (!pos.isMoonBag && !pos.capitalWithdrawn && pos.strategyId !== 4) {
+    // Universal capital floor — applies to all strategies including Pump Spec.
+    if (!pos.isMoonBag && !pos.capitalWithdrawn) {
       const ageMs        = Date.now() - pos.enteredAt;
       const currentSLNow = updates.currentSL ?? pos.currentSL;
 
@@ -3640,45 +3639,13 @@ async function monitorPositions() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // ── STRATEGY 5 — ATH-BASED TRAILING SL ───────────────────────────────
-    // Phase-based schedule tied to ATH, not flat entry:
-    //  <20% gain:   flat −40% from entry (slx=0.60)
-    //  20–59%:      break-even lock (SL = entry)
-    //  60–79%:      −35% trail from ATH
-    //  80–99%:      −30% trail from ATH
-    //  post-capital: −25% → −20% → −15% → −10% floor
-    // ══════════════════════════════════════════════════════════════════════
-    if (pos.strategyId === 4 && !pos.isMoonBag) {
-      const ATH = currentPeak;
-      let s5SL;
-      if (!pos.capitalWithdrawn) {
-        if (gainPct < 20)       s5SL = pos.entryPrice * 0.60; // flat −40%
-        else if (gainPct < 60)  s5SL = pos.entryPrice;         // break-even lock
-        else if (gainPct < 80)  s5SL = ATH * 0.65;             // −35% trail
-        else                    s5SL = ATH * 0.70;             // −30% trail
-      } else {
-        if (gainPct < 120)      s5SL = ATH * 0.75; // −25% from ATH
-        else if (gainPct < 140) s5SL = ATH * 0.80; // −20% from ATH
-        else if (gainPct < 160) s5SL = ATH * 0.85; // −15% from ATH
-        else                    s5SL = ATH * 0.90; // −10% floor
-      }
-      // Break-even ratchet: once in profit, SL never drops below entry
-      if (gainPct >= 20) s5SL = Math.max(s5SL, pos.entryPrice);
-      const currentSLNow = updates.currentSL ?? pos.currentSL;
-      if (s5SL > currentSLNow * 1.005) {
-        updates.currentSL      = s5SL;
-        updates.trailingActive = gainPct >= 60;
-      }
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
     // ── UNIVERSAL PROGRESSIVE TRAILING SL ────────────────────────────────
-    // Activates at +50% gain. Trail starts at 50% below ATH, tightens 5%
+    // Activates at +25% gain. Trail starts at 50% below ATH, tightens 5%
     // per +20% ATH move, floor 10%. SL never within 10% of current price
     // (buffer). SL never below entryPrice (zero-loss). Ratchet: only rises.
+    // Applies to all strategies — Pump Spec now uses the same mechanism.
     // ══════════════════════════════════════════════════════════════════════
-    // Strategy 5 uses its own ATH-based schedule above — skip universal trail.
-    if (gainPct > 0 && pos.strategyId !== 4) {
+    if (gainPct > 0) {
       let newSL;
 
       if (pos.isMoonBag) {
