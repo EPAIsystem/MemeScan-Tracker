@@ -28,7 +28,7 @@ const TELEGRAM_CHAT   = (process.env.TELEGRAM_CHAT_ID   || process.env.TELEGRAM_
 const POSITION_SIZE   = parseFloat(process.env.POSITION_SIZE || '100');
 const MAX_POSITIONS   = 20;
 const SURGE_RESERVED  = 5;   // last 5 slots reserved for Surge Catch (id 2) only
-const MIN_SCORE       = 55;  // Nov-9 overhaul — requires positive bonuses above 50 base; filters marginal trades
+const MIN_SCORE       = 45;  // Nov-11: lowered from 55; GeckoTerminal trending pre-filters the pool so a 55 bar was double-filtering
 
 // ── STRATEGY FILTER SWITCH ────────────────────────────────────────────────────
 // true  = all per-strategy filters active (normal operation — Oct-27 baseline)
@@ -86,12 +86,7 @@ const MOON_BAG_SL_SCHEDULE = [
 ];
 
 // ─── GOPLUS LP LOCK CHECK ─────────────────────────────────────────────────────
-// DexScreener chain ID → GoPlus numeric / named chain ID
-const GOPLUS_CHAIN_MAP = {
-  solana: 'solana', ethereum: '1', eth: '1',
-  bsc: '56', base: '8453', polygon: '137',
-  arbitrum: '42161', avalanche: '43114', optimism: '10',
-};
+// GoPlus removed (Nov-11) — Solana security now handled entirely by RugCheck.
 const lpLockCache = new Map();   // addr → { locked: bool, ts: number }
 const LP_LOCK_TTL = 10 * 60 * 1000; // 10-min cache — recheck often; meme coins can change
 
@@ -2318,14 +2313,14 @@ async function pollTelegramCommands() {
         await sendTelegram(
           `${icon} *LP LOCK CHECK: ${state}*\n\n` +
           (lpLockBypass
-            ? `GoPlus + RugCheck security check is now *bypassed*.\n\n` +
-              `Bypassed: LP lock check, mintable/freezable guard, risk score, strict liq floor for unlocked LP.\n\n` +
+            ? `RugCheck security check is now *bypassed*.\n\n` +
+              `Bypassed: LP lock check, risk score gate, strict liq floor for unlocked LP.\n\n` +
               `*All coins that pass strategy scoring will now reach the quality gate.*\n\n` +
               `Watch the logs — if entries appear, LP check was the last blocker.\n` +
               `If entries still don't appear, the quality gate or scoring floor is blocking.\n\n` +
               `⚠️ _Diagnostic mode — this skips real rug protection. Restore with /skiplp when done._`
             : `LP lock check *restored* to normal.\n\n` +
-              `GoPlus + RugCheck security checks are active again.\n` +
+              `RugCheck security checks are active again.\n` +
               `Run /status to confirm.`
           )
         );
@@ -2884,24 +2879,14 @@ async function processLpProbation() {
 }
 
 // ─── LP LOCK + SECURITY FILTER ───────────────────────────────────────────────
-// Two-stage security check for every strategy match:
+// Security filter — RugCheck only (Solana-native, GoPlus removed Nov-11):
+//   1. Risk score > maxRiskScore (default 60) → hard block
+//   2. LP locked → pass with relaxed floors
+//   3. pump.fun bonding-curve (strategy 4) → pass on risk score alone
+//   4. LP unlocked + risk ≤ 40 + strict liq/ratio floors → PROBATION
+//   5. LP unlocked + too risky / thin pool → hard block
 //
-// Stage 1 — GoPlus (all chains, batch):
-//   1. Mintable  — mint authority still active → hard block
-//   2. Freezable — freeze authority still active → hard block
-//   3. EVM LP lock — lp_locked or lp_burned via GoPlus → required for EVM
-//   4. Solana airdrop scam flag → hard block
-//
-// Stage 2 — RugCheck (Solana only, per-coin):
-//   5. LP locked — RugCheck lp_locked/markets lp data → required
-//   6. Risk score > 60 → hard block even if locked
-//   7. LP unlocked + risk ≤ 40 + passes strict liq/ratio floors → PROBATION
-//
-// Tiered liquidity/ratio floors (Solana LP-locked coins use relaxed floors;
-// unlocked coins must pass the original strict floors):
-//   Relaxed (LP locked): minLiqLocked + 40× MC/Liq  (checked at detectStrategy level)
-//   Strict  (LP unlocked): minLiq + 30× MC/Liq (enforced here — block or probation)
-//
+// EVM chains: fail open (no checker after GoPlus removal).
 // Results cached 10 min. Probation coins bust their own cache on recheck.
 async function filterByLpLock(matches) {
   const passed   = new Set();
@@ -2918,163 +2903,78 @@ async function filterByLpLock(matches) {
 
   if (!toCheck.length) return matches.filter(c => passed.has(c.addr));
 
-  // Group by chain for batched GoPlus calls
-  const byChain = {};
   for (const coin of toCheck) {
-    const chain = (coin.chain || '').toLowerCase();
-    if (!byChain[chain]) byChain[chain] = [];
-    byChain[chain].push(coin);
-  }
+    const chain    = (coin.chain || '').toLowerCase();
+    const isSolana = chain === 'solana';
 
-  for (const [chain, coins] of Object.entries(byChain)) {
-    const goplusChain = GOPLUS_CHAIN_MAP[chain] || null;
-    if (!goplusChain) {
-      for (const c of coins) lpLockCache.set(c.addr, { locked: false, ts: Date.now() });
+    // ── Non-Solana: no checker available — fail open ──────────────────────
+    if (!isSolana) {
+      lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
+      passed.add(coin.addr);
       continue;
     }
 
-    const isSolana = chain === 'solana';
-    const addrs    = coins.map(c => c.addr).join(',');
+    // ── RugCheck — LP lock + risk score (Solana) ─────────────────────────
+    const rc = await checkRugCheck(coin.addr, coin.symbol);
 
-    // ── Stage 1: GoPlus — mint / freeze / EVM LP lock ─────────────────────
-    let goplusResult = {};
-    try {
-      const r = await httpGet('api.gopluslabs.io', `/api/v1/token_security/${goplusChain}?contract_addresses=${addrs}`);
-      if (r.status !== 200) {
-        console.warn(`[SECURITY] GoPlus returned ${r.status} for chain ${chain} — failing open (${coins.length} coins)`);
-        // For EVM: fail open (allow through). For Solana: proceed to RugCheck stage.
-        if (!isSolana) {
-          for (const c of coins) { lpLockCache.set(c.addr, { locked: true, ts: Date.now() }); passed.add(c.addr); }
-          continue;
-        }
-      } else {
-        goplusResult = JSON.parse(r.body)?.result || {};
-      }
-    } catch(e) {
-      console.warn(`[SECURITY] GoPlus error for chain ${chain}: ${e.message} — failing open`);
-      if (!isSolana) {
-        for (const c of coins) { lpLockCache.set(c.addr, { locked: true, ts: Date.now() }); passed.add(c.addr); }
-        continue;
-      }
+    if (!rc) {
+      // RugCheck unavailable — fail open
+      console.log(`[RUGCHECK] ⚠️ ${coin.symbol} — RugCheck unavailable, allowing through`);
+      lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
+      passed.add(coin.addr);
+      continue;
     }
 
-    for (const coin of coins) {
-      const info = goplusResult[coin.addr.toLowerCase()] || goplusResult[coin.addr] || null;
-
-      // ── No GoPlus record yet (newly listed) ───────────────────────────────
-      if (!info && !isSolana) {
-        console.log(`[SECURITY] ⚠️ ${coin.symbol} (${coin.addr.slice(0,8)}…) — not in GoPlus yet, allowing through`);
-        passed.add(coin.addr);
-        continue;
-      }
-
-      // ── 1 & 2: Mintable / Freezable — hard block, all chains ─────────────
-      let isMintable = false, isFreezable = false;
-      if (info) {
-        if (isSolana) {
-          isMintable  = !!(info.mint_authority  && info.mint_authority  !== '');
-          isFreezable = !!(info.freeze_authority && info.freeze_authority !== '');
-        } else {
-          isMintable  = info.is_mintable       === '1';
-          isFreezable = info.transfer_pausable === '1';
-        }
-      }
-      if (isMintable) {
-        console.log(`[SECURITY] ❌ ${coin.symbol} — MINTABLE token rejected`);
-        lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
-        continue;
-      }
-      if (isFreezable) {
-        console.log(`[SECURITY] ❌ ${coin.symbol} — FREEZABLE token rejected`);
-        lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
-        continue;
-      }
-
-      // ── 3: EVM — LP lock via GoPlus ───────────────────────────────────────
-      if (!isSolana) {
-        const lpPasses = info?.lp_locked === '1' || info?.lp_burned === '1';
-        if (!lpPasses) console.log(`[SECURITY] ❌ ${coin.symbol} — EVM LP not locked, skipped`);
-        lpLockCache.set(coin.addr, { locked: lpPasses, ts: Date.now() });
-        if (lpPasses) passed.add(coin.addr);
-        continue;
-      }
-
-      // ── 4: Solana — airdrop scam flag ─────────────────────────────────────
-      if (info && info.is_airdrop_scam === '1') {
-        console.log(`[SECURITY] ❌ ${coin.symbol} — airdrop scam flag, rejected`);
-        lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
-        continue;
-      }
-
-      // ── Stage 2: Solana — RugCheck LP lock + risk score ───────────────────
-      await sleep(200); // pace RugCheck calls
-      const rc = await checkRugCheck(coin.addr, coin.symbol);
-
-      if (!rc) {
-        // RugCheck unavailable — fail open
-        console.log(`[RUGCHECK] ⚠️ ${coin.symbol} — RugCheck unavailable, allowing through`);
-        lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
-        passed.add(coin.addr);
-        continue;
-      }
-
-      // ── 5: Risk score gate ────────────────────────────────────────────────
-      // Strategy 5 (Pump Spec) uses a stricter threshold (50 vs standard 60)
-      // because pump.fun / PumpSwap coins carry higher inherent rug risk.
-      const maxRiskScore = coin.strategy?.rugCheckMaxRisk ?? 60;
-      if (rc.riskScore > maxRiskScore) {
-        console.log(`[RUGCHECK] ❌ ${coin.symbol} — risk score ${rc.riskScore}/100 (>${maxRiskScore}), rejected`);
-        lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
-        continue;
-      }
-
-      // ── 6: LP locked — pass with relaxed floors ───────────────────────────
-      if (rc.lpLocked) {
-        console.log(`[RUGCHECK] ✅ ${coin.symbol} — LP locked, risk ${rc.riskScore}/100, PASSED`);
-        lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
-        passed.add(coin.addr);
-        continue;
-      }
-
-      // ── 6b: Strategy 5 pump.fun bonding-curve coins — no traditional LP ───
-      // Bonding-curve tokens have no separate LP pool; rug risk is captured by
-      // the risk score alone. If score ≤ 50, allow through directly.
-      if (coin.isPumpFun && coin.strategy?.id === 4) {
-        console.log(`[RUGCHECK] ✅ ${coin.symbol} — pump.fun bonding-curve, risk ${rc.riskScore}/100, PASSED (S5)`);
-        lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
-        passed.add(coin.addr);
-        continue;
-      }
-
-      // ── 7: LP NOT locked — strict floor check → probation or hard block ───
-      const strictLiq   = coin.strategy?.minLiq || Infinity;
-      const strictRatio = ANTI_MANIP_MC_LIQ_RATIO_MAX; // 30×
-      const liqOk       = coin.liq >= strictLiq;
-      const ratioOk     = (coin.mcLiqRatio || 999) <= strictRatio;
-      // S5 PumpSwap unlocked: allow if risk ≤ 40 (same as standard unlocked threshold)
-      const maxUnlockedRisk = 40;
-
-      if (rc.riskScore > maxUnlockedRisk) {
-        // Too risky even for probation
-        console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked, risk ${rc.riskScore}/100 (>${maxUnlockedRisk}), rejected`);
-        lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
-      } else if (!liqOk) {
-        // Thin pool without LP lock guarantee — too dangerous
-        console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked + liq $${coin.liq.toFixed(0)} < $${strictLiq} strict floor, rejected`);
-        lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
-      } else if (!ratioOk) {
-        // High MC/Liq without LP lock — manipulation risk
-        console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked + MC/Liq ${(coin.mcLiqRatio||0).toFixed(1)}× > ${strictRatio}×, rejected`);
-        lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
-      } else {
-        // Passes all strict floors — probation until LP lock confirmed
-        addToProbation(coin, rc.riskScore);
-        console.log(`[RUGCHECK] 🕐 ${coin.symbol} — LP unlocked (risk ${rc.riskScore}/100), added to probation`);
-        lpLockCache.set(coin.addr, { locked: false, ts: Date.now() }); // block from normal flow for now
-      }
+    // ── 1: Risk score gate ──────────────────────────────────────────────
+    // Strategy 4 (Pump Spec) uses stricter threshold (50 vs standard 60).
+    const maxRiskScore = coin.strategy?.rugCheckMaxRisk ?? 60;
+    if (rc.riskScore > maxRiskScore) {
+      console.log(`[RUGCHECK] ❌ ${coin.symbol} — risk score ${rc.riskScore}/100 (>${maxRiskScore}), rejected`);
+      lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
+      continue;
     }
 
-    await sleep(200); // brief pause between chain batches
+    // ── 2: LP locked — pass ─────────────────────────────────────────────
+    if (rc.lpLocked) {
+      console.log(`[RUGCHECK] ✅ ${coin.symbol} — LP locked, risk ${rc.riskScore}/100, PASSED`);
+      lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
+      passed.add(coin.addr);
+      continue;
+    }
+
+    // ── 3: pump.fun bonding-curve (strategy 4) — no traditional LP ─────
+    // Bonding-curve tokens have no separate LP pool; risk score is the
+    // only rug signal available. Already passed gate 1 above (≤50).
+    if (coin.isPumpFun && coin.strategy?.id === 4) {
+      console.log(`[RUGCHECK] ✅ ${coin.symbol} — pump.fun bonding-curve, risk ${rc.riskScore}/100, PASSED`);
+      lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
+      passed.add(coin.addr);
+      continue;
+    }
+
+    // ── 4: LP NOT locked — strict floor check → probation or hard block ─
+    const strictLiq       = coin.strategy?.minLiq || Infinity;
+    const strictRatio     = ANTI_MANIP_MC_LIQ_RATIO_MAX; // 30×
+    const liqOk           = coin.liq >= strictLiq;
+    const ratioOk         = (coin.mcLiqRatio || 999) <= strictRatio;
+    const maxUnlockedRisk = 40;
+
+    if (rc.riskScore > maxUnlockedRisk) {
+      console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked, risk ${rc.riskScore}/100 (>${maxUnlockedRisk}), rejected`);
+      lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
+    } else if (!liqOk) {
+      console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked + liq $${coin.liq.toFixed(0)} < $${strictLiq} strict floor, rejected`);
+      lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
+    } else if (!ratioOk) {
+      console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked + MC/Liq ${(coin.mcLiqRatio||0).toFixed(1)}× > ${strictRatio}×, rejected`);
+      lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
+    } else {
+      // Passes all strict floors — probation until LP lock confirmed
+      addToProbation(coin, rc.riskScore);
+      console.log(`[RUGCHECK] 🕐 ${coin.symbol} — LP unlocked (risk ${rc.riskScore}/100), added to probation`);
+      lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
+    }
+    await sleep(200); // pace RugCheck calls
   }
 
   return matches.filter(c => passed.has(c.addr));
