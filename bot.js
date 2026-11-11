@@ -1512,7 +1512,7 @@ async function processManualQueue() {
           }
           if (!openStrategies.length) {
             await doc.ref.update({ status: 'skipped', reason: 'no_open_strategies', processedAt: Date.now() });
-            await sendTelegram(`⏭️ PRO signal (${item.proScore}/100) skipped — all strategy slots full.`);
+            console.log(`[PRO-BRIDGE] ${item.address.slice(0, 8)} skipped — all slots full`);
             continue;
           }
 
@@ -1523,11 +1523,7 @@ async function processManualQueue() {
           if (!result || botScore < MIN_SCORE) {
             const reason = result ? `score_${botScore}_below_${MIN_SCORE}` : 'no_strategy_match';
             await doc.ref.update({ status: 'rejected', reason, botScore, processedAt: Date.now() });
-            await sendTelegram(
-              `❌ *PRO Signal Rejected*\n` +
-              `PRO: ${item.proScore}/100 → Bot: ${botScore}/${MIN_SCORE} needed\n` +
-              `\`${item.address.slice(0, 8)}…${item.address.slice(-6)}\``
-            );
+            // Nov-11: silent reject — no Telegram noise; entry fires only if score passes
             console.log(`[PRO-BRIDGE] ${item.address.slice(0, 8)} rejected — bot score ${botScore}`);
             continue;
           }
@@ -2428,20 +2424,15 @@ async function pollTelegramCommands() {
                   proScore,
                   queuedAt: Date.now(),
                 });
-                await sendTelegram(
-                  `🤖 *PRO Signal → Bot Queue*\n` +
-                  `PRO: ${proScore}/100 → bot evaluating with its own scoring\n` +
-                  `CA: \`${ca.slice(0, 8)}…${ca.slice(-6)}\`\n` +
-                  `_Entry only if bot score ≥ ${MIN_SCORE}_`
-                );
+                // Nov-11: silent queue — no Telegram ack; bot speaks only on actual entry
+                console.log(`[PRO-BRIDGE] queued ${ca.slice(0, 8)} (PRO ${proScore}/100)`);
               } else {
-                await sendTelegram(`ℹ️ PRO signal (${proScore}/100) — CA already queued, bot is on it.`);
+                // Nov-11: silent duplicate — already queued, bot is on it
+                console.log(`[PRO-BRIDGE] ${ca.slice(0, 8)} already queued`);
               }
             } else {
-              await sendTelegram(
-                `⚠️ PRO signal (${proScore}/100) found but couldn't extract the contract address.\n` +
-                `Use \`/queue <CA>\` to add it manually.`
-              );
+              // Nov-11: silent parse failure — user forwarded signal without extractable CA
+              console.log(`[PRO-BRIDGE] could not extract CA from PRO signal (score ${proScore})`);
             }
           }
           // score < 80 → silent ignore
