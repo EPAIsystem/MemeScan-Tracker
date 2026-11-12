@@ -1395,17 +1395,13 @@ async function enterPosition(coin, overrides = {}) {
   const meaningfulR = resistanceCandidates.filter(r => r > effectiveEntry * (1 + RESISTANCE_MIN_GAP));
   const resistancePrice = meaningfulR.length > 0 ? Math.min(...meaningfulR) : null;
 
-  // ── YOUNG COIN TIGHTER SL (< 1 hour old) ────────────────────────────────────
-  // Rug pulls happen fastest on coins that just launched — cap the initial SL
-  // at 10% below entry so we don't ride a rug all the way to zero.
-  // If the strategy's normal SL is already tighter (slx > 0.90), keep it as-is.
-  // Strategy 5 (Pump Spec) deliberately uses a wide −40% SL (slx=0.60); skip the
-  // young-coin floor so it isn't overridden to −10%, which would trigger immediately.
-  const isYoungCoin   = (coin.ageMinutes || 999) < 60 && s.id !== 4;
-  const youngSLFloor  = 0.90; // max 10% below entry for < 1h coins
-  const initialSLPrice = isYoungCoin
-    ? Math.max(effectiveEntry * s.slx, effectiveEntry * youngSLFloor)
-    : effectiveEntry * s.slx;
+  // ── INITIAL SL = ENTRY PRICE (break-even from day 1) ────────────────────────
+  // The dynamic trailing SL system takes over immediately:
+  //   Phase 1: SL = entry (fires here if price drops below entry — cost = fees only)
+  //   Phase 2: SL = entry + 50% × ATH_gain (applied in monitorPositions)
+  //   Phase 3: gap tightens 50→45→40→35%… per +20% ATH move (monitorPositions)
+  // Old fixed-% stop (s.slx) is no longer used.
+  const initialSLPrice = effectiveEntry;
 
   const pos = {
     symbol: coin.symbol, name: coin.name, address: coin.addr,
@@ -1438,9 +1434,14 @@ async function enterPosition(coin, overrides = {}) {
     youngCoin: (s.id === 1 && (coin.ageMinutes || 0) < 60),
     // Age at entry — reference only
     coinAgeDays: coin.ageDays || 0,
-    // Universal progressive trail state (null = not activated yet — activates at +50% gain)
-    trailPct:    null,   // current trail % (50 → 45 → ... → 10)
+    // Universal progressive trail state — gap % of ATH gain given back (Phase 3)
+    trailPct:    null,   // current gap % × 100 (50 → 45 → 40 → 35 … → 10)
     tightenBase: null,   // ATH at last tighten event
+    // Progressive withdrawal tracking (Nov-12)
+    originalPositionSize: posSize,  // dollar amount at entry — used for $20 withdrawal calc
+    capitalWithdrawnAt:   null,     // price at capital withdrawal (+50%)
+    withdrawalCount:      0,        // profit withdrawals completed so far (max 5)
+    lastWithdrawalPrice:  null,     // price at last profit withdrawal (for +50% re-trigger)
     // Surge momentum: skip TP1/TP2, ride to 80%+ then full-exit & reinvest
     surgeMomentum: isSurge,
     // Strategy 5 (Pump Spec) profit-halving at 4× — false until triggered, null for other strategies
@@ -3283,6 +3284,7 @@ async function monitorPositions() {
                 const partPnL    = rugFillGain * pos.size * capFrac;
                 capUpdates.capitalWithdrawn     = true;
                 capUpdates.capitalWithdrawPrice = price;
+                capUpdates.capitalWithdrawnAt   = price;
                 capUpdates.remaining            = pos.remaining - capFrac;
                 capUpdates.recoveredAmount      = totalRecovered + proceeds;
                 capUpdates.pnl                  = (pos.pnl || 0) + partPnL;
@@ -3292,6 +3294,7 @@ async function monitorPositions() {
               } else {
                 capUpdates.capitalWithdrawn     = true;
                 capUpdates.capitalWithdrawPrice = price;
+                capUpdates.capitalWithdrawnAt   = price;
                 capUpdates.tpDisabled           = true;
               }
             }
@@ -3571,12 +3574,13 @@ async function monitorPositions() {
     // Triggers at +100% for all coins. After this, trailing SL rides the profit.
     // ══════════════════════════════════════════════════════════════════════
     if (!pos.capitalWithdrawn) {
-      const capThreshold = 1.00; // +100% gain — universal
+      const capThreshold = 0.50; // +50% gain — recover original capital at first profit milestone
       if (gain >= capThreshold && pos.remaining > 0.01) {
         const totalRecovered = pos.recoveredAmount || 0;
         const stillNeeded    = pos.size - totalRecovered; // capital still at risk
         if (stillNeeded > 0.01) {
-          // Sell the minimum fraction needed to bring total recovered >= pos.size
+          // Sell the minimum fraction needed to bring total recovered >= pos.size.
+          // At +50%: capitalFrac = size / (remaining × size × 1.5) = 1/1.5 = 0.667
           const currentValue = pos.remaining * pos.size * (price / pos.entryPrice);
           const capitalFrac  = Math.min(pos.remaining, stillNeeded / currentValue);
           const proceeds     = capitalFrac * pos.size * (exitFillPrice / pos.entryPrice);
@@ -3586,25 +3590,90 @@ async function monitorPositions() {
           const capUpdates   = {
             capitalWithdrawn:    true,
             capitalWithdrawPrice: price,
+            capitalWithdrawnAt:  price,  // used for progressive withdrawal trigger
             remaining:           newRemaining,
             recoveredAmount:     newRecovered,
             pnl:                 (pos.pnl || 0) + partPnL,
-            tpDisabled:          true, // TP sells done — Phase 2 is pure profit trail
+            tpDisabled:          true, // TP sells done — profit trail takes over
           };
           await updatePosition(pos.id, capUpdates);
           await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, capitalFrac));
           Object.assign(pos, capUpdates);
-          alertMsg = `🛡️ *CAPITAL PROTECTED*\n\n` +
+          alertMsg = `🛡️ *CAPITAL RECOVERED*\n\n` +
             `*${pos.symbol}* ${pos.strategyLabel}\n` +
-            `📥 Entry: $${fmtPrice(pos.entryPrice)} | Trigger: +100% (house money)\n` +
+            `📥 Entry: $${fmtPrice(pos.entryPrice)} | Trigger: +50% (house money)\n` +
             `💰 Sold ${(capitalFrac * 100).toFixed(1)}% → recovered $${newRecovered.toFixed(2)}\n` +
-            `🎯 ${(newRemaining * 100).toFixed(1)}% remains — pure profit, trailing SL only\n` +
+            `🎯 ${(newRemaining * 100).toFixed(1)}% remains — 5× $${((pos.originalPositionSize || pos.size) * 0.20).toFixed(0)} profit withdrawals ahead\n` +
             `🔗 [Chart](${pos.dexUrl})`;
         } else {
           // Prior TP sells already recovered full capital — just flip the flag
-          const capUpdates = { capitalWithdrawn: true, capitalWithdrawPrice: price, tpDisabled: true };
+          const capUpdates = {
+            capitalWithdrawn:   true,
+            capitalWithdrawPrice: price,
+            capitalWithdrawnAt: price,
+            tpDisabled:         true,
+          };
           await updatePosition(pos.id, capUpdates);
           Object.assign(pos, capUpdates);
+        }
+      }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ── PROGRESSIVE PROFIT WITHDRAWALS (Nov-12) ──────────────────────────
+    // After capital recovery (+50%), extract profits in up to 5 × $20 chunks:
+    //   • 1st withdrawal: when price doubles from capitalWithdrawnAt
+    //   • 2nd–5th:        every +50% above the last withdrawal price
+    // After 5 withdrawals (5×20% = 100% of original position in profit): moon bag.
+    // Each sells just enough of remaining to realize 20% of original position size.
+    // ══════════════════════════════════════════════════════════════════════
+    if (pos.capitalWithdrawn && !pos.isMoonBag && (pos.withdrawalCount || 0) < 5
+        && pos.remaining > 0.01 && !closingNow.has(pos.id)) {
+      const wCount        = pos.withdrawalCount || 0;
+      const originalSize  = pos.originalPositionSize || pos.size;
+      const withdrawGoal  = originalSize * 0.20; // $20 per trigger on $100 position
+
+      let shouldWithdraw = false;
+      if (wCount === 0) {
+        // 1st: when price doubles from capital withdrawal price
+        const refP = pos.capitalWithdrawnAt || pos.capitalWithdrawPrice || (pos.entryPrice * 1.50);
+        shouldWithdraw = price >= refP * 2.0;
+      } else {
+        // 2nd–5th: every +50% from last withdrawal price
+        shouldWithdraw = !!(pos.lastWithdrawalPrice && price >= pos.lastWithdrawalPrice * 1.50);
+      }
+
+      if (shouldWithdraw) {
+        const curValue   = pos.remaining * pos.size * (price / pos.entryPrice);
+        const closeRatio = Math.min(pos.remaining - 0.001, withdrawGoal / curValue);
+        if (closeRatio > 0.001) {
+          const wFill        = pos.tradingMode === 'paper'
+            ? simulateFillPrice(price, pos.size * closeRatio, pos.liquidityAtEntry || 0, false)
+            : price;
+          const wGain        = (wFill - pos.entryPrice) / pos.entryPrice;
+          const partPnL      = wGain * pos.size * closeRatio;
+          const newRemaining = +(pos.remaining - closeRatio).toFixed(6);
+          const newCount     = wCount + 1;
+          const toMoonBag    = newCount >= 5;
+          const wUpdates     = {
+            remaining:          newRemaining,
+            pnl:                (pos.pnl || 0) + partPnL,
+            withdrawalCount:    newCount,
+            lastWithdrawalPrice: price,
+            isMoonBag:          toMoonBag,
+          };
+          await updatePosition(pos.id, wUpdates);
+          await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, wFill, closeRatio));
+          Object.assign(pos, wUpdates);
+          await sendTelegram(
+            `💰 *PROFIT WITHDRAWAL ${newCount}/5*\n\n` +
+            `*${pos.symbol}* ${pos.strategyLabel}\n` +
+            `📥 Entry: $${fmtPrice(pos.entryPrice)} | Now: +${gainPct.toFixed(1)}%\n` +
+            `💸 Sold ${(closeRatio*100).toFixed(1)}% → locked *$${partPnL.toFixed(2)}*\n` +
+            `🎯 ${(newRemaining*100).toFixed(1)}% remains${toMoonBag ? '\n🌕 *MOON BAG MODE — 20% trailing SL from ATH*' : ` — next at $${fmtPrice(price * 1.50)}`}\n` +
+            `🔗 [Chart](${pos.dexUrl})`
+          );
+          console.log(`[BOT] PROFIT_WITHDRAWAL ${newCount}/5 ${pos.symbol}: +${gainPct.toFixed(1)}%, sold ${(closeRatio*100).toFixed(1)}%, locked $${partPnL.toFixed(2)}`);
         }
       }
     }
@@ -3683,127 +3752,60 @@ async function monitorPositions() {
     // Everything else rides via progressive trailing SL below.
     // ─────────────────────────────────────────────────────────────────────────
 
-    // ══════════════════════════════════════════════════════════════════════
-    // ── CAPITAL FLOOR — PRICE-BASED TRIGGER ──────────────────────────────
-    // Three tiers:
-    //   • price ≥ entry × 1.05 (+5% above entry):
-    //       50% PROFIT LOCK — SL = entry + 50% × (ATH − entry)
-    //       Locks half the gain above entry. At +20%, SL sits at +10%.
-    //       Ratchet: once pushed up it never comes back down.
-    //   • entry ≤ price < entry × 1.05 (between 0% and +5%):
-    //       ZERO-LOSS FLOOR — SL = entryPrice immediately.
-    //       Capital protected the moment the coin turns green.
-    //   • price < entry for 2+ min (after grace period):
-    //       SL TIGHTENED from −25% to −15% (downside protection).
-    // ══════════════════════════════════════════════════════════════════════
-    // Universal capital floor — applies to all strategies including Pump Spec.
-    if (!pos.isMoonBag && !pos.capitalWithdrawn) {
-      const ageMs        = Date.now() - pos.enteredAt;
-      const currentSLNow = updates.currentSL ?? pos.currentSL;
-
-      if (price >= pos.entryPrice * 1.05) {
-        // ── TIER 1: 50% PROFIT LOCK (+5% above entry) ────────────────────
-        // SL = entry + 50% × (ATH − entry): locks in half the profit above entry.
-        // E.g. entry $100, ATH $120 → SL $110 → ~$6–7 secured after slippage.
-        const ATHForLock    = currentPeak; // ATH for this position
-        const profitLockSL  = pos.entryPrice + 0.5 * (ATHForLock - pos.entryPrice);
-        const capFloorSL    = Math.max(pos.entryPrice, profitLockSL);
-        if (capFloorSL > currentSLNow * 1.005) {
-          updates.currentSL      = capFloorSL;
-          updates.trailingActive = true;
-        }
-
-      } else if (price >= pos.entryPrice) {
-        // ── TIER 2: ZERO-LOSS FLOOR (between entry and +5%) ──────────────
-        // Price is green but hasn't reached the profit-lock threshold yet.
-        // Lock SL at entry so we can never exit below break-even.
-        if (pos.entryPrice > currentSLNow * 1.005) {
-          updates.currentSL      = pos.entryPrice;
-          updates.trailingActive = true;
-        }
-
-      } else if (ageMs >= CAPITAL_FLOOR_GRACE_MS && !pos.slTightened) {
-        // ── TIER 3: 2-MIN GRACE TIGHTEN (price still below entry) ────────
-        // Price hasn't recovered above entry after 2-min — tighten SL to −15%.
-        const tightenedSL = pos.entryPrice * SL_TIGHTEN_PCT;
-        if (tightenedSL > currentSLNow * 1.005) {
-          updates.currentSL  = tightenedSL;
-          updates.slTightened = true;
-          sendTelegram(
-            `⚠️ *SL TIGHTENED — ${pos.symbol}*\n` +
-            `Price still below entry after 2-min grace\n` +
-            `SL: −25% → −15% from entry ($${fmtPrice(tightenedSL)})\n` +
-            `Waiting for price to recover above entry ($${fmtPrice(pos.entryPrice)})…`
-          ).catch(() => {});
-        }
+    // ── PHASE 2 CAPITAL FLOOR — fires on any positive gain ───────────────────
+    // SL = entry + 50% × (ATH − entry). Covers gains 0–20%.
+    // Phase 3 (progressive tightening) takes over above 20% — both run; Phase 3 wins.
+    if (!pos.isMoonBag && gain > 0) {
+      const profitLockSL = pos.entryPrice + 0.50 * (currentPeak - pos.entryPrice);
+      if (profitLockSL > (updates.currentSL ?? pos.currentSL) * 1.005) {
+        updates.currentSL      = profitLockSL;
+        updates.trailingActive = true;
       }
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // ── UNIVERSAL PROGRESSIVE TRAILING SL ────────────────────────────────
-    // Activates at +25% gain. Trail starts at 50% below ATH, tightens 5%
-    // per +20% ATH move, floor 10%. SL never within 10% of current price
-    // (buffer). SL never below entryPrice (zero-loss). Ratchet: only rises.
-    // Applies to all strategies — Pump Spec now uses the same mechanism.
+    // ── PHASE 3 PROGRESSIVE TRAILING SL ──────────────────────────────────
+    // Activates at +20% gain (Phase 2 covers 0–20%; both run, Phase 3 wins).
+    //   stepsAbove20 = floor((ATHGain − 20%) / 20%)   → 0 at +20%, 1 at +40%…
+    //   gapPct       = max(10%, 50% − steps × 5%)      → 50%→45%→40%→…→10%
+    //   SL           = entry + (1 − gapPct) × (ATH − entry)
+    //   SL never below entryPrice (zero-loss). Ratchet: only rises.
+    // Moon bag: flat 20% below ATH — SL = ATH × 0.80. Never comes down.
     // ══════════════════════════════════════════════════════════════════════
     if (gainPct > 0) {
       let newSL;
 
       if (pos.isMoonBag) {
-        // ── MOON BAG: graduated SL schedule (25 → 5% floor, unchanged) ────
-        const targetPct = getMoonBagSL(gain);
-        newSL = price * (1 - targetPct);
-        const prevGain  = ((pos.peakPrice || pos.entryPrice) - pos.entryPrice) / pos.entryPrice;
-        const prevPct   = getMoonBagSL(prevGain);
-        if (targetPct < prevPct && newSL > (updates.currentSL ?? pos.currentSL) * 1.005) {
-          await sendTelegram(
-            `🌕 *MOON BAG SL TIGHTENED — ${pos.symbol}*\n` +
-            `+${gainPct.toFixed(1)}% from entry\n` +
-            `SL: ${(prevPct*100).toFixed(0)}% → *${(targetPct*100).toFixed(0)}%*\n🔗 [Chart](${pos.dexUrl})`
-          );
-        }
+        // ── MOON BAG: flat 20% trailing from ATH ─────────────────────────
+        // SL = ATH × 0.80 — rises with ATH, never comes down (ratchet).
+        newSL = currentPeak * 0.80;
 
-      } else if (gainPct >= 25) {
-        // ── UNIVERSAL TRAIL: activates at +25% gain (Nov-9: was +50% — most trades never reached it) ──
-        const ATH = currentPeak; // highest price seen for this position
+      } else if (gainPct >= 20) {
+        // ── PHASE 3: progressive trail starting at +20% gain ─────────────
+        const ATH     = currentPeak;
+        const ATHGain = (ATH - pos.entryPrice) / pos.entryPrice; // e.g. 0.40 at +40%
+        const steps   = Math.max(0, Math.floor((ATHGain - 0.20) / 0.20)); // 0=at20%, 1=at40%…
+        const gapPct  = Math.max(0.10, 0.50 - steps * 0.05);              // 50%→45%→…→10%
 
-        // Initialise on first activation
-        let trailPct    = pos.trailPct    ?? 50;
-        let tightenBase = pos.tightenBase ?? ATH;
-
-        // AM/SC held < 1 hour: 7% tighten per +20% ATH, floor 5% — highly slippery coins
-        // All others: 5% tighten per +20% ATH, floor 10%
-        const holdMs      = Date.now() - pos.enteredAt;
-        const isFastHold  = (pos.strategyId === 1 || pos.strategyId === 2) && holdMs < 60 * 60 * 1000;
-        const tightenStep = isFastHold ? 7 : 5;
-        const trailFloor  = isFastHold ? 5 : 10;
-
-        while (ATH >= tightenBase * 1.20 && trailPct > trailFloor) {
-          trailPct    = Math.max(trailFloor, trailPct - tightenStep);
-          tightenBase = ATH;
-        }
-
-        // Persist trailPct / tightenBase if changed
-        if (trailPct !== pos.trailPct || tightenBase !== pos.tightenBase) {
-          const prevTrail = pos.trailPct ?? 50;
-          updates.trailPct    = trailPct;
-          updates.tightenBase = tightenBase;
-          pos.trailPct        = trailPct;    // patch cache immediately
-          pos.tightenBase     = tightenBase;
-          if (trailPct !== prevTrail) {
+        // Persist gap state; notify when gap tightens
+        const prevGap = pos.trailPct != null ? pos.trailPct / 100 : 0.50;
+        if (gapPct !== prevGap) {
+          updates.trailPct    = gapPct * 100;   // stored as 50/45/40… for readability
+          updates.tightenBase = ATH;
+          pos.trailPct        = gapPct * 100;
+          pos.tightenBase     = ATH;
+          if (gapPct < prevGap) {
             sendTelegram(
               `📐 *SL TIGHTENED — ${pos.symbol}*\n` +
-              `Trail: ${prevTrail}% → *${trailPct}%* | Floor: ${trailFloor}%\n` +
+              `Gap: ${(prevGap*100).toFixed(0)}% → *${(gapPct*100).toFixed(0)}%* | Floor: 10%\n` +
               `ATH: $${fmtPrice(ATH)} | Gain: +${gainPct.toFixed(1)}%\n🔗 [Chart](${pos.dexUrl})`
             ).catch(() => {});
           }
         }
 
-        // Compute SL: trail from ATH, with 10% buffer from current price
-        const idealSL  = ATH   * (1 - trailPct / 100); // e.g. ATH×0.90 at 10% trail
-        const bufferSL = price * 0.90;                  // always ≥10% below current price
-        const rawSL    = Math.min(idealSL, bufferSL);   // whichever gives more room
-        newSL = Math.max(pos.entryPrice, rawSL);         // zero-loss floor
+        // SL = entry + (1 − gapPct) × (ATH − entry)
+        newSL = pos.entryPrice + (1 - gapPct) * (ATH - pos.entryPrice);
+        newSL = Math.max(pos.entryPrice, newSL); // zero-loss floor
       }
 
       if (newSL !== undefined) {
