@@ -824,6 +824,21 @@ async function getTradingConfig() {
   return _tradingCfg;
 }
 
+// Persist bypass flag state to Firestore so it survives restarts.
+// Stored in paper_config/control as: gatesOpen, lpOpen, stratsSkipped
+async function saveBypassFlags() {
+  try {
+    _tradingCfg = null; // bust config cache so next read picks up fresh values
+    await db.collection('paper_config').doc('control').set({
+      gatesOpen:    globalGatesBypass,
+      lpOpen:       lpLockBypass,
+      stratsSkipped: !strategyFiltersActive,
+    }, { merge: true });
+  } catch(e) {
+    console.warn('[BOT] Could not persist bypass flags:', e.message);
+  }
+}
+
 // Returns active wallets array, sorted by envKey (WALLET_1 first)
 async function getWallets() {
   const now = Date.now();
@@ -2281,68 +2296,108 @@ async function pollTelegramCommands() {
         }
       }
 
-      // ── /skipgates — toggle global filter bypass for diagnostics ────────────────
+      // ── /skipgates — toggle global filter bypass ────────────────────────────────
       if (text === '/skipgates') {
         globalGatesBypass = !globalGatesBypass;
+        await saveBypassFlags(); // ← persists across restarts
         const state = globalGatesBypass ? 'OFF 🚫' : 'ON ✅';
         const icon  = globalGatesBypass ? '⚠️' : '✅';
         await sendTelegram(
           `${icon} *GLOBAL GATES: ${state}*\n\n` +
           (globalGatesBypass
-            ? `All global filters are now *bypassed*.\n\n` +
+            ? `All global filters are now *bypassed* (saved — survives restarts).\n\n` +
               `Bypassed: liq floor, honeypot, anti-manip (avgTrade/txns/ratio), young coin gate, dead coin guard, activity gate, DEX gate, age gate, momentum gate, live price decline.\n\n` +
               `*Only price > 0 and valid chain/address checks remain.*\n\n` +
-              `Coins now go straight to strategy-specific scoring.\n` +
-              `Watch the logs — if entries appear, global filters are the culprit.\n\n` +
-              `⚠️ _This mode trades aggressively — disable once diagnosis is done._\n` +
-              `Send /skipgates again to restore gates.`
-            : `All global filters are *restored* to normal operation.\n\n` +
+              `Coins now go straight to strategy-specific scoring.\n\n` +
+              `⚠️ _Send /skipgates again to restore gates._`
+            : `All global filters *restored* to normal (saved — survives restarts).\n\n` +
               `Run /status to confirm the bot is scanning correctly.`
           )
         );
         continue;
       }
 
-      // ── /skipstrats — toggle per-strategy filter bypass for diagnostics ─────────
+      // ── /skipstrats — toggle per-strategy filter bypass ─────────────────────────
       if (text === '/skipstrats') {
         strategyFiltersActive = !strategyFiltersActive;
+        await saveBypassFlags(); // ← persists across restarts
         const state = strategyFiltersActive ? 'ON ✅' : 'OFF 🚫';
         const icon  = strategyFiltersActive ? '✅' : '⚠️';
         await sendTelegram(
           `${icon} *STRATEGY FILTERS: ${state}*\n\n` +
           (!strategyFiltersActive
-            ? `All per-strategy filters are now *bypassed*.\n\n` +
+            ? `All per-strategy filters are now *bypassed* (saved — survives restarts).\n\n` +
               `Bypassed: age gates, momentum thresholds, buy%, m5Txns, h1 requirements, liq floors, and all other strategy-specific scoring gates.\n\n` +
               `*Any coin that reaches strategy scoring will now match.*\n\n` +
-              `Combined with /skipgates (global bypass), ALL filters are now off.\n` +
-              `If entries still don't appear, the problem is in data fetching — not filters.\n\n` +
-              `⚠️ _Diagnostic mode — restore with /skipstrats when done._`
-            : `Strategy filters *restored* to normal.\n\n` +
+              `⚠️ _Send /skipstrats again to restore filters._`
+            : `Strategy filters *restored* to normal (saved — survives restarts).\n\n` +
               `Run /status to confirm.`
           )
         );
         continue;
       }
 
-      // ── /skiplp — toggle LP lock bypass for diagnostics ─────────────────────────
+      // ── /skiplp — toggle LP lock bypass ─────────────────────────────────────────
       if (text === '/skiplp') {
         lpLockBypass = !lpLockBypass;
+        await saveBypassFlags(); // ← persists across restarts
         const state = lpLockBypass ? 'BYPASSED ⚠️' : 'ACTIVE ✅';
         const icon  = lpLockBypass ? '⚠️' : '✅';
         await sendTelegram(
           `${icon} *LP LOCK CHECK: ${state}*\n\n` +
           (lpLockBypass
-            ? `RugCheck security check is now *bypassed*.\n\n` +
+            ? `RugCheck security check is now *bypassed* (saved — survives restarts).\n\n` +
               `Bypassed: LP lock check, risk score gate, strict liq floor for unlocked LP.\n\n` +
               `*All coins that pass strategy scoring will now reach the quality gate.*\n\n` +
-              `Watch the logs — if entries appear, LP check was the last blocker.\n` +
-              `If entries still don't appear, the quality gate or scoring floor is blocking.\n\n` +
-              `⚠️ _Diagnostic mode — this skips real rug protection. Restore with /skiplp when done._`
-            : `LP lock check *restored* to normal.\n\n` +
+              `⚠️ _This skips rug protection. Send /skiplp again to restore._`
+            : `LP lock check *restored* to normal (saved — survives restarts).\n\n` +
               `RugCheck security checks are active again.\n` +
               `Run /status to confirm.`
           )
         );
+        continue;
+      }
+
+      // ── /openmode — master switch: open ALL filters at once ─────────────────────
+      // Sets globalGatesBypass=true, lpLockBypass=true, strategyFiltersActive=false
+      // and persists to Firestore. Toggle again to restore all filters.
+      if (text === '/openmode') {
+        const allOpen = globalGatesBypass && lpLockBypass && !strategyFiltersActive;
+        if (allOpen) {
+          // All already open — restore everything
+          globalGatesBypass     = false;
+          lpLockBypass          = false;
+          strategyFiltersActive = true;
+        } else {
+          // Open everything
+          globalGatesBypass     = true;
+          lpLockBypass          = true;
+          strategyFiltersActive = false;
+        }
+        await saveBypassFlags();
+        if (!allOpen) {
+          await sendTelegram(
+            `🔓 *OPEN MODE — ALL FILTERS BYPASSED*\n\n` +
+            `All entry gates are now *open* (saved — survives restarts).\n\n` +
+            `✅ Global gates: OFF\n` +
+            `✅ LP/RugCheck: BYPASSED\n` +
+            `✅ Strategy filters: OFF\n\n` +
+            `The bot will now enter any coin that scores ≥ 1 on any strategy.\n` +
+            `Use this to observe the market and validate the pipeline.\n\n` +
+            `⚠️ _Paper mode observation — no real capital at risk._\n` +
+            `Send /openmode again to restore all filters.\n\n` +
+            `Individual controls still work: /skipgates · /skiplp · /skipstrats`
+          );
+        } else {
+          await sendTelegram(
+            `🔒 *FILTERS RESTORED — NORMAL MODE*\n\n` +
+            `All entry filters are back to normal (saved — survives restarts).\n\n` +
+            `✅ Global gates: ON\n` +
+            `✅ LP/RugCheck: ACTIVE\n` +
+            `✅ Strategy filters: ON\n\n` +
+            `Run /status to confirm scanning is active.`
+          );
+        }
         continue;
       }
 
@@ -2388,6 +2443,11 @@ async function pollTelegramCommands() {
           `/clearreal — delete ghost real-mode positions\n` +
           `/restart — reset daily loss counter\n` +
           `/queue <CA> — evaluate a contract address now\n\n` +
+          `🔓 *Filter Controls* _(saved — survive restarts)_\n` +
+          `/openmode — open ALL filters at once (master toggle)\n` +
+          `/skipgates — toggle global entry gates\n` +
+          `/skiplp — toggle LP/RugCheck security gate\n` +
+          `/skipstrats — toggle per-strategy filters\n\n` +
           `💡 *MemeScan PRO Bridge*\n` +
           `Forward any PRO signal here → bot auto-evaluates if PRO score ≥ 80`
         );
@@ -4196,10 +4256,10 @@ async function scanForEntries() {
   const openStrategies = STRATEGIES.filter(s => slotCount[s.id] < s.maxSlots);
   if (!openStrategies.length) return;
 
-  // ── Score threshold — never lower than MIN_SCORE regardless of vacant slots ──
-  // Resist the urge to fill slots with low-quality coins. Quality > quantity.
-  // Slight relief (−5) when 5+ slots empty, but never below MIN_SCORE.
-  const scoreThreshold = vacantSlots >= 5 ? Math.max(MIN_SCORE, MIN_SCORE - 5) : MIN_SCORE;
+  // ── Score threshold — slight relief (−5) when 5+ slots empty, floor at 30 ──
+  // Nov-12: fixed bug — was Math.max(MIN_SCORE, MIN_SCORE-5) which always = MIN_SCORE.
+  // Now correctly lowers to MIN_SCORE-5 (40) when 5+ slots are vacant.
+  const scoreThreshold = vacantSlots >= 5 ? Math.max(30, MIN_SCORE - 5) : MIN_SCORE;
   if (vacantSlots >= 3) console.log(`[BOT] ${vacantSlots} slots vacant — score threshold: ${scoreThreshold}`);
 
   // ── Candidate pool — refreshed every 3 min; evaluation runs every 15s against cache ──
@@ -4337,9 +4397,13 @@ async function scanForEntries() {
       `Mode: *${mode}* · Open positions: ${openPositions.length}/${MAX_POSITIONS}\n` +
       `${candidates.length} candidates → ${matches.length} matched → ${lockedMatches.length} LP OK → ${qualityMatches.length} quality\n` +
       `${nearMissCount} near-misses (score ${MIN_SCORE - 8}-${scoreThreshold - 1})` +
-      (globalGatesBypass      ? `\n⚠️ _GLOBAL GATES BYPASSED — /skipgates to restore_` : '') +
-      (!strategyFiltersActive ? `\n⚠️ _STRATEGY FILTERS BYPASSED — /skipstrats to restore_` : '') +
-      (lpLockBypass           ? `\n⚠️ _LP CHECK BYPASSED — /skiplp to restore_` : '')
+      (globalGatesBypass || lpLockBypass || !strategyFiltersActive
+        ? `\n\n🔓 *OPEN MODE ACTIVE*` +
+          (globalGatesBypass      ? `\n⚠️ Global gates: BYPASSED (/skipgates to restore)`  : '') +
+          (lpLockBypass           ? `\n⚠️ LP/RugCheck: BYPASSED (/skiplp to restore)`       : '') +
+          (!strategyFiltersActive ? `\n⚠️ Strategy filters: OFF (/skipstrats to restore)`   : '') +
+          `\n_/openmode to restore all at once_`
+        : '')
     ).catch(() => {});
   }
 
@@ -4571,6 +4635,20 @@ async function main() {
     // Keep process alive so Fly.io doesn't roll back — poll Telegram every 30s
     setInterval(() => pollTelegramCommands().catch(() => {}), 30000);
     return; // exits main() but setInterval keeps Node.js alive
+  }
+
+  // ── Restore persisted bypass flags (Nov-12) ────────────────────────────────
+  // Flags are now saved to Firestore so they survive restarts.
+  globalGatesBypass     = !!startCfg.gatesOpen;
+  lpLockBypass          = !!startCfg.lpOpen;
+  strategyFiltersActive = !startCfg.stratsSkipped; // inverted: true = filters on
+  if (globalGatesBypass || lpLockBypass || !strategyFiltersActive) {
+    const active = [
+      globalGatesBypass      ? '⚠️ Global gates: BYPASSED' : null,
+      lpLockBypass           ? '⚠️ LP/RugCheck: BYPASSED'  : null,
+      !strategyFiltersActive ? '⚠️ Strategy filters: OFF'  : null,
+    ].filter(Boolean).join('\n');
+    await sendTelegram(`⚠️ *OPEN MODE ACTIVE* (restored from last session)\n\n${active}\n\nSend /openmode to restore all filters, or /status to confirm.`);
   }
   const walletLine = wallets.length
     ? `👛 ${wallets.length} wallet(s): ${wallets.map(w => w.chain).join(', ')}`
