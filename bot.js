@@ -2886,10 +2886,11 @@ async function processLpProbation() {
 // ─── LP LOCK + SECURITY FILTER ───────────────────────────────────────────────
 // Security filter — RugCheck only (Solana-native, GoPlus removed Nov-11):
 //   1. Risk score > maxRiskScore (default 60) → hard block
-//   2. LP locked → pass with relaxed floors
-//   3. pump.fun bonding-curve (strategy 4) → pass on risk score alone
-//   4. LP unlocked + risk ≤ 40 + strict liq/ratio floors → PROBATION
-//   5. LP unlocked + too risky / thin pool → hard block
+//   2. LP locked → pass
+//   3. pump.fun bonding-curve → pass on risk score alone (≤ 50)
+//   3.5. PumpSwap graduated → pass on risk score alone (≤ 40)
+//   4. LP unlocked + risk ≤ 40 + strict liq/ratio floors → PASS (no probation)
+//   4r. LP unlocked + too risky / thin pool → hard block
 //
 // EVM chains: fail open (no checker after GoPlus removal).
 // Results cached 10 min. Probation coins bust their own cache on recheck.
@@ -2977,7 +2978,11 @@ async function filterByLpLock(matches) {
       continue;
     }
 
-    // ── 4: LP NOT locked — strict floor check → probation or hard block ─
+    // ── 4: LP NOT locked — pass on risk score alone if floors met, else reject ─
+    // Nov-12: removed probation; waiting for LP lock almost never triggered an
+    // entry in practice (Raydium meme coins rarely lock within 90 min). Coins
+    // that clear risk (≤ 40) + liq + ratio floors pass directly — same logic as
+    // gate 3.5 for PumpSwap but now extended to all DEXes.
     const strictLiq       = coin.strategy?.minLiq || Infinity;
     const strictRatio     = ANTI_MANIP_MC_LIQ_RATIO_MAX; // 30×
     const liqOk           = coin.liq >= strictLiq;
@@ -2994,10 +2999,10 @@ async function filterByLpLock(matches) {
       console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked + MC/Liq ${(coin.mcLiqRatio||0).toFixed(1)}× > ${strictRatio}×, rejected`);
       lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
     } else {
-      // Passes all strict floors — probation until LP lock confirmed
-      addToProbation(coin, rc.riskScore);
-      console.log(`[RUGCHECK] 🕐 ${coin.symbol} — LP unlocked (risk ${rc.riskScore}/100), added to probation`);
-      lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
+      // Risk ≤ 40, liq OK, ratio OK — pass without requiring LP lock
+      console.log(`[RUGCHECK] ✅ ${coin.symbol} — LP unlocked but risk ${rc.riskScore}/100 ≤ ${maxUnlockedRisk}, liq $${coin.liq.toFixed(0)}, PASSED`);
+      lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
+      passed.add(coin.addr);
     }
     await sleep(200); // pace RugCheck calls
   }
@@ -4321,7 +4326,6 @@ async function scanForEntries() {
       `Mode: *${mode}* · Open positions: ${openPositions.length}/${MAX_POSITIONS}\n` +
       `${candidates.length} candidates → ${matches.length} matched → ${lockedMatches.length} LP OK → ${qualityMatches.length} quality\n` +
       `${nearMissCount} near-misses (score ${MIN_SCORE - 8}-${scoreThreshold - 1})` +
-      (lpProbationCoins.size ? `\n🕐 ${lpProbationCoins.size} coin(s) on LP probation` : '') +
       (globalGatesBypass      ? `\n⚠️ _GLOBAL GATES BYPASSED — /skipgates to restore_` : '') +
       (!strategyFiltersActive ? `\n⚠️ _STRATEGY FILTERS BYPASSED — /skipstrats to restore_` : '') +
       (lpLockBypass           ? `\n⚠️ _LP CHECK BYPASSED — /skiplp to restore_` : '')
@@ -4587,7 +4591,6 @@ async function main() {
       scanCount++;
       await processManualQueue();   // manual entries first
       await scanForEntries();
-      await processLpProbation();   // recheck probation coins every 5 min
       if (scanCount % 4 === 0) console.log(`[BOT] Scan #${scanCount}`);
     } catch(e) { console.error('[SCANNER]', e.message); }
   }, SCAN_INTERVAL);
