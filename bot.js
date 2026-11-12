@@ -1562,12 +1562,18 @@ async function processManualQueue() {
         }
 
         // ── Standard manual entry (dashboard / /queue command) ──────────────────
+        // Nov-12: added liq + mcap so calcDynamicPositionSize works correctly
+        //         (without them it falls back to POS_FLOOR=$10 every time)
+        const liq  = pair.liquidity?.usd  || 0;
+        const mcap = pair.fdv             || pair.marketCap || 0;
         const coin = {
           symbol: item.symbol || pair.baseToken?.symbol || '?',
           name:   pair.baseToken?.name || '',
           addr:   item.address,
           chain:  pair.chainId,
           price,
+          liq,
+          mcap,
           score:  100,
           dexUrl: `https://dexscreener.com/${pair.chainId}/${pair.pairAddress}`,
           strategy: MANUAL_STRATEGY,
@@ -1578,15 +1584,22 @@ async function processManualQueue() {
           isManual: true,
         });
 
+        // Nov-12: null check — enterPosition returns null in real mode with no wallet
+        if (!pos) {
+          await doc.ref.update({ status: 'skipped', reason: 'no_wallet', processedAt: Date.now() });
+          console.log(`[MANUAL] ${coin.symbol} skipped — no wallet for chain ${coin.chain}`);
+          continue;
+        }
+
         await doc.ref.update({ status: 'entered', enteredPositionId: pos.id, processedAt: Date.now() });
         positions.push(pos);
 
         await sendTelegram(
           `🎯 *MANUAL ENTRY*\n` +
           `*${coin.symbol}* @ ${fmtPrice(price)}\n` +
-          `💰 Size: $${coin.size || POSITION_SIZE} · TP3: ${fmtPrice(pos.tp3)} · SL: ${fmtPrice(pos.sl)}`
+          `💰 Size: $${pos.size?.toFixed(2) || POSITION_SIZE} · TP3: ${fmtPrice(pos.tp3)} · SL: ${fmtPrice(pos.sl)}`
         );
-        console.log(`[MANUAL] Entered ${coin.symbol} @ ${price}`);
+        console.log(`[MANUAL] Entered ${coin.symbol} @ ${price}, liq=$${liq.toFixed(0)}, mcap=$${mcap.toFixed(0)}`);
       } catch (e) {
         await doc.ref.update({ status: 'failed', error: e.message, processedAt: Date.now() });
         console.error(`[MANUAL] Failed for ${item.address}: ${e.message}`);
@@ -2941,6 +2954,25 @@ async function filterByLpLock(matches) {
       console.log(`[RUGCHECK] ✅ ${coin.symbol} — pump.fun bonding-curve (${coin.strategy?.label}), risk ${rc.riskScore}/100, PASSED`);
       lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
       passed.add(coin.addr);
+      continue;
+    }
+
+    // ── 3.5: PumpSwap graduated coins — no traditional LP lock in this ecosystem ─
+    // PumpSwap (pump.fun graduated) pools almost never have locked LP; requiring
+    // it blocks every PumpSwap coin. Pass on risk score alone (≤ 40).
+    // Nov-12: gate added so PumpSwap scans actually yield entries.
+    const isPumpSwap = ['pumpswap','pump_amm','pump-amm','pump_swap','pump-swap']
+      .includes((coin.dexId || '').toLowerCase());
+    if (isPumpSwap) {
+      const maxUnlockedPS = 40;
+      if (rc.riskScore <= maxUnlockedPS) {
+        console.log(`[RUGCHECK] ✅ ${coin.symbol} — PumpSwap graduated, risk ${rc.riskScore}/100, PASSED`);
+        lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
+        passed.add(coin.addr);
+      } else {
+        console.log(`[RUGCHECK] ❌ ${coin.symbol} — PumpSwap risk ${rc.riskScore}/100 > ${maxUnlockedPS}, rejected`);
+        lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
+      }
       continue;
     }
 
