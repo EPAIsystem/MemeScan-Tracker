@@ -753,8 +753,9 @@ function detectStrategy(pair, openStrategies) {
 }
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
-const enteredToday  = new Set();
-const alertCooldown = new Map();
+const enteredToday       = new Set();
+const alertCooldown      = new Map(); // set only on actual entry — guards the 30-min re-entry window
+const pausedAlertCooldown = new Map(); // set on pause-mode signals — separate so it never blocks auto-entry
 // Block re-entry for 6h after SL or rug — prevents the triple-entry bug
 // (address → timestamp of SL/rug close)
 const recentSLCoins = new Map();
@@ -4474,9 +4475,12 @@ async function scanForEntries() {
   for (const coin of qualityMatches) {
     if (positions.length >= MAX_POSITIONS) break;
     if (usedThisScan.has(coin.addr)) continue;
-    // Check cooldown
+    // Entry cooldown: only blocks when NOT paused (paused path uses its own cooldown)
     const last = alertCooldown.get(coin.addr) || 0;
-    if (Date.now() - last < 30 * 60 * 1000) continue;
+    if (!autoEntryPaused && Date.now() - last < 30 * 60 * 1000) continue;
+    // Pause-alert cooldown: suppress repeat signals while paused (separate from entry cooldown)
+    const lastPaused = pausedAlertCooldown.get(coin.addr) || 0;
+    if (autoEntryPaused && Date.now() - lastPaused < 30 * 60 * 1000) continue;
     // Check slot still available (may have been filled earlier in this loop)
     if (slotCount[coin.strategy.id] >= coin.strategy.maxSlots) continue;
 
@@ -4500,25 +4504,6 @@ async function scanForEntries() {
           }
         }
       }
-    }
-
-    // ── PULLBACK WATCHLIST — BB (id=0) and OR (id=3) ────────────────────────────
-    // These strategies must enter at support, not mid-bounce.
-    // Add to watchlist and wait for flat zone → 3% bounce before entering.
-    // Exception: range re-entries already confirmed at support — enter immediately.
-    if ((coin.strategy.id === 0 || coin.strategy.id === 3) && !coin._rangeReentry) {
-      if (!pullbackWatchlist.has(coin.addr)) {
-        pullbackWatchlist.set(coin.addr, {
-          qualifiedAt:    Date.now(),
-          qualifiedPrice: coin.price,
-          low:            coin.price,
-          inFlatZone:     false,
-          coin:           { ...coin },
-          expiry:         Date.now() + PULLBACK_EXPIRY_MS,
-        });
-        console.log(`[PBW] ${coin.symbol} ${coin.strategy.label} → watchlist (waiting for support bounce)`);
-      }
-      continue; // do NOT enter immediately
     }
 
     // ── BUILD signal alert fields (used for both entered and paused-entry alerts) ──
@@ -4554,7 +4539,7 @@ async function scanForEntries() {
 
     // ── If auto-entry is paused: send full signal alert but skip entering ─────────
     if (autoEntryPaused) {
-      alertCooldown.set(coin.addr, Date.now()); // respect cooldown — don't re-fire every 30 min
+      pausedAlertCooldown.set(coin.addr, Date.now()); // pause-only cooldown — never touches entry cooldown
       usedThisScan.add(coin.addr);
       await sendTelegram(
         `⏸ *SIGNAL — AUTO-ENTRY PAUSED*\n\n` +
