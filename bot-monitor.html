@@ -674,6 +674,8 @@ const S = {
   addPosErr: '',          // error inside modal
   addPosOk:  '',          // success message inside modal
   addPosSaving: false,    // saving spinner
+  addPosSizingMode: 'bot', // 'bot' = dynamic sizing | 'human' = custom amount
+  addPosCustomSize: '',   // custom dollar amount when sizingMode = 'human'
   shownAdvisories: new Set(), // track posIds whose advisory toast has already been shown
 };
 
@@ -863,16 +865,18 @@ async function loadData() {
 
     const [positions, history, statsDoc, manualQueue] = await Promise.all([
       fsQuery(S.config, S.posCollection, 'status', 'open'),
-      // Nov-12: read closed trades directly from paper_positions (always present even
-      // when history write fails). Fetch up to 100, sort client-side by closedAt desc.
-      fsQuery(S.config, S.posCollection, 'status', 'closed', { limit: 100 }),
+      // History: order by closedAt DESC so Firestore returns the 100 most recently
+      // closed positions regardless of total count. Open positions lack closedAt and
+      // are excluded automatically. Client-side filter for status=closed is a safety net.
+      fsQuery(S.config, S.posCollection, null, null, { limit: 100, orderField: 'closedAt', orderDir: 'DESCENDING' }),
       fsGet(S.config, S.statsCollection, today),
       fsQuery(S.config, 'paper_manual_queue'),
     ]);
     S.positions = positions;
-    // Sort client-side by closedAt descending so most recently closed appears first
+    // Already ordered by closedAt DESC from Firestore; filter to closed only (safety net
+    // in case open positions somehow slipped in), then cap at 50 for display.
     S.history = history
-      .sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0))
+      .filter(p => p.status === 'closed')
       .slice(0, 50);
     S.stats = statsDoc;
     S.control = ctrlDoc || {};
@@ -1485,6 +1489,7 @@ async function removeManualToken(id) {
 // calculates TP/SL, and enters with the configured /setsize ceiling.
 function addPositionModalHTML() {
   if (!S.addingPosition) return '';
+  const isHuman = S.addPosSizingMode === 'human';
   return `
   <div class="modal-backdrop" onclick="if(event.target===this)closeAddModal()">
     <div class="modal-sheet" onclick="event.stopPropagation()">
@@ -1494,7 +1499,7 @@ function addPositionModalHTML() {
       </div>
 
       <div class="modal-info" style="font-size:13px">
-        Paste the token's contract address. The bot fetches price, calculates size &amp; TP/SL, and enters within 15 seconds.
+        Paste the token address. Bot fetches price, sets TP/SL, and enters within 15 s.
       </div>
 
       <div class="mfield">
@@ -1502,6 +1507,29 @@ function addPositionModalHTML() {
         <input id="ap-mint" placeholder="Solana token address…" autocomplete="off" autocorrect="off" spellcheck="false"
                style="font-family:var(--mono);font-size:12px"
                onkeydown="if(event.key==='Enter')submitAddPosition()">
+      </div>
+
+      <div class="mfield">
+        <label style="margin-bottom:8px;display:block">Position Size</label>
+        <div style="display:flex;gap:0;border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:${isHuman?'10px':'0'}">
+          <button onclick="S.addPosSizingMode='bot';render()"
+            style="flex:1;padding:9px 0;background:${!isHuman?'var(--accent)':'var(--bg3)'};color:${!isHuman?'#fff':'var(--fg2)'};border:none;cursor:pointer;font-size:13px;font-weight:${!isHuman?'600':'400'};transition:all .15s">
+            🤖 Bot
+          </button>
+          <button onclick="S.addPosSizingMode='human';render()"
+            style="flex:1;padding:9px 0;background:${isHuman?'var(--accent)':'var(--bg3)'};color:${isHuman?'#fff':'var(--fg2)'};border:none;cursor:pointer;font-size:13px;font-weight:${isHuman?'600':'400'};border-left:1px solid var(--border);transition:all .15s">
+            👤 Human
+          </button>
+        </div>
+        ${!isHuman
+          ? `<div style="font-size:11px;color:var(--fg3);margin-top:6px">Bot uses dynamic sizing from liq &amp; mcap, capped at your /setsize limit.</div>`
+          : `<input id="ap-size" type="number" min="1" step="1" placeholder="e.g. 50"
+               value="${S.addPosCustomSize}"
+               oninput="S.addPosCustomSize=this.value"
+               onkeydown="if(event.key==='Enter')submitAddPosition()"
+               style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--fg);font-size:14px;padding:9px 12px;outline:none;margin-top:4px">
+             <div style="font-size:11px;color:var(--fg3);margin-top:4px">Enter any dollar amount — no limits, your call.</div>`
+        }
       </div>
 
       ${S.addPosErr ? `<div class="modal-err">⚠ ${S.addPosErr}</div>` : ''}
@@ -1517,7 +1545,7 @@ function addPositionModalHTML() {
   </div>`;
 }
 
-function showAddPosition() { S.addingPosition = true; S.addPosErr = ''; S.addPosOk = ''; render(); }
+function showAddPosition() { S.addingPosition = true; S.addPosErr = ''; S.addPosOk = ''; S.addPosSizingMode = 'bot'; S.addPosCustomSize = ''; render(); }
 function closeAddModal()   { S.addingPosition = false; S.addPosErr = ''; S.addPosOk = ''; render(); }
 
 async function submitAddPosition() {
@@ -1528,16 +1556,30 @@ async function submitAddPosition() {
   const mint = (document.getElementById('ap-mint')?.value || '').trim();
   if (!mint) { S.addPosErr = 'Paste a contract address first.'; render(); return; }
 
+  // Human sizing validation
+  if (S.addPosSizingMode === 'human') {
+    // Read value directly from input in case oninput hasn't synced yet
+    const rawSize = parseFloat(document.getElementById('ap-size')?.value || S.addPosCustomSize || '0');
+    if (!rawSize || rawSize < 1) { S.addPosErr = 'Enter a valid dollar amount (≥ $1).'; render(); return; }
+    S.addPosCustomSize = String(rawSize);
+  }
+
   S.addPosSaving = true; render();
 
   try {
-    // Queue for the bot — it will fetch DexScreener, calculate size/TP/SL, and enter
-    await fsAdd(S.config, 'paper_manual_queue', {
-      address:   mint,
-      status:    'pending',
-      addedAt:   Date.now(),
-      source:    'dashboard',
-    });
+    const isHuman  = S.addPosSizingMode === 'human';
+    const queueDoc = {
+      address:     mint,
+      status:      'pending',
+      addedAt:     Date.now(),
+      source:      'dashboard',
+      sizingMode:  isHuman ? 'human' : 'bot',
+    };
+    if (isHuman) {
+      queueDoc.size = parseFloat(S.addPosCustomSize);
+    }
+    // Queue for the bot — it will fetch DexScreener, set TP/SL, and enter
+    await fsAdd(S.config, 'paper_manual_queue', queueDoc);
     S.addPosSaving = false;
     S.addPosOk  = 'Queued — bot will enter within 15 s';
     render();

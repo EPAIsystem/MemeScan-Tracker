@@ -1608,8 +1608,13 @@ async function processManualQueue() {
           strategy: MANUAL_STRATEGY,
         };
 
+        // sizingMode 'bot': no size override → enterPosition uses dynamic sizing
+        //   (calcDynamicPositionSize capped at /setsize or POSITION_SIZE env var)
+        // sizingMode 'human': pass item.size directly → used as ceiling (human's choice)
+        // Legacy items with no sizingMode default to bot-style dynamic sizing.
+        const sizeOverride = item.sizingMode === 'human' && item.size > 0 ? item.size : undefined;
         const pos = await enterPosition(coin, {
-          size: item.size || POSITION_SIZE,
+          ...(sizeOverride != null ? { size: sizeOverride } : {}),
           isManual: true,
         });
 
