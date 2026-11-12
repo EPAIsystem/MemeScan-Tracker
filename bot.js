@@ -235,8 +235,9 @@ const STRATEGIES = [
     id: 0,
     label: '📉 BOTTOM BOUNCE',
     maxSlots: 20, // unlimited — competes openly for global slots with id 1 and id 3
-    desc: 'Oversold token reversing from its bottom',
+    desc: '1h+ old token caught at the bottom going up',
     // ── Entry criteria ──
+    minAgeDays: 0.042,  // Nov-12: ≥ 1 hour — anything under 1h is PS territory, not BB
     maxCh24: -5,        // Nov-11: -20→-5 — open to any meaningful pullback, not just big crashes
     minCh24: -85,       // Nov-9: not a dead coin
     maxCh1: 12,         // Nov-9: h1 not already mooned
@@ -255,10 +256,11 @@ const STRATEGIES = [
     id: 1,
     label: '⚡ ACTIVE MOMENTUM',
     maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 3
-    desc: 'Price ticking every 5-15 min — strong live activity, any age',
+    desc: 'Any age trending upward — hours or days of live momentum',
     // ── Entry criteria ──
-    // No age cap — AM applies to any coin with active momentum regardless of age.
-    // SC (id=2) handles the aggressive surge signal for very young coins; AM and SC
+    // No age cap — AM applies to any coin with active momentum regardless of age
+    // (from 1h all the way to multi-day trending coins).
+    // SC (id=2) handles the aggressive surge for 1h–24h coins; AM and SC
     // compete on score when both criteria are met and the highest scorer wins.
     minM5Ch: 0.5,        // Nov-11: 1.5→0.5 — subtle positive momentum is a valid signal in pump ecosystem
     minM5Txns: 8,        // Nov-11: 15→8 — pump.fun coins have thinner activity
@@ -276,10 +278,11 @@ const STRATEGIES = [
     id: 2,
     label: '🚀 SURGE CATCH',
     maxSlots: 20, // competes for all global slots — last 5 reserved exclusively via SURGE_RESERVED logic
-    desc: 'Any token actively surging RIGHT NOW — catch it mid-flight, not after',
+    desc: '1h to 24h old — surging hard mid-flight, catch it now',
     // ── Entry criteria — use m5 as primary signal, not h1 ──
     // h1 is a lagging indicator — the surge may already be over by then
     // m5 catches it while it's still happening
+    minAgeDays: 0.042,  // Nov-12: ≥ 1 hour — anything under 1h is PS territory, not SC
     minM5Ch: 3,          // Nov-11: 5→3 — 5% was too rare; 3% is still a genuine surge
     minM5Txns: 10,       // Nov-11: 20→10 — allow thinner activity in pump ecosystem
     minCh1: 0,           // h1 not negative (newly graduated coins may lack h1 history)
@@ -297,9 +300,9 @@ const STRATEGIES = [
     id: 3,
     label: '📈 OLD RECOVERY',
     maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 1
-    desc: 'Established coin climbing back steadily',
+    desc: '1 day+ established coin recovering steadily',
     // ── Entry criteria ──
-    minAgeDays: 3,       // Nov-11: 15→3 — open to PumpSwap coins that have been around 3+ days
+    minAgeDays: 1,       // Nov-12: 3→1 — any coin ≥ 1 day old qualifies as "old recovery"
     minCh24: 2,          // Nov-11: 5→2 — less aggressive recovery signal required
     minCh1: 0.5,         // Nov-10: 1.5→0.5 — ch24≥2% already confirms recovery; 0.5% checks h1 trend intact
     maxCh1: 20,          // Nov-9: tighter spike guard — >20% in 1h on old coin is suspicious
@@ -316,8 +319,9 @@ const STRATEGIES = [
     id: 4,
     label: '🎯 PUMP SPEC',
     maxSlots: 20, // Nov-11: removed per-strategy cap — all strategies compete freely for the global 20 slots
-    desc: 'Pump.fun + PumpSwap on pullback — capital recovery + profit trail',
+    desc: 'pump.fun / PumpSwap < 1 hour old — speculative pullback entry',
     // ── Entry criteria ──
+    maxAgeDays: 0.042,  // Nov-12: < 1 hour — strictly new coins; anything older routes to BB/SC/AM/OR
     minLiq: 3000,
     minLiqLocked: 3000,
     minH1Ch: 2,          // Nov-11: 5→2 — h1 just needs to show positive trend, not strongly up
@@ -573,7 +577,9 @@ function detectStrategy(pair, openStrategies) {
         match = true;
       } else {
 
-      match = ch24 <= s.maxCh24           // genuinely crashed (ch24 ≤ –20%)
+      if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // ≥ 1h — PS takes the sub-1h coins
+
+      if (match) match = ch24 <= s.maxCh24           // genuinely crashed (ch24 ≤ –20%)
            && ch24 >= s.minCh24           // not a dead coin (≥ –85%)
            && ch1 >= s.minCh1             // h1 turning — not in freefall
            && ch1 <= s.maxCh1             // h1 not already mooned
@@ -639,6 +645,7 @@ function detectStrategy(pair, openStrategies) {
       // Primary signal: m5 activity — catch it WHILE it's happening
       // Age gate: 0–24 hours (recently graduated coins surge post-migration)
       if (strategyFiltersActive) {
+        if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // ≥ 1h — PS takes the sub-1h coins
         if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // over 24h → AM/BB/OR
         if (m5Ch < s.minM5Ch)      { match = false; } // must be moving in last 5 min
         if (m5Txns < s.minM5Txns)  { match = false; } // must be very active
@@ -675,7 +682,7 @@ function detectStrategy(pair, openStrategies) {
     else if (s.id === 3) {
       // ── OLD RECOVERY ───────────────────────────────────────────────────────
       // Nov-11: pump.fun/PumpSwap coins now allowed — all strategies compete freely.
-      // OR still requires minAgeDays ≥ 15 so pump.fun bonding-curve coins rarely match.
+      // Nov-12: minAgeDays = 1 — any coin ≥ 1 day old qualifies for Old Recovery.
       if (strategyFiltersActive) {
         if (ageDays < s.minAgeDays)  { match = false; }
         if (ch24 < s.minCh24)        { match = false; }
@@ -712,6 +719,8 @@ function detectStrategy(pair, openStrategies) {
       if (!isPumpFun && !isPumpSwap) {
         match = false;
       } else if (strategyFiltersActive) {
+        // < 1 hour only — older coins route to BB/SC/AM/OR
+        if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; }
         // h1 must be strongly up — confirms an uptrend is running
         if (ch1 === null || ch1 < s.minH1Ch)              { match = false; }
         // m5 in pullback zone — not at the peak, not in freefall
