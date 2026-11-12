@@ -554,6 +554,7 @@ function detectStrategy(pair, openStrategies) {
     chain:  pair.chainId || 'unknown',
     dexUrl: `https://dexscreener.com/${pair.chainId}/${addr}`,
     isPumpFun,
+    dexId,  // Nov-12: propagate dexId so filterByLpLock gate 3.5 (PumpSwap pass-through) can read it
   };
 
   // Try each open strategy, return first match with highest confidence
