@@ -770,6 +770,7 @@ let scanCount = 0;
 let dayHaltedToday      = false;
 let globalGatesBypass   = false; // /skipgates toggle — bypasses all global filters for diagnostics
 let lpLockBypass        = false; // /skiplp toggle  — bypasses filterByLpLock() for diagnostics
+let autoEntryPaused     = false; // /pauseentry toggle — signals alert but bot skips auto-entry
 let telegramOffset      = 0; // for Telegram command polling
 
 // ─── POSITION CACHE ───────────────────────────────────────────────────────────
@@ -830,9 +831,10 @@ async function saveBypassFlags() {
   try {
     _tradingCfg = null; // bust config cache so next read picks up fresh values
     await db.collection('paper_config').doc('control').set({
-      gatesOpen:    globalGatesBypass,
-      lpOpen:       lpLockBypass,
-      stratsSkipped: !strategyFiltersActive,
+      gatesOpen:        globalGatesBypass,
+      lpOpen:           lpLockBypass,
+      stratsSkipped:    !strategyFiltersActive,
+      autoEntryPaused:  autoEntryPaused,
     }, { merge: true });
   } catch(e) {
     console.warn('[BOT] Could not persist bypass flags:', e.message);
@@ -2106,6 +2108,9 @@ async function pollTelegramCommands() {
         const pausedNote = botPaused
           ? `\n⚠️ _Bot is PAUSED — set running=true in Firebase to resume_`
           : '';
+        const entryNote = autoEntryPaused
+          ? `\n⏸ _Auto-entry PAUSED — signals alert only. /pauseentry off to resume._`
+          : '';
 
         await sendTelegram(
           `📊 *STATUS*\n\n` +
@@ -2118,7 +2123,7 @@ async function pollTelegramCommands() {
           `🏆 Net P&L: *${netStr}*\n` +
           `💸 Fees (in P&L):  $${fees.toFixed(2)}\n\n` +
           `Position size: *$${posSize.toFixed(2)}* · Limit: ${(DAILY_LOSS_LIMIT * 100).toFixed(0)}%\n` +
-          `Scan #: ${scanCount}${pausedNote}\n\n` +
+          `Scan #: ${scanCount}${pausedNote}${entryNote}\n\n` +
           `_/stats · /ping · /setsize · /mode paper|real · /wallets_`
         );
       }
@@ -2402,6 +2407,32 @@ async function pollTelegramCommands() {
         continue;
       }
 
+      // ── /pauseentry [on|off] — pause/resume auto-entry without stopping monitoring ─
+      // When paused: signals fire the full alert (Option A) but bot skips enterPosition.
+      // Existing positions, SL, partial closes, and profit withdrawals are unaffected.
+      if (text === '/pauseentry' || text === '/pauseentry on' || text === '/pauseentry off') {
+        if (text === '/pauseentry on')  autoEntryPaused = true;
+        else if (text === '/pauseentry off') autoEntryPaused = false;
+        else autoEntryPaused = !autoEntryPaused; // toggle
+        await saveBypassFlags();
+        if (autoEntryPaused) {
+          await sendTelegram(
+            `⏸ *AUTO-ENTRY PAUSED*\n\n` +
+            `The bot will *not* enter new positions automatically.\n\n` +
+            `When a signal fires you'll still get the *full signal alert* so you can decide to enter manually with /enter [address].\n\n` +
+            `Monitoring, stop-losses, partial closes and profit withdrawals on existing positions continue normally.\n\n` +
+            `Send /pauseentry again (or /pauseentry off) to resume auto-entry.`
+          );
+        } else {
+          await sendTelegram(
+            `▶️ *AUTO-ENTRY RESUMED*\n\n` +
+            `The bot will now enter positions automatically when signals qualify.\n\n` +
+            `Run /status to confirm.`
+          );
+        }
+        continue;
+      }
+
       // ── /hidden — show backgrounded positions with inline detail buttons ────────
       if (text === '/hidden') {
         const allPos    = await getOpenPositions();
@@ -2446,6 +2477,7 @@ async function pollTelegramCommands() {
           `/queue <CA> — evaluate a contract address now\n\n` +
           `🔓 *Filter Controls* _(saved — survive restarts)_\n` +
           `/openmode — open ALL filters at once (master toggle)\n` +
+          `/pauseentry — pause auto-entry (signals still alert; enter manually)\n` +
           `/skipgates — toggle global entry gates\n` +
           `/skiplp — toggle LP/RugCheck security gate\n` +
           `/skipstrats — toggle per-strategy filters\n\n` +
@@ -4488,21 +4520,7 @@ async function scanForEntries() {
       continue; // do NOT enter immediately
     }
 
-    // Reserve coin BEFORE the async enterPosition call — a concurrent scan tick
-    // starting during the Firestore await would otherwise find the coin absent
-    // from enteredToday and enter it a second time. Roll back if entry fails.
-    enteredToday.add(coin.addr);
-    usedThisScan.add(coin.addr);
-    const pos = await enterPosition(coin);
-    if (!pos) {
-      enteredToday.delete(coin.addr); // no position created — release the reservation
-      continue; // null = real mode with no matching wallet for this chain
-    }
-    alertCooldown.set(coin.addr, Date.now()); // set AFTER successful entry to avoid 30-min lockout on failure
-    positions.push(pos);
-    slotCount[coin.strategy.id]++;
-    if (coin._rangeReentry) rangeReentryWatchlist.delete(coin.addr); // watchlist fulfilled
-
+    // ── BUILD signal alert fields (used for both entered and paused-entry alerts) ──
     const s = coin.strategy;
     const isYoung = s.id === 1 && (coin.ageMinutes || 0) < 60;
     const ageLabel = coin.ageMinutes < 60
@@ -4519,7 +4537,6 @@ async function scanForEntries() {
             `🎯 TP2: $${fmtPrice(coin.price * s.tp2x)} (+${((s.tp2x-1)*100).toFixed(0)}%) → 30%\n` +
             `🎯 TP3: $${fmtPrice(coin.price * s.tp3x)} (+${((s.tp3x-1)*100).toFixed(0)}%) → 20%\n`
           : `🎯 TP: Dynamic (capital recovery → profit trail → 4× halving)\n`;
-
     const pumpBadge     = coin.isPumpFun ? `🎪 Pump.fun${isYoung?' · YOUNG COIN':''}\n` : '';
     const trendBadge    = coin._trendingPlatforms
       ? `🔥 Trending on ${coin._trendingPlatforms} platform${coin._trendingPlatforms > 1 ? 's' : ''} (score threshold lowered)\n`
@@ -4533,6 +4550,48 @@ async function scanForEntries() {
     const rangeReentryBadge = coin._rangeReentry
       ? `🔄 Range re-entry — support bounce confirmed\n`
       : '';
+
+    // ── If auto-entry is paused: send full signal alert but skip entering ─────────
+    if (autoEntryPaused) {
+      alertCooldown.set(coin.addr, Date.now()); // respect cooldown — don't re-fire every 30 min
+      usedThisScan.add(coin.addr);
+      await sendTelegram(
+        `⏸ *SIGNAL — AUTO-ENTRY PAUSED*\n\n` +
+        `*${coin.symbol}* — ${coin.name}\n` +
+        `${s.label} · Score: *${coin.score}/100*\n` +
+        `${pumpBadge}` +
+        `${trendBadge}` +
+        `${pullbackBadge}` +
+        `${explosiveBadge}` +
+        `${rangeReentryBadge}` +
+        `💡 ${s.desc}\n\n` +
+        `💵 Price now: $${fmtPrice(coin.price)}\n` +
+        `📊 Buy%: ${coin.buyPct.toFixed(0)}% | Liq: $${(coin.liq/1000).toFixed(0)}k\n` +
+        `📈 Age: ${ageLabel} | m5: ${coin.m5Ch>0?'+':''}${coin.m5Ch.toFixed(1)}% | h1: ${coin.ch1!=null?(coin.ch1>0?'+':'')+coin.ch1.toFixed(1)+'%':'<1h'}\n\n` +
+        tpInfo +
+        `\`${coin.addr}\`\n🔗 [Chart](${coin.dexUrl})\n\n` +
+        `_Enter manually: /enter ${coin.addr}_\n` +
+        `_Resume auto-entry: /pauseentry off_`
+      );
+      console.log(`[BOT] ENTRY PAUSED — signal fired for ${coin.symbol} (${s.label}) but auto-entry is off`);
+      continue;
+    }
+
+    // Reserve coin BEFORE the async enterPosition call — a concurrent scan tick
+    // starting during the Firestore await would otherwise find the coin absent
+    // from enteredToday and enter it a second time. Roll back if entry fails.
+    enteredToday.add(coin.addr);
+    usedThisScan.add(coin.addr);
+    const pos = await enterPosition(coin);
+    if (!pos) {
+      enteredToday.delete(coin.addr); // no position created — release the reservation
+      continue; // null = real mode with no matching wallet for this chain
+    }
+    alertCooldown.set(coin.addr, Date.now()); // set AFTER successful entry to avoid 30-min lockout on failure
+    positions.push(pos);
+    slotCount[coin.strategy.id]++;
+    if (coin._rangeReentry) rangeReentryWatchlist.delete(coin.addr); // watchlist fulfilled
+
     const modeHeader = pos.tradingMode === 'real'
       ? `💰 *BOT ENTERED — REAL TRADE*`
       : `✅ *BOT ENTERED — PAPER TRADE*`;
@@ -4644,6 +4703,7 @@ async function main() {
   globalGatesBypass     = !!startCfg.gatesOpen;
   lpLockBypass          = !!startCfg.lpOpen;
   strategyFiltersActive = !startCfg.stratsSkipped; // inverted: true = filters on
+  autoEntryPaused       = !!startCfg.autoEntryPaused;
   if (globalGatesBypass || lpLockBypass || !strategyFiltersActive) {
     const active = [
       globalGatesBypass      ? '⚠️ Global gates: BYPASSED' : null,
