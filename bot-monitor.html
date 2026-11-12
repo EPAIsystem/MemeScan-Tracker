@@ -592,7 +592,8 @@ tbody tr:hover td { background: var(--bg3); }
 .mfield-hint { font-size: 11px; color: var(--fg3); margin-top: 4px; }
 .mfield-row { display: flex; gap: 10px; }
 .mfield-row .mfield { flex: 1; min-width: 0; }
-.modal-err { color: var(--red); font-size: 12px; margin-bottom: 10px; }
+.modal-err { color: var(--red);   font-size: 12px; margin-bottom: 10px; }
+.modal-ok  { color: var(--green); font-size: 12px; margin-bottom: 10px; }
 .modal-info {
   background: rgba(79,110,247,.08); border: 1px solid rgba(79,110,247,.25);
   border-radius: 8px; padding: 10px 12px; font-size: 12px; color: var(--blue);
@@ -671,6 +672,7 @@ const S = {
   statsCollection:'paper_stats',
   addingPosition: false,  // modal open/closed
   addPosErr: '',          // error inside modal
+  addPosOk:  '',          // success message inside modal
   addPosSaving: false,    // saving spinner
   shownAdvisories: new Set(), // track posIds whose advisory toast has already been shown
 };
@@ -1477,157 +1479,72 @@ async function removeManualToken(id) {
   } catch (e) { S.error = 'Remove failed: ' + e.message; render(); }
 }
 
-// ── Add Position Modal ────────────────────────────────────────────────────────
+// ── Quick Add Modal — address only, bot handles the rest ─────────────────────
+// Nov-12: replaced 7-field manual form with single-address quick-add.
+// Writes to paper_manual_queue → bot fetches price/liq/mcap from DexScreener,
+// calculates TP/SL, and enters with the configured /setsize ceiling.
 function addPositionModalHTML() {
   if (!S.addingPosition) return '';
-  const mode = S.control.tradingMode || 'paper';
-  const isReal = mode === 'real';
-  const walletOptions = S.wallets.length
-    ? S.wallets.map(w => `<option value="${w._id}">${w.label || w.envKey || w._id}</option>`).join('')
-    : `<option value="wallet1">wallet1</option>`;
-
   return `
   <div class="modal-backdrop" onclick="if(event.target===this)closeAddModal()">
     <div class="modal-sheet" onclick="event.stopPropagation()">
       <div class="modal-header">
-        <div class="modal-title">➕ Add Manual Position</div>
+        <div class="modal-title">⚡ Quick Add</div>
         <button class="modal-close" onclick="closeAddModal()">✕</button>
       </div>
 
-      <div class="modal-info">
-        ${isReal
-          ? '💰 <strong>Real mode</strong> — the bot will manage this position and execute real sell trades when TP/SL is hit. Make sure the tokens are already in your wallet.'
-          : '📄 <strong>Paper mode</strong> — this is a simulated position. No real funds involved.'}
+      <div class="modal-info" style="font-size:13px">
+        Paste the token's contract address. The bot fetches price, calculates size &amp; TP/SL, and enters within 15 seconds.
       </div>
 
       <div class="mfield">
-        <label>Token Symbol *</label>
-        <input id="ap-symbol" placeholder="e.g. BONK" style="text-transform:uppercase">
-      </div>
-
-      <div class="mfield">
-        <label>Token Name (optional)</label>
-        <input id="ap-name" placeholder="e.g. Bonk">
-      </div>
-
-      <div class="mfield">
-        <label>Contract Address (Mint) *</label>
-        <input id="ap-mint" placeholder="Solana token mint address…">
-        <div class="mfield-hint">Used to fetch live price for TP/SL tracking</div>
-      </div>
-
-      <div class="mfield">
-        <label>Token Amount *</label>
-        <input id="ap-amount" type="number" step="any" min="0" placeholder="e.g. 1500000">
-        <div class="mfield-hint">Number of tokens you currently hold</div>
-      </div>
-
-      <div class="mfield">
-        <label>Entry Price (USD) — optional</label>
-        <input id="ap-entry" type="number" step="any" min="0" placeholder="Leave blank → use current price">
-        <div class="mfield-hint">If blank, today's live price is used as baseline. P&amp;L will be calculated from now.</div>
-      </div>
-
-      <div class="mfield">
-        <label>SOL Spent — optional</label>
-        <input id="ap-sol" type="number" step="any" min="0" placeholder="e.g. 0.05">
-        <div class="mfield-hint">Original cost — only needed for cost-basis tracking</div>
-      </div>
-
-      <div class="mfield">
-        <label>Wallet</label>
-        <select id="ap-wallet">${walletOptions}</select>
+        <label>Contract Address</label>
+        <input id="ap-mint" placeholder="Solana token address…" autocomplete="off" autocorrect="off" spellcheck="false"
+               style="font-family:var(--mono);font-size:12px"
+               onkeydown="if(event.key==='Enter')submitAddPosition()">
       </div>
 
       ${S.addPosErr ? `<div class="modal-err">⚠ ${S.addPosErr}</div>` : ''}
+      ${S.addPosOk  ? `<div class="modal-ok">✓ ${S.addPosOk}</div>`   : ''}
 
       <div class="modal-actions">
         <button class="btn-cancel" onclick="closeAddModal()">Cancel</button>
         <button class="btn-save" onclick="submitAddPosition()" ${S.addPosSaving ? 'disabled' : ''}>
-          ${S.addPosSaving ? '<span class="spin" style="width:12px;height:12px;border-width:2px"></span> Saving…' : '＋ Add Position'}
+          ${S.addPosSaving ? '<span class="spin" style="width:12px;height:12px;border-width:2px"></span> Queuing…' : '⚡ Add Now'}
         </button>
       </div>
     </div>
   </div>`;
 }
 
-function showAddPosition() { S.addingPosition = true; S.addPosErr = ''; render(); }
-function closeAddModal()   { S.addingPosition = false; S.addPosErr = ''; render(); }
+function showAddPosition() { S.addingPosition = true; S.addPosErr = ''; S.addPosOk = ''; render(); }
+function closeAddModal()   { S.addingPosition = false; S.addPosErr = ''; S.addPosOk = ''; render(); }
 
 async function submitAddPosition() {
   if (S.addPosSaving) return;
   S.addPosErr = '';
+  S.addPosOk  = '';
 
-  const sym      = (document.getElementById('ap-symbol')?.value || '').trim().toUpperCase();
-  const name     = (document.getElementById('ap-name')?.value   || '').trim();
-  const mint     = (document.getElementById('ap-mint')?.value   || '').trim();
-  const amount   = parseFloat(document.getElementById('ap-amount')?.value);
-  const entryRaw = document.getElementById('ap-entry')?.value.trim();
-  const solRaw   = document.getElementById('ap-sol')?.value.trim();
-  const walletId = document.getElementById('ap-wallet')?.value || 'wallet1';
-
-  if (!sym)              { S.addPosErr = 'Symbol is required.'; render(); return; }
-  if (!mint)             { S.addPosErr = 'Contract address (mint) is required.'; render(); return; }
-  if (isNaN(amount) || amount <= 0) { S.addPosErr = 'Token amount is required.'; render(); return; }
+  const mint = (document.getElementById('ap-mint')?.value || '').trim();
+  if (!mint) { S.addPosErr = 'Paste a contract address first.'; render(); return; }
 
   S.addPosSaving = true; render();
 
   try {
-    // Resolve entry price: use provided value OR fetch current live price
-    let entry = entryRaw ? parseFloat(entryRaw) : null;
-    if (!entry || entry <= 0) {
-      // Try to get live price from DexScreener
-      try {
-        const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-        if (r.ok) {
-          const d = await r.json();
-          const pair = d.pairs?.[0];
-          if (pair?.priceUsd) entry = parseFloat(pair.priceUsd);
-        }
-      } catch { /* ignore — entry stays null */ }
-    }
-    if (!entry || entry <= 0) {
-      // Fallback: use cached price if we already have it
-      entry = S.prices[mint] || null;
-    }
-    if (!entry || entry <= 0) {
-      S.addPosErr = 'Could not fetch current price. Please enter the entry price manually.';
-      S.addPosSaving = false; render(); return;
-    }
-
-    const sol = solRaw ? parseFloat(solRaw) : null;
-    const sl  = entry * 0.80;
-    const tp1 = entry * 1.50;
-    const tp2 = entry * 2.0;
-    const tp3 = entry * 3.0;
-    const noKnownEntry = !entryRaw; // flag so UI can note P&L is from-now
-
-    const doc = {
-      symbol:        sym,
-      name:          name || sym,
-      address:       mint,
-      mint:          mint,
-      entryPrice:    entry,
-      solSpent:      sol || 0,
-      amount:        amount,
-      size:          sol ? sol * entry : amount * entry,
-      sl, tp1, tp2, tp3,
-      walletId,
-      chain:         'solana',
-      status:        'open',
-      source:        'manual',
-      entryFromNow:  noKnownEntry, // true = entry price is today's price, not original buy price
-      entryTime:     Date.now(),
-      remaining:     1,
-      score:         null,
-      strategyLabel: 'MANUAL',
-    };
-    await fsAdd(S.config, S.posCollection, doc);
-    S.addingPosition = false;
+    // Queue for the bot — it will fetch DexScreener, calculate size/TP/SL, and enter
+    await fsAdd(S.config, 'paper_manual_queue', {
+      address:   mint,
+      status:    'pending',
+      addedAt:   Date.now(),
+      source:    'dashboard',
+    });
     S.addPosSaving = false;
-    await loadData();
+    S.addPosOk  = 'Queued — bot will enter within 15 s';
+    render();
+    // Auto-close and refresh after 2 s
+    setTimeout(() => { S.addingPosition = false; S.addPosOk = ''; loadData(); }, 2000);
   } catch (e) {
-    S.addPosErr = 'Save failed: ' + e.message;
+    S.addPosErr = 'Queue failed: ' + e.message;
     S.addPosSaving = false;
     render();
   }

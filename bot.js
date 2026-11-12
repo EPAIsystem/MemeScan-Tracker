@@ -330,7 +330,7 @@ const STRATEGIES = [
     rugCheckMaxRisk: 50, // stricter rug threshold (50 vs standard 60)
     // ── SL / TP (custom schedule — handled in monitor loop for id=4) ──
     slx: 0.60,           // initial SL = entry − 40%
-    maxPositionSize: 50, // hard cap at $50 — overrides dynamic ceiling
+    // Nov-12: removed maxPositionSize:50 — now respects /setsize ceiling like all other strategies
     // SL phases (see monitorPositions Strategy 5 block):
     //   0–19%:   flat −40% from entry
     //  20–59%:   break-even lock (SL = entry)
@@ -1314,7 +1314,7 @@ async function enterPosition(coin, overrides = {}) {
   const cfg        = await getTradingConfig();
   // positionSize: dynamic sizing (liq × 1% × MC multiplier), capped at /setsize override or POSITION_SIZE env var
   const ceiling      = overrides.size || parseFloat(cfg.positionSize) || POSITION_SIZE;
-  // Strategy 5 (Pump Spec) has a hard $50 cap to limit exposure on volatile bonding-curve coins
+  // stratCeiling: strategy-level cap (if set); all strategies currently use the global ceiling
   const stratCeiling = s.maxPositionSize ? Math.min(s.maxPositionSize, ceiling) : ceiling;
   const posSize      = calcDynamicPositionSize(coin.liq || 0, coin.mcap || 0, stratCeiling);
   const rawSize    = (coin.liq || 0) * 0.01;  // 1% of liq before MC multiplier & ceiling
