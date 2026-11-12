@@ -1397,13 +1397,13 @@ async function enterPosition(coin, overrides = {}) {
   const meaningfulR = resistanceCandidates.filter(r => r > effectiveEntry * (1 + RESISTANCE_MIN_GAP));
   const resistancePrice = meaningfulR.length > 0 ? Math.min(...meaningfulR) : null;
 
-  // ── INITIAL SL = ENTRY PRICE (break-even from day 1) ────────────────────────
-  // The dynamic trailing SL system takes over immediately:
-  //   Phase 1: SL = entry (fires here if price drops below entry — cost = fees only)
-  //   Phase 2: SL = entry + 50% × ATH_gain (applied in monitorPositions)
+  // ── INITIAL SL = 7% BELOW ENTRY (Phase 1 buffer) ───────────────────────────
+  // Gives the coin room to breathe after entry without triggering on normal pullbacks.
+  //   Phase 1: SL = entry × 0.93 (holds until +7% gain — cost = 7% + fees if hit)
+  //   Phase 2: SL = entry + 50% × ATH_gain (fires at gain ≥ 7%, applied in monitorPositions)
   //   Phase 3: gap tightens 50→45→40→35%… per +20% ATH move (monitorPositions)
   // Old fixed-% stop (s.slx) is no longer used.
-  const initialSLPrice = effectiveEntry;
+  const initialSLPrice = effectiveEntry * 0.93;
 
   const pos = {
     symbol: coin.symbol, name: coin.name, address: coin.addr,
@@ -3784,10 +3784,11 @@ async function monitorPositions() {
     // Everything else rides via progressive trailing SL below.
     // ─────────────────────────────────────────────────────────────────────────
 
-    // ── PHASE 2 CAPITAL FLOOR — fires on any positive gain ───────────────────
-    // SL = entry + 50% × (ATH − entry). Covers gains 0–20%.
+    // ── PHASE 2 CAPITAL FLOOR — fires at gain ≥ 7% ──────────────────────────
+    // SL = entry + 50% × (ATH − entry). Covers gains 7–20%.
+    // At first fire (+7% ATH): SL = entry × 1.035 — smooth step up from the -7% buffer.
     // Phase 3 (progressive tightening) takes over above 20% — both run; Phase 3 wins.
-    if (!pos.isMoonBag && gain > 0) {
+    if (!pos.isMoonBag && gain >= 0.07) {
       const profitLockSL = pos.entryPrice + 0.50 * (currentPeak - pos.entryPrice);
       if (profitLockSL > (updates.currentSL ?? pos.currentSL) * 1.005) {
         updates.currentSL      = profitLockSL;
