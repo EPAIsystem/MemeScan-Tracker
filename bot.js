@@ -1642,12 +1642,23 @@ async function closePosition(id, data) {
   if (_posCache) _posCache = _posCache.filter(p => p.id !== id);
   // Always update the position status — this is the critical write
   await db.collection(positions).doc(id).update(closeData);
-  // Write history entry — wrapped so a failure doesn't revert the close
-  try {
-    const snap = await db.collection(positions).doc(id).get();
-    await db.collection(history).add({ ...snap.data(), ...closeData });
-  } catch(e) {
-    console.warn(`[BOT] History write failed for ${id} — position is still closed:`, e.message);
+  // Write history entry — wrapped so a failure doesn't revert the close.
+  // Nov-12: added retry + Telegram alert so silent failures are visible.
+  let histOk = false;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const snap = await db.collection(positions).doc(id).get();
+      await db.collection(history).add({ ...snap.data(), ...closeData });
+      histOk = true;
+      break;
+    } catch(e) {
+      console.warn(`[BOT] History write attempt ${attempt}/2 failed for ${id}:`, e.message);
+      if (attempt < 2) await sleep(1500);
+    }
+  }
+  if (!histOk) {
+    console.error(`[BOT] ⚠️ History write FAILED for ${id} — position is closed in paper_positions but NOT in paper_history`);
+    sendTelegram(`⚠️ *History write failed* — position closed in DB but history record missing. Check Firestore.`).catch(() => {});
   }
 }
 

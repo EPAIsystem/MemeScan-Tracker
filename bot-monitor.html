@@ -757,14 +757,16 @@ function parseDoc(doc) {
   return o;
 }
 
-async function fsQuery(cfg, coll, field, value) {
+async function fsQuery(cfg, coll, field, value, { limit: lim = 25, orderField, orderDir = 'DESCENDING' } = {}) {
   const url = `${base(cfg)}:runQuery?key=${cfg.apiKey}`;
-  const q = { structuredQuery: { from: [{ collectionId: coll }], limit: 25 } };
+  const q = { structuredQuery: { from: [{ collectionId: coll }], limit: lim } };
   if (field) {
     q.structuredQuery.where = { fieldFilter: { field: { fieldPath: field }, op: 'EQUAL', value: { stringValue: value } } };
   }
-  if (!field) {
-    q.structuredQuery.orderBy = [{ field: { fieldPath: 'enteredAt' }, direction: 'DESCENDING' }];
+  // Always apply ordering when an orderField is specified, or fall back to enteredAt when no filter
+  const sortKey = orderField || (!field ? 'enteredAt' : null);
+  if (sortKey) {
+    q.structuredQuery.orderBy = [{ field: { fieldPath: sortKey }, direction: orderDir }];
   }
   const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(await authHeaders(cfg)) }, body: JSON.stringify(q) });
   if (!r.ok) { const t = await r.text(); throw new Error(`Firestore ${r.status}: ${t.slice(0,120)}`); }
@@ -859,12 +861,17 @@ async function loadData() {
 
     const [positions, history, statsDoc, manualQueue] = await Promise.all([
       fsQuery(S.config, S.posCollection, 'status', 'open'),
-      fsQuery(S.config, S.histCollection),
+      // Nov-12: read closed trades directly from paper_positions (always present even
+      // when history write fails). Fetch up to 100, sort client-side by closedAt desc.
+      fsQuery(S.config, S.posCollection, 'status', 'closed', { limit: 100 }),
       fsGet(S.config, S.statsCollection, today),
       fsQuery(S.config, 'paper_manual_queue'),
     ]);
     S.positions = positions;
-    S.history = history.slice(0, 15);
+    // Sort client-side by closedAt descending so most recently closed appears first
+    S.history = history
+      .sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0))
+      .slice(0, 50);
     S.stats = statsDoc;
     S.control = ctrlDoc || {};
     S.botRunning = ctrlDoc ? (ctrlDoc.running !== false) : true;
