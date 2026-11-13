@@ -1583,8 +1583,11 @@ async function submitAddPosition() {
     S.addPosSaving = false;
     S.addPosOk  = 'Queued — bot will enter within 15 s';
     render();
-    // Auto-close and refresh after 2 s
-    setTimeout(() => { S.addingPosition = false; S.addPosOk = ''; loadData(); }, 2000);
+    // Close modal after 2 s; then poll at 10 s and 20 s to catch the bot's entry
+    // (bot processes queue every 15 s, so the first refresh at 2 s is always too early)
+    setTimeout(() => { S.addingPosition = false; S.addPosOk = ''; render(); }, 2000);
+    setTimeout(() => { if (S.config && !S.loading) loadData(); }, 10000);
+    setTimeout(() => { if (S.config && !S.loading) loadData(); }, 20000);
   } catch (e) {
     S.addPosErr = 'Queue failed: ' + e.message;
     S.addPosSaving = false;
@@ -1796,7 +1799,7 @@ function disconnect() {
 S.config = loadCfg();
 render();
 if (S.config) loadData();
-setInterval(() => { if (S.config && !S.loading) loadData(); }, 60000);
+setInterval(() => { if (S.config && !S.loading) loadData(); }, 20000);
 
 // ── Live age clock — updates every 30s without a full re-render ───────────────
 // Header chip has title="Time since entry"; detail-panel span does not.
