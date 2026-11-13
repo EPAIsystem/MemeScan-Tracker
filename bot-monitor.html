@@ -1581,13 +1581,13 @@ async function submitAddPosition() {
     // Queue for the bot — it will fetch DexScreener, set TP/SL, and enter
     await fsAdd(S.config, 'paper_manual_queue', queueDoc);
     S.addPosSaving = false;
-    S.addPosOk  = 'Queued — bot will enter within 15 s';
+    S.addPosOk  = '⚡ Sent — entering within 5 s';
     render();
-    // Close modal after 2 s; then poll at 10 s and 20 s to catch the bot's entry
-    // (bot processes queue every 15 s, so the first refresh at 2 s is always too early)
+    // Close modal after 2 s; then refresh at 6 s and 12 s to catch the bot's entry
+    // (fast queue loop runs every 5 s, so entry is usually done within that window)
     setTimeout(() => { S.addingPosition = false; S.addPosOk = ''; render(); }, 2000);
-    setTimeout(() => { if (S.config && !S.loading) loadData(); }, 10000);
-    setTimeout(() => { if (S.config && !S.loading) loadData(); }, 20000);
+    setTimeout(() => { if (S.config && !S.loading) loadData(); }, 6000);
+    setTimeout(() => { if (S.config && !S.loading) loadData(); }, 12000);
   } catch (e) {
     S.addPosErr = 'Queue failed: ' + e.message;
     S.addPosSaving = false;

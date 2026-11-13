@@ -4732,10 +4732,16 @@ async function main() {
 
   await sleep(7500);
 
+  // Fast queue loop — checks for manual entries every 5 s so dashboard Add Now
+  // is processed almost immediately without waiting for the full 15 s scan cycle.
+  setInterval(async () => {
+    try { await processManualQueue(); }
+    catch(e) { console.error('[QUEUE]', e.message); }
+  }, 5000);
+
   setInterval(async () => {
     try {
       scanCount++;
-      await processManualQueue();   // manual entries first
       await scanForEntries();
       if (scanCount % 4 === 0) console.log(`[BOT] Scan #${scanCount}`);
     } catch(e) { console.error('[SCANNER]', e.message); }
