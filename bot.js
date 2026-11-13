@@ -465,7 +465,7 @@ function detectStrategy(pair, openStrategies) {
   if (!globalGatesBypass && ageDays < 1) {
     // avgTrade gate: $20 for all strategies except SC and pump.fun→S5
     // SC has its own $15 gate; pump.fun coins for S5 use the global floor ($8) only.
-    if (!scIsOpen && !s5OpenForYoung && avgTrade !== null && avgTrade < 20) return rej('young');
+    if (!scIsOpen && !s5OpenForYoung && avgTrade !== null && avgTrade < 12) return rej('young'); // Nov-13: 20→12 — $20 was blocking most pump.fun ecosystem coins
     if (s5OpenForYoung) {
       // Nov-11: aligned to PS's current thresholds (was 55/10, PS now accepts 50/6)
       if (buyPct < 50) return rej('young');  // S5 minBuyPct (updated)
