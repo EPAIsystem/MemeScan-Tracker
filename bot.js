@@ -191,6 +191,20 @@ const RANGE_REENTRY_WINDOW  = 2 * 60 * 60 * 1000; // 2h watchlist expiry
 // addr → { symbol, strategyId, strategyLabel, supportLevel, exitPrice, exitTime, dexUrl }
 const rangeReentryWatchlist = new Map();
 
+// ── MOMENTUM RE-ENTRY (AM id=1, SC id=2, PS id=4) ───────────────────────────
+// After an SL close where loss ≤ 10% (or any profit), watch for higher-low reversal.
+// Higher low = postExitLow > snapshotLow (structural low recorded at time of exit).
+// Entry trigger = 3% bounce from that postExitLow (curve reversing from the dip).
+// Window = 30 minutes. Sizing = standard dynamic (1% liq).
+const MOMENTUM_REENTRY_STRATEGIES  = new Set([1, 2, 4]); // AM, SC, PUMP SPEC
+const MOMENTUM_REENTRY_BOUNCE_PCT  = 0.03;               // 3% bounce from postExitLow
+const MOMENTUM_REENTRY_WINDOW_MS   = 30 * 60 * 1000;     // 30-min watch window
+const MOMENTUM_REENTRY_MAX_LOSS    = -0.10;               // ignore if loss > 10% of size
+
+// addr → { symbol, strategyId, strategyLabel, dexUrl, chain, liq, mcap, score,
+//           ageMinutes, snapshotLow, postExitLow, exitPrice, exitTime, pnlPct }
+const momentumReentryWatch = new Map();
+
 // ═════════════════════════════════════════════════════════════════════════════
 // ─── CORE OPERATING PRINCIPLE ─────────────────────────────────────────────────
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1925,6 +1939,124 @@ async function processPullbackWatchlist(positions, slotCount, usedThisScan) {
   }
 }
 
+// ─── MOMENTUM RE-ENTRY PROCESSOR ─────────────────────────────────────────────
+// Called each scan. Watches AM/SC/PS coins after their SL close for a higher-low
+// reversal signal: postExitLow > snapshotLow AND price bounces 3% from that low.
+// That means the dip held above the previous structure — the curve is reversing.
+async function processMomentumReentry(positions) {
+  if (momentumReentryWatch.size === 0) return;
+  const now = Date.now();
+
+  for (const [addr, entry] of momentumReentryWatch) {
+    // ── Expire ───────────────────────────────────────────────────────────────
+    if (now - entry.exitTime > MOMENTUM_REENTRY_WINDOW_MS) {
+      console.log(`[MREENTRY] ${entry.symbol} — 30min window expired, removing`);
+      momentumReentryWatch.delete(addr);
+      continue;
+    }
+    // ── Already re-entered or blocked ────────────────────────────────────────
+    if (positions.find(p => p.address === addr)) {
+      momentumReentryWatch.delete(addr);
+      continue;
+    }
+    if (recentSLCoins.has(addr)) {
+      momentumReentryWatch.delete(addr);
+      continue;
+    }
+    if (positions.length >= MAX_POSITIONS) continue;
+
+    // ── Fetch fresh price + momentum data ────────────────────────────────────
+    let price, liq, m5Ch, buyPct;
+    try {
+      const r = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${addr}`);
+      const d = JSON.parse(r.body);
+      const pairs = (d.pairs || []).filter(p => p.chainId === entry.chain);
+      if (!pairs.length) continue;
+      pairs.sort((a,b) => (b.liquidity?.usd||0) - (a.liquidity?.usd||0));
+      const pair = pairs[0];
+      price  = parseFloat(pair.priceUsd || 0);
+      liq    = pair.liquidity?.usd   || entry.liq;
+      m5Ch   = parseFloat(pair.priceChange?.m5 || 0);
+      const buys  = pair.txns?.m5?.buys  || 0;
+      const sells = pair.txns?.m5?.sells || 0;
+      buyPct = (buys + sells) > 0 ? (buys / (buys + sells)) * 100 : 50;
+    } catch(e) { continue; }
+    if (!price || price <= 0) continue;
+
+    // ── Track post-exit low (the dip after the SL close) ─────────────────────
+    if (price < entry.postExitLow) entry.postExitLow = price;
+
+    // ── Higher-low check ─────────────────────────────────────────────────────
+    // The dip after exit must hold ABOVE the structural low recorded at exit time.
+    // If coin fell through that floor, the uptrend has broken — ignore.
+    if (entry.postExitLow <= entry.snapshotLow) {
+      console.log(`[MREENTRY] ${entry.symbol} — dip broke below snapshotLow ($${fmtPrice(entry.postExitLow)} ≤ $${fmtPrice(entry.snapshotLow)}) — removing`);
+      momentumReentryWatch.delete(addr);
+      continue;
+    }
+
+    // ── Bounce check: 3% recovery from the postExitLow ───────────────────────
+    if (price < entry.postExitLow * (1 + MOMENTUM_REENTRY_BOUNCE_PCT)) continue;
+
+    // ── Momentum filter: m5 must be positive (curve actively reversing) ───────
+    if (m5Ch <= 0) continue;
+
+    // ── All conditions met — enter ────────────────────────────────────────────
+    const bouncePct = ((price / entry.postExitLow - 1) * 100).toFixed(1);
+    const prevResult = entry.pnlPct >= 0
+      ? `+${(entry.pnlPct * 100).toFixed(1)}%`
+      : `${(entry.pnlPct * 100).toFixed(1)}%`;
+    console.log(`[MREENTRY] ${entry.symbol} — higher low confirmed! postExitLow:$${fmtPrice(entry.postExitLow)} > snapshotLow:$${fmtPrice(entry.snapshotLow)}, +${bouncePct}% bounce — entering`);
+    momentumReentryWatch.delete(addr);
+
+    const strategy = STRATEGIES.find(s => s.id === entry.strategyId) || STRATEGIES[1];
+    const coin = {
+      addr,
+      symbol:      entry.symbol,
+      name:        entry.symbol,
+      price,
+      liq,
+      mcap:        entry.mcap || 0,
+      m5Ch,
+      buyPct,
+      chain:       entry.chain,
+      strategy,
+      dexUrl:      entry.dexUrl,
+      ageMinutes:  entry.ageMinutes || 60,
+      ageDays:     (entry.ageMinutes || 60) / (60 * 24),
+      score:       entry.score || 60,
+      ch1:         null,
+      _momentumReentry:  true,
+      _prevExitPrice:    entry.exitPrice,
+      _prevResult:       prevResult,
+      _bouncePct:        bouncePct,
+      _snapshotLow:      entry.snapshotLow,
+      _postExitLow:      entry.postExitLow,
+    };
+
+    enteredToday.delete(addr); // clear so enterPosition doesn't reject it
+    enteredToday.add(addr);
+    const pos = await enterPosition(coin);
+    if (!pos) {
+      enteredToday.delete(addr);
+      continue;
+    }
+    alertCooldown.set(addr, Date.now());
+    positions.push(pos);
+
+    await sendTelegram(
+      `🔄 *MOMENTUM RE-ENTRY*\n\n` +
+      `*${entry.symbol}* ${entry.strategyLabel}\n` +
+      `📉 Higher low held: $${fmtPrice(entry.postExitLow)} > structure $${fmtPrice(entry.snapshotLow)}\n` +
+      `📈 Bounce: *+${bouncePct}%* from low — curve reversing\n` +
+      `📥 Re-entry: $${fmtPrice(price)} (prev exit: $${fmtPrice(entry.exitPrice)}, ${prevResult})\n` +
+      `💰 Position: ${pos.sizeNote || '$'+pos.size}${pos.walletLabel ? ` · ${pos.walletLabel}` : ''}\n` +
+      `📊 m5: +${m5Ch.toFixed(1)}% | Buy%: ${buyPct.toFixed(0)}% | Liq: $${(liq/1000).toFixed(0)}k\n` +
+      `🔗 [Chart](${entry.dexUrl})`
+    ).catch(() => {});
+  }
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // ─── POSITION MONITOR ────────────────────────────────────────────────────────
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1968,6 +2100,7 @@ async function checkDayRestart() {
     enteredToday.clear();
     recentSLCoins.clear();
     alertCooldown.clear();
+    momentumReentryWatch.clear();
     dayHaltedToday = false;
 
     // Clear the flag so we don't restart again immediately
@@ -3590,15 +3723,16 @@ async function monitorPositions() {
         const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial TP exits
         await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'STOP_LOSS', pnl });
         await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
+        // Slippage check — lifted here so it's available for both loss and profit paths
+        const slippagePct = pos.currentSL > 0
+          ? (pos.currentSL - exitFillPrice) / pos.currentSL
+          : 0;
+        const highSlippage = slippagePct > 0.10;
         if (pnl <= 0) {
           // Loss SL — allow same-day re-entry for ALL strategies as soon as indicators
           // qualify again (a stop loss doesn't permanently invalidate the coin).
           // Exception: if fill slipped >10% below the SL price (rug-like behaviour —
           // price blew through the stop), block 6h regardless of strategy.
-          const slippagePct = pos.currentSL > 0
-            ? (pos.currentSL - exitFillPrice) / pos.currentSL
-            : 0;
-          const highSlippage = slippagePct > 0.10;
           if (!highSlippage) {
             // Normal loss — free the coin; re-entry fires when scan indicators reset
             enteredToday.delete(pos.address);
@@ -3609,6 +3743,31 @@ async function monitorPositions() {
         } else {
           // Profitable trailing SL (capital secured, positive P&L) — allow same-day re-entry
           enteredToday.delete(pos.address);
+        }
+        // ── MOMENTUM RE-ENTRY WATCH ───────────────────────────────────────────
+        // For AM(1), SC(2), PS(4): if loss ≤ 10% and not rug-slippage,
+        // watch for higher-low reversal within 30 min and auto-re-enter.
+        const pnlPct = pos.size > 0 ? pnl / pos.size : 0;
+        if (MOMENTUM_REENTRY_STRATEGIES.has(pos.strategyId)
+            && pnlPct >= MOMENTUM_REENTRY_MAX_LOSS
+            && !highSlippage) {
+          // Record structural low from recent price history at time of exit
+          const hist         = priceHistory.get(pos.address) || [];
+          const recentPrices = hist.slice(-20).map(h => h.price).filter(p => p > 0);
+          const snapshotLow  = recentPrices.length > 0
+            ? Math.min(...recentPrices)
+            : pos.entryPrice;
+          momentumReentryWatch.set(pos.address, {
+            symbol: pos.symbol, strategyId: pos.strategyId, strategyLabel: pos.strategyLabel,
+            dexUrl: pos.dexUrl, chain: pos.chain, liq: pos.liq || 0, mcap: pos.mcap || 0,
+            score: pos.botScore || 60, ageMinutes: pos.ageMinutes || 60,
+            snapshotLow,
+            postExitLow: exitFillPrice, // tracks lowest price seen after exit
+            exitPrice: exitFillPrice,
+            exitTime: Date.now(),
+            pnlPct,
+          });
+          console.log(`[MREENTRY] ${pos.symbol} — watching for higher-low re-entry | snapshotLow:$${fmtPrice(snapshotLow)} exitPrice:$${fmtPrice(exitFillPrice)} pnl:${(pnlPct*100).toFixed(1)}%`);
         }
         await sendTelegram(
           `🛑 *STOP LOSS HIT*\n\n` +
@@ -4629,6 +4788,9 @@ async function scanForEntries() {
 
   // Process pullback watchlist — check BB and OR coins waiting for support bounce
   await processPullbackWatchlist(positions, slotCount, usedThisScan);
+
+  // Process momentum re-entry — check AM/SC/PS coins after SL for higher-low reversal
+  await processMomentumReentry(positions);
 }
 
 // ─── HOURLY SUMMARY ───────────────────────────────────────────────────────────
