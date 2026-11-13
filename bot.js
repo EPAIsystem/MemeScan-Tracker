@@ -4403,11 +4403,13 @@ async function monitorPositions() {
     // Everything else rides via progressive trailing SL below.
     // ─────────────────────────────────────────────────────────────────────────
 
-    // ── PHASE 2 CAPITAL FLOOR — fires at gain ≥ 7% ──────────────────────────
-    // SL = entry + 50% × (ATH − entry). Covers gains 7–20%.
-    // At first fire (+7% ATH): SL = entry × 1.035 — smooth step up from the -7% buffer.
+    // ── PHASE 2 CAPITAL FLOOR — fires at gain ≥ 3% ──────────────────────────
+    // SL = entry + 50% × (ATH − entry). Covers gains 3–20%.
+    // Nov-13: lowered from 7% → 3% — coins were running 10%+ and crashing back
+    // through entry before protection locked in. Small profit > small loss.
+    // At first fire (+3% ATH): SL = entry × 1.015 — locks in half of any gain immediately.
     // Phase 3 (progressive tightening) takes over above 20% — both run; Phase 3 wins.
-    if (!pos.isMoonBag && gain >= 0.07) {
+    if (!pos.isMoonBag && gain >= 0.03) {
       const profitLockSL = pos.entryPrice + 0.50 * (currentPeak - pos.entryPrice);
       if (profitLockSL > (updates.currentSL ?? pos.currentSL) * 1.005) {
         updates.currentSL      = profitLockSL;
