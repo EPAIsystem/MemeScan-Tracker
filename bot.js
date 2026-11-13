@@ -501,13 +501,17 @@ function detectStrategy(pair, openStrategies) {
   //
   if (!globalGatesBypass) {
     if (ch1 === null) {
-      const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2)
-                || (m5Ch >= 3);
+      const s5OpenDead = openStrategies.some(st => st.id === 4);
+      const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 0.5) // Nov-13: 2→0.5 — aligns with AM minM5Ch; unlocks AM candidates
+                || (m5Ch >= 3)
+                || (s5OpenDead && ageMinutes < 60 && m5Ch >= -5);        // Nov-13: PS exemption — enters on pullbacks, ch1 often null for <1h coins
       if (!pass) return rej('dead');
     } else if (Math.abs(ch1) < 0.5) {
-      const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 2) // young coin pumping
-                || (ch24 <= -5 && buyPct >= 50 && liq >= 5000)          // bottom bounce stabilising — Nov-11: liq floor 10k→5k (matches BB minLiq)
-                || (m5Ch >= 3);                                           // actively surging now
+      const s5OpenDead = openStrategies.some(st => st.id === 4);
+      const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 0.5) // Nov-13: 2→0.5 — aligns with AM minM5Ch
+                || (ch24 <= -5 && buyPct >= 50 && liq >= 5000)           // bottom bounce stabilising
+                || (m5Ch >= 3)                                            // actively surging now
+                || (s5OpenDead && ageMinutes < 60 && m5Ch >= -5);        // Nov-13: PS exemption — pullback entry
       if (!pass) return rej('dead');
     }
 
@@ -547,19 +551,23 @@ function detectStrategy(pair, openStrategies) {
     //      This catches coins that peaked between scans and are now coming down.
     //
     // Exception: Bottom Bounce (id=0) is designed to enter on oversold recovery —
-    // it can have a slightly negative m5 as the coin is stabilising. Allow m5Ch ≥ -1%.
+    // it can have a slightly negative m5 as the coin is stabilising. Allow m5Ch ≥ -3%.
     // Strategy 5 (Pump Spec) enters on pullbacks — allow m5Ch down to -5% when s5 is open.
     // All other strategies require m5Ch ≥ -1% (no meaningful decline allowed).
+    // Nov-13: BB extended from -1% to -3% — bounce forming coins often show slight negative m5
     if (m5Ch !== null && m5Ch < -1) {
       const s5Open = openStrategies.some(st => st.id === 4);
-      if (!s5Open || m5Ch < -5) return rej('mom'); // declining too hard — skip
+      const bbOpen = openStrategies.some(st => st.id === 0);
+      if (s5Open && m5Ch >= -5) { /* PS exemption — pullback entry allowed */ }
+      else if (bbOpen && m5Ch >= -3) { /* BB exemption Nov-13: -1→-3 — bounce forming */ }
+      else return rej('mom'); // declining too hard — skip
     }
 
     const liveHist = priceHistory.get(addr) || [];
     if (liveHist.length >= 3) {
       const newest = liveHist[liveHist.length - 1]?.price;
       const older  = liveHist[liveHist.length - 3]?.price; // ~6 seconds ago
-      if (newest && older && newest < older * 0.999) return rej('live'); // price declining in live feed
+      if (newest && older && newest < older * 0.995) return rej('live'); // price declining in live feed — Nov-13: 0.999→0.995 (allow up to 0.5% tick dip; 0.1% was too hair-trigger)
     }
   } // end globalGatesBypass check
 
