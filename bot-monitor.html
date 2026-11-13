@@ -557,18 +557,18 @@ tbody tr:hover td { background: var(--bg3); }
 /* ── Add Position Modal ─────────────────────────────────────────────────────── */
 .modal-backdrop {
   position: fixed; inset: 0; background: rgba(0,0,0,.72);
-  display: flex; align-items: flex-end; justify-content: center;
-  z-index: 100; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  z-index: 100; padding: 16px;
   animation: fade-in .15s ease;
 }
 @keyframes fade-in { from { opacity:0 } to { opacity:1 } }
 .modal-sheet {
   background: var(--bg2); border: 1px solid var(--border);
-  border-radius: 18px 18px 0 0; padding: 24px 20px 36px;
+  border-radius: 18px; padding: 24px 20px 28px;
   width: 100%; max-width: 520px; max-height: 90vh; overflow-y: auto;
-  animation: slide-up .2s ease;
+  animation: pop-in .2s ease;
 }
-@keyframes slide-up { from { transform:translateY(40px); opacity:0 } to { transform:translateY(0); opacity:1 } }
+@keyframes pop-in { from { transform:scale(.95); opacity:0 } to { transform:scale(1); opacity:1 } }
 .modal-header {
   display: flex; align-items: center; justify-content: space-between;
   margin-bottom: 20px;

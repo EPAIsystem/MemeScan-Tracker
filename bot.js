@@ -2511,22 +2511,17 @@ async function pollTelegramCommands() {
             `_Bot will evaluate with its own scoring (needs ≥ ${MIN_SCORE})_`
           );
         } else {
-          const existSnap = await db.collection('paper_manual_queue')
-            .where('address', '==', ca).where('status', '==', 'pending').get();
-          if (!existSnap.empty) {
-            await sendTelegram(`ℹ️ \`${ca.slice(0, 8)}…${ca.slice(-6)}\` is already queued.`);
-          } else {
-            await db.collection('paper_manual_queue').add({
-              address: ca, status: 'pending',
-              source: 'manual_command',
-              queuedAt: Date.now(),
-            });
-            await sendTelegram(
-              `🔍 *Queued for evaluation*\n` +
-              `\`${ca.slice(0, 8)}…${ca.slice(-6)}\`\n` +
-              `_Bot will enter only if it scores ≥ ${MIN_SCORE}_`
-            );
-          }
+          // Manual command — goes straight in, no filter checks (human override)
+          await db.collection('paper_manual_queue').add({
+            address: ca, status: 'pending',
+            source: 'manual_command',
+            queuedAt: Date.now(),
+          });
+          await sendTelegram(
+            `✅ *Queued — entering shortly*\n` +
+            `\`${ca.slice(0, 8)}…${ca.slice(-6)}\`\n` +
+            `_Manual entries bypass bot filters and go straight in_`
+          );
         }
       }
 
