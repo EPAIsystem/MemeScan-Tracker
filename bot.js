@@ -440,7 +440,7 @@ function detectStrategy(pair, openStrategies) {
   const rej = gate => { gateStats[gate]++; return null; };
   if (!isSolana && !isEVM) return rej('chain');
   if (!globalGatesBypass) {
-    if (liq < 10000) return rej('liqFloor'); // Nov-13: 3k→10k — eliminate micro-cap noise coins
+    if (liq < 3000) return rej('liqFloor'); // Nov-13: 10k→3k — $10k was blocking 75-80% of all coins; real liq floors are in LP gate per strategy
   }
   if (price <= 0)  return rej('price');  // always keep — zero price breaks arithmetic
   if (!globalGatesBypass) {
