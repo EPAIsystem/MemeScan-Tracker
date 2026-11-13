@@ -261,6 +261,7 @@ const STRATEGIES = [
     minLiq: 12000,      // Nov-13: 5k→12k — tighter liq floor to filter noise
     minLiqLocked: 8000, // Nov-13: 3k→8k — higher bar for LP-locked coins
     minM5Txns: 5,       // Nov-10: 12→5 — crashed coins have thin volume; 5 confirms it's not dead
+    rugCheckMaxUnlockedRisk: 40, // Nov-13: BB targets crashed coins — risk scores run higher; needs wider unlocked LP gate than other strategies
     // ── TP / SL (standard 3-step) ──
     tp1x: 1.20, tp2x: 1.45, tp3x: 2.00,
     slx: 0.90,          // –10% SL: if a bounce thesis fails –10%, thesis is wrong
@@ -3515,7 +3516,7 @@ async function filterByLpLock(matches) {
     const strictRatio     = ANTI_MANIP_MC_LIQ_RATIO_MAX; // 30×
     const liqOk           = coin.liq >= strictLiq;
     const ratioOk         = (coin.mcLiqRatio || 999) <= strictRatio;
-    const maxUnlockedRisk = 25; // Nov-13: 40→25 — tighter unlocked-LP gate
+    const maxUnlockedRisk = coin.strategy?.rugCheckMaxUnlockedRisk ?? 30; // Nov-13: per-strategy ceiling — BB=40, all others=30 (global raised from 25; 25 was blocking AM/SC/PS)
 
     if (rc.riskScore > maxUnlockedRisk) {
       console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked, risk ${rc.riskScore}/100 (>${maxUnlockedRisk}), rejected`);
