@@ -172,6 +172,22 @@ const gatePeriodStats = { total:0, chain:0, liqFloor:0, price:0, honey:0, txns:0
 const lpPeriodStats   = { checked:0, passed:0, failRisk:0, failLiq:0, failRatio:0, rcFail:0 };
 // Strategy distribution — how many matched each strategy per period
 const stratPeriodStats = { bb:0, am:0, sc:0, or:0, ps:0 };
+// Gate simulation accumulator — per-filter independent rejection counts.
+// Runs on ALL coins regardless of bypass flags (pure diagnostic — no early return).
+const gateSimStats = {
+  total:0,
+  // Global gate (independent checks)
+  liqFloor:0, honey:0, txns:0, avgT:0, ratio:0,
+  youngBuy:0, youngTxns:0, dead:0, noAct:0, dex:0, age:0, mom:0,
+  // Strategy gates (per-filter, independent)
+  bbAge:0, bbCh24:0, bbCh1:0, bbM5Ch:0, bbBuy:0, bbTxns:0, bbLiq:0,
+  amM5Ch:0, amBuy:0, amTxns:0, amLiq:0, amCh1:0,
+  scAge:0, scM5Ch:0, scBuy:0, scTxns:0, scLiq:0, scAvgT:0,
+  orAge:0, orCh24:0, orCh1:0, orBuy:0, orLiq:0, orBuys24:0,
+  psAge:0, psCh1:0, psM5Ch:0, psBuy:0, psTxns:0, psLiq:0,
+  // LP gate simulation (liq-floor checks — RugCheck risk can't be simulated here)
+  lpBB:0, lpAM:0, lpSC:0, lpOR:0, lpPS:0, lpRatio:0
+};
 
 // ─── DYNAMIC POSITION SIZING ─────────────────────────────────────────────────
 // Position scales with liquidity (1% of pool ≈ <1% price impact) and market cap.
@@ -266,7 +282,7 @@ const STRATEGIES = [
     minBuyPct: 55,      // Nov-11: 60→55 — relaxed to accommodate pump.fun/PumpSwap ecosystem
     minLiq: 12000,      // Nov-13: 5k→12k — tighter liq floor to filter noise
     minLiqLocked: 8000, // Nov-13: 3k→8k — higher bar for LP-locked coins
-    minM5Txns: 5,       // Nov-10: 12→5 — crashed coins have thin volume; 5 confirms it's not dead
+    minM5Txns: 3,       // Nov-13: 5→3 — crashed coins have very thin volume; 3 is enough to confirm it's alive
     rugCheckMaxUnlockedRisk: 40, // Nov-13: BB targets crashed coins — risk scores run higher; needs wider unlocked LP gate than other strategies
     // ── TP / SL (standard 3-step) ──
     tp1x: 1.20, tp2x: 1.45, tp3x: 2.00,
@@ -283,7 +299,7 @@ const STRATEGIES = [
     // (from 1h all the way to multi-day trending coins).
     // SC (id=2) handles the aggressive surge for 1h–24h coins; AM and SC
     // compete on score when both criteria are met and the highest scorer wins.
-    minM5Ch: 0.5,        // Nov-11: 1.5→0.5 — subtle positive momentum is a valid signal in pump ecosystem
+    minM5Ch: 0,          // Nov-13: 0.5→0 — catch sideways coins about to move; any non-negative m5 is valid
     minM5Txns: 8,        // Nov-11: 15→8 — pump.fun coins have thinner activity
     minBuyPct: 52,       // Nov-11: 58→52 — marginal buyer edge is enough with RugCheck backing it
     minCh1: -2,          // Nov-11: 0→-2 — allow slight h1 dip as long as m5 is positive
@@ -324,7 +340,7 @@ const STRATEGIES = [
     desc: '1 day+ established coin recovering steadily',
     // ── Entry criteria ──
     minAgeDays: 1,       // Nov-12: 3→1 — any coin ≥ 1 day old qualifies as "old recovery"
-    minCh24: 2,          // Nov-11: 5→2 — less aggressive recovery signal required
+    minCh24: 0.5,        // Nov-13: 2→0.5 — catch early recovery before 24h fully green
     minCh1: 0.5,         // Nov-10: 1.5→0.5 — ch24≥2% already confirms recovery; 0.5% checks h1 trend intact
     maxCh1: 20,          // Nov-9: tighter spike guard — >20% in 1h on old coin is suspicious
     minBuyPct: 50,       // Nov-11: 58→50 — marginal buyer dominance allowed with RugCheck backing
@@ -439,6 +455,96 @@ function detectStrategy(pair, openStrategies) {
   gateStats.total++;
   const rej = gate => { gateStats[gate]++; return null; };
   if (!isSolana && !isEVM) return rej('chain');
+
+  // ── GATE SIMULATION ACCUMULATOR ──────────────────────────────────────────────
+  // Runs on ALL coins regardless of bypass flags — no early returns.
+  // Shows which individual filters block the most coins independently.
+  // Uses same variable values as the real gate (liq, ch1, m5Ch, etc. already computed above).
+  {
+    const simAgeMin  = (now - created) / 60000;
+    const simDexId   = pair.dexId || '';
+    const simIsPSwap = ['pumpswap','pump_amm','pump-amm','pump_swap','pump-swap'].includes(simDexId);
+    gateSimStats.total++;
+
+    // — Global gate (independent checks — mirrors real gate logic) —
+    if (liq < 500)                                                   gateSimStats.liqFloor++;
+    if (sells24 === 0 && buys24 > 10)                                gateSimStats.honey++;
+    if (m5Txns > ANTI_MANIP_M5_TXNS_MAX)                            gateSimStats.txns++;
+    if (avgTrade !== null && avgTrade < ANTI_MANIP_AVG_TRADE_FLOOR)  gateSimStats.avgT++;
+    if (mcLiqRatio > ANTI_MANIP_MC_LIQ_RATIO_MAX_LOCKED)            gateSimStats.ratio++;
+    if (ageDays < 1) {
+      if (buyPct < 10)  gateSimStats.youngBuy++;
+      if (m5Txns < 1)   gateSimStats.youngTxns++;
+    }
+    // Dead coin simulation (mirrors the two branches of the real dead guard)
+    {
+      let simDeadFail = false;
+      if (ch1 === null) {
+        const pass = (simAgeMin >= 60 && simAgeMin < 240 && m5Ch >= -20)
+                  || (m5Ch >= -20);
+        if (!pass) simDeadFail = true;
+      } else if (Math.abs(ch1) < 0.5) {
+        const pass = (simAgeMin >= 60 && simAgeMin < 240 && m5Ch >= -20)
+                  || (ch24 <= 0 && buyPct >= 10 && liq >= 500)
+                  || (m5Ch >= -20);
+        if (!pass) simDeadFail = true;
+      }
+      if (simDeadFail) gateSimStats.dead++;
+    }
+    if (!m5Txns || m5Txns < 1)             gateSimStats.noAct++;
+    if (!ALLOWED_DEXES.has(simDexId))      gateSimStats.dex++;
+    if (simAgeMin < 1)                     gateSimStats.age++;
+    if (m5Ch !== null && m5Ch < -20)       gateSimStats.mom++;
+
+    // — BB strategy gates (independent — reflects NEW thresholds) —
+    if (!(ageDays >= 0.042))                           gateSimStats.bbAge++;
+    if (!(ch24 <= -5 && ch24 >= -85))                  gateSimStats.bbCh24++;
+    if (!(ch1 >= -8 && ch1 <= 12))                     gateSimStats.bbCh1++;
+    if (!(m5Ch >= 0))                                  gateSimStats.bbM5Ch++;
+    if (!(buyPct >= 55))                               gateSimStats.bbBuy++;
+    if (!(m5Txns >= 3))                                gateSimStats.bbTxns++;  // NEW: 5→3
+    if (!(liq >= 8000))                                gateSimStats.bbLiq++;   // minLiqLocked
+
+    // — AM strategy gates (independent — reflects NEW thresholds) —
+    if (!(m5Ch >= 0))                                  gateSimStats.amM5Ch++;  // NEW: 0.5→0
+    if (!(buyPct >= 52))                               gateSimStats.amBuy++;
+    if (!(m5Txns >= 8))                                gateSimStats.amTxns++;
+    if (!(liq >= 8000))                                gateSimStats.amLiq++;   // minLiqLocked
+    if (!(ch1 >= -2))                                  gateSimStats.amCh1++;
+
+    // — SC strategy gates (independent) —
+    if (!(ageDays >= 0.042 && ageDays <= 1))           gateSimStats.scAge++;
+    if (!(m5Ch >= 3))                                  gateSimStats.scM5Ch++;
+    if (!(buyPct >= 55))                               gateSimStats.scBuy++;
+    if (!(m5Txns >= 10))                               gateSimStats.scTxns++;
+    if (!(liq >= 5000))                                gateSimStats.scLiq++;   // minLiqLocked
+    if (avgTrade !== null && !(avgTrade >= 15))        gateSimStats.scAvgT++;  // ANTI_MANIP_SC_AVG_TRADE
+
+    // — OR strategy gates (independent — reflects NEW thresholds) —
+    if (!(ageDays >= 1))                               gateSimStats.orAge++;
+    if (!(ch24 >= 0.5))                                gateSimStats.orCh24++;  // NEW: 2→0.5
+    if (!(ch1 >= 0.5 && ch1 <= 20))                    gateSimStats.orCh1++;
+    if (!(buyPct >= 50))                               gateSimStats.orBuy++;
+    if (!(liq >= 12000))                               gateSimStats.orLiq++;   // minLiqLocked
+    if (!(buys24 >= 15))                               gateSimStats.orBuys24++;
+
+    // — PS strategy gates (independent — pump.fun / PumpSwap only) —
+    if (ageDays > 0.042)                               gateSimStats.psAge++;   // too old for PS
+    if (!(ch1 >= 2))                                   gateSimStats.psCh1++;   // null >= 2 → false → counted
+    if (!(m5Ch >= -5 && m5Ch <= 4))                    gateSimStats.psM5Ch++;
+    if (!(buyPct >= 50))                               gateSimStats.psBuy++;
+    if (!(m5Txns >= 6))                                gateSimStats.psTxns++;
+    if (!(liq >= 5000))                                gateSimStats.psLiq++;   // minLiq (same as minLiqLocked for PS)
+
+    // — LP gate simulation (liq-floor checks — RugCheck risk can't be simulated here) —
+    if (liq < 12000) gateSimStats.lpBB++;   // BB minLiq=12000
+    if (liq < 12000) gateSimStats.lpAM++;   // AM minLiq=12000
+    if (liq < 8000)  gateSimStats.lpSC++;   // SC minLiq=8000
+    if (liq < 20000) gateSimStats.lpOR++;   // OR minLiq=20000
+    if (liq < 6000)  gateSimStats.lpPS++;   // PS minLiq=6000
+    if (mcLiqRatio > ANTI_MANIP_MC_LIQ_RATIO_MAX) gateSimStats.lpRatio++; // unlocked ratio gate
+  }
+
   if (!globalGatesBypass) {
     if (liq < 500) return rej('liqFloor'); // MIN: $500 (was 3k) — absolute floor; raise incrementally
   }
@@ -2753,11 +2859,30 @@ async function pollTelegramCommands() {
               (lp.rcFail > 0 ? `\n  ⚠️ RC API failures: ${lp.rcFail}` : '')
             : '  No coins checked yet this period';
           const stratLine = `BB:${sp.bb} AM:${sp.am} SC:${sp.sc} OR:${sp.or} PS:${sp.ps}`;
+          const gs = gateSimStats;
+          const simTopGlobal = Object.entries({
+            liqFloor:gs.liqFloor, honey:gs.honey, txns:gs.txns, avgT:gs.avgT, ratio:gs.ratio,
+            youngBuy:gs.youngBuy, youngTxns:gs.youngTxns, dead:gs.dead, noAct:gs.noAct,
+            dex:gs.dex, age:gs.age, mom:gs.mom
+          }).filter(([,v]) => v > 0).sort(([,a],[,b]) => b-a).slice(0,8)
+            .map(([k,v]) => `  ${k}: ${v}`).join('\n');
+          const simStratBlock = [
+            `  BB: age:${gs.bbAge} ch24:${gs.bbCh24} ch1:${gs.bbCh1} m5:${gs.bbM5Ch} buy:${gs.bbBuy} txns:${gs.bbTxns} liq:${gs.bbLiq}`,
+            `  AM: m5:${gs.amM5Ch} buy:${gs.amBuy} txns:${gs.amTxns} liq:${gs.amLiq} ch1:${gs.amCh1}`,
+            `  SC: age:${gs.scAge} m5:${gs.scM5Ch} buy:${gs.scBuy} txns:${gs.scTxns} liq:${gs.scLiq} avgT:${gs.scAvgT}`,
+            `  OR: age:${gs.orAge} ch24:${gs.orCh24} ch1:${gs.orCh1} buy:${gs.orBuy} liq:${gs.orLiq} b24:${gs.orBuys24}`,
+            `  PS: age:${gs.psAge} ch1:${gs.psCh1} m5:${gs.psM5Ch} buy:${gs.psBuy} txns:${gs.psTxns} liq:${gs.psLiq}`,
+          ].join('\n');
+          const simLpBlock = `  BB:${gs.lpBB} AM:${gs.lpAM} SC:${gs.lpSC} OR:${gs.lpOR} PS:${gs.lpPS} ratio:${gs.lpRatio}`;
           await sendTelegram(
             `📊 *GATE STATS* (since last heartbeat)\n\n` +
             `*Global gate* — ${total} processed\n${allRej || '  (no rejections recorded)'}\n\n` +
             `*LP / RugCheck gate*\n${lpStatus}\n\n` +
-            `*Strategies matched:* ${stratLine}`
+            `*Strategies matched:* ${stratLine}\n\n` +
+            `🔬 *Sim (${gs.total} coins — bypass-independent)*\n` +
+            `*Global independent blocks:*\n${simTopGlobal || '  (none)'}\n\n` +
+            `*LP liq simulation:*\n${simLpBlock}\n\n` +
+            `*Strategy filter simulation:*\n${simStratBlock}`
           );
         }
       }
@@ -4972,12 +5097,36 @@ async function scanForEntries() {
         `Strats: ${stratLine}`
       : '';
 
+    // ── Build gate simulation section ─────────────────────────────────────
+    const sim = gateSimStats;
+    const simGlobalTopRej = Object.entries({
+      liqFloor:sim.liqFloor, honey:sim.honey, txns:sim.txns, avgT:sim.avgT, ratio:sim.ratio,
+      youngBuy:sim.youngBuy, youngTxns:sim.youngTxns, dead:sim.dead, noAct:sim.noAct,
+      dex:sim.dex, age:sim.age, mom:sim.mom
+    }).filter(([,v]) => v > 0).sort(([,a],[,b]) => b-a).slice(0,5)
+      .map(([k,v]) => `${k}:${v}`).join(' ');
+    const simStratLines = [
+      `BB: age:${sim.bbAge} ch24:${sim.bbCh24} ch1:${sim.bbCh1} m5:${sim.bbM5Ch} buy:${sim.bbBuy} txns:${sim.bbTxns} liq:${sim.bbLiq}`,
+      `AM: m5:${sim.amM5Ch} buy:${sim.amBuy} txns:${sim.amTxns} liq:${sim.amLiq} ch1:${sim.amCh1}`,
+      `SC: age:${sim.scAge} m5:${sim.scM5Ch} buy:${sim.scBuy} txns:${sim.scTxns} liq:${sim.scLiq} avgT:${sim.scAvgT}`,
+      `OR: age:${sim.orAge} ch24:${sim.orCh24} ch1:${sim.orCh1} buy:${sim.orBuy} liq:${sim.orLiq} b24:${sim.orBuys24}`,
+      `PS: age:${sim.psAge} ch1:${sim.psCh1} m5:${sim.psM5Ch} buy:${sim.psBuy} txns:${sim.psTxns} liq:${sim.psLiq}`,
+    ].join('\n');
+    const simLpLine = `BB:${sim.lpBB} AM:${sim.lpAM} SC:${sim.lpSC} OR:${sim.lpOR} PS:${sim.lpPS} ratio:${sim.lpRatio}`;
+    const simSection = sim.total > 0
+      ? `\n\n🔬 *Sim (${sim.total} coins — bypass-independent)*\n` +
+        `Global: ${simGlobalTopRej || 'no blocks'}\n` +
+        `LP liq: ${simLpLine}\n` +
+        simStratLines
+      : '';
+
     await sendTelegram(
       `🔍 *Scan #${scanCount}*${paused}${halted}\n` +
       `Mode: *${mode}* · Open: ${openPositions.length}/${MAX_POSITIONS}\n` +
       `${candidates.length} cands→${matches.length} scored→${lockedMatches.length} LP OK→${qualityMatches.length} quality\n` +
       `${nearMissCount} near-misses (score ${MIN_SCORE - 8}-${scoreThreshold - 1})` +
       gateSection +
+      simSection +
       (globalGatesBypass || lpLockBypass || !strategyFiltersActive
         ? `\n\n🔓 *OPEN MODE ACTIVE*` +
           (globalGatesBypass      ? `\n⚠️ Global gates: BYPASSED (/skipgates to restore)`  : '') +
@@ -4991,6 +5140,7 @@ async function scanForEntries() {
     Object.keys(gatePeriodStats).forEach(k => { gatePeriodStats[k] = 0; });
     Object.keys(lpPeriodStats).forEach(k => { lpPeriodStats[k] = 0; });
     Object.keys(stratPeriodStats).forEach(k => { stratPeriodStats[k] = 0; });
+    Object.keys(gateSimStats).forEach(k => { gateSimStats[k] = 0; });
   }
 
   const usedThisScan = new Set();
