@@ -1618,10 +1618,16 @@ async function processManualQueue() {
           isManual: true,
         });
 
-        // Nov-12: null check — enterPosition returns null in real mode with no wallet
+        // null = real mode with no wallet configured for this chain
         if (!pos) {
           await doc.ref.update({ status: 'skipped', reason: 'no_wallet', processedAt: Date.now() });
           console.log(`[MANUAL] ${coin.symbol} skipped — no wallet for chain ${coin.chain}`);
+          await sendTelegram(
+            `⚠️ *MANUAL ENTRY SKIPPED*\n` +
+            `*${coin.symbol}*\n` +
+            `Reason: no wallet configured for chain \`${coin.chain}\`\n` +
+            `_Switch to Paper mode or fund a wallet for this chain._`
+          );
           continue;
         }
 
@@ -1637,6 +1643,12 @@ async function processManualQueue() {
       } catch (e) {
         await doc.ref.update({ status: 'failed', error: e.message, processedAt: Date.now() });
         console.error(`[MANUAL] Failed for ${item.address}: ${e.message}`);
+        // Always notify — user queued this manually and deserves to know it failed
+        await sendTelegram(
+          `❌ *MANUAL ENTRY FAILED*\n` +
+          `\`${item.address.slice(0, 8)}…${item.address.slice(-6)}\`\n` +
+          `Reason: ${e.message}`
+        ).catch(() => {});
       }
     }
   } catch (e) { console.error('[MANUAL QUEUE]', e.message); }
