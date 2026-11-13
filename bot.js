@@ -164,8 +164,14 @@ const ALLOWED_DEXES = new Set([
   'meteora',
   'orca',          // Solana AMM — confirmed blocked in logs (should be allowed)
 ]);
-// ─── DIAGNOSTIC GATE COUNTERS (temporary — remove once root cause identified) ─
-const gateStats = { total:0, chain:0, liqFloor:0, price:0, honey:0, txns:0, avgT:0, ratio:0, young:0, dead:0, noAct:0, dex:0, age:0, mom:0, live:0, noMatch:0 };
+// ─── DIAGNOSTIC GATE COUNTERS ────────────────────────────────────────────────
+// gateStats: per-scan (console only); gatePeriodStats: 20-scan window (sent to Telegram on heartbeat)
+const gateStats       = { total:0, chain:0, liqFloor:0, price:0, honey:0, txns:0, avgT:0, ratio:0, young:0, dead:0, noAct:0, dex:0, age:0, mom:0, live:0, noMatch:0 };
+const gatePeriodStats = { total:0, chain:0, liqFloor:0, price:0, honey:0, txns:0, avgT:0, ratio:0, young:0, dead:0, noAct:0, dex:0, age:0, mom:0, live:0, noMatch:0 };
+// LP gate stats — per 20-scan period
+const lpPeriodStats   = { checked:0, passed:0, failRisk:0, failLiq:0, failRatio:0, rcFail:0 };
+// Strategy distribution — how many matched each strategy per period
+const stratPeriodStats = { bb:0, am:0, sc:0, or:0, ps:0 };
 
 // ─── DYNAMIC POSITION SIZING ─────────────────────────────────────────────────
 // Position scales with liquidity (1% of pool ≈ <1% price impact) and market cap.
@@ -2732,6 +2738,37 @@ async function pollTelegramCommands() {
         }
       }
 
+      // ── /gates — on-demand gate diagnostic ──────────────────────────────────────
+      if (text === '/gates') {
+        const gp = gatePeriodStats;
+        const lp = lpPeriodStats;
+        const sp = stratPeriodStats;
+        const total = gp.total;
+        if (total === 0 && lp.checked === 0) {
+          await sendTelegram(`📊 *GATE STATS* — No data yet\n\n_Stats accumulate between heartbeats (every 20 scans ≈ 5 min). Check back after the next scan cycle._`);
+        } else {
+          const allRej = Object.entries({
+            dex:gp.dex, mom:gp.mom, dead:gp.dead, young:gp.young,
+            noMatch:gp.noMatch, ratio:gp.ratio, avgT:gp.avgT,
+            noAct:gp.noAct, age:gp.age, live:gp.live,
+            honey:gp.honey, txns:gp.txns, liqFloor:gp.liqFloor,
+            chain:gp.chain, price:gp.price
+          }).filter(([,v]) => v > 0).sort(([,a],[,b]) => b-a)
+            .map(([k,v]) => `  ${k}: ${v}`).join('\n');
+          const lpStatus = lp.checked > 0
+            ? `Checked: ${lp.checked} → Passed: ${lp.passed}\n  Fail risk: ${lp.failRisk} | Fail liq: ${lp.failLiq} | Fail ratio: ${lp.failRatio}` +
+              (lp.rcFail > 0 ? `\n  ⚠️ RC API failures: ${lp.rcFail}` : '')
+            : '  No coins checked yet this period';
+          const stratLine = `BB:${sp.bb} AM:${sp.am} SC:${sp.sc} OR:${sp.or} PS:${sp.ps}`;
+          await sendTelegram(
+            `📊 *GATE STATS* (since last heartbeat)\n\n` +
+            `*Global gate* — ${total} processed\n${allRej || '  (no rejections recorded)'}\n\n` +
+            `*LP / RugCheck gate*\n${lpStatus}\n\n` +
+            `*Strategies matched:* ${stratLine}`
+          );
+        }
+      }
+
       // ── /skipgates — toggle global filter bypass ────────────────────────────────
       if (text === '/skipgates') {
         globalGatesBypass = !globalGatesBypass;
@@ -2895,6 +2932,7 @@ async function pollTelegramCommands() {
           `/status — P&L, mode, balance\n` +
           `/stats — daily revenue: profit, losses, fees, net\n` +
           `/watching — coins being monitored (near threshold)\n` +
+          `/gates — gate rejection breakdown (since last heartbeat)\n` +
           `/hidden — view backgrounded positions (dormant slots)\n` +
           `/mode paper — switch to paper trading\n` +
           `/mode real — switch to real (Solana) trading\n` +
@@ -3451,10 +3489,13 @@ async function filterByLpLock(matches) {
 
     // ── RugCheck — LP lock + risk score (Solana) ─────────────────────────
     const rc = await checkRugCheck(coin.addr, coin.symbol);
+    lpPeriodStats.checked++;
 
     if (!rc) {
       // RugCheck unavailable — fail open
       console.log(`[RUGCHECK] ⚠️ ${coin.symbol} — RugCheck unavailable, allowing through`);
+      lpPeriodStats.rcFail++;
+      lpPeriodStats.passed++; // fail-open counts as passed
       lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
       passed.add(coin.addr);
       continue;
@@ -3465,6 +3506,7 @@ async function filterByLpLock(matches) {
     const maxRiskScore = coin.strategy?.rugCheckMaxRisk ?? 50; // Nov-13: 60→50 — stricter locked-LP default
     if (rc.riskScore > maxRiskScore) {
       console.log(`[RUGCHECK] ❌ ${coin.symbol} — risk score ${rc.riskScore}/100 (>${maxRiskScore}), rejected`);
+      lpPeriodStats.failRisk++;
       lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
       continue;
     }
@@ -3472,6 +3514,7 @@ async function filterByLpLock(matches) {
     // ── 2: LP locked — pass ─────────────────────────────────────────────
     if (rc.lpLocked) {
       console.log(`[RUGCHECK] ✅ ${coin.symbol} — LP locked, risk ${rc.riskScore}/100, PASSED`);
+      lpPeriodStats.passed++;
       lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
       passed.add(coin.addr);
       continue;
@@ -3483,6 +3526,7 @@ async function filterByLpLock(matches) {
     // Nov-11: applies to ANY strategy, not just PS (all strategies compete freely).
     if (coin.isPumpFun) {
       console.log(`[RUGCHECK] ✅ ${coin.symbol} — pump.fun bonding-curve (${coin.strategy?.label}), risk ${rc.riskScore}/100, PASSED`);
+      lpPeriodStats.passed++;
       lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
       passed.add(coin.addr);
       continue;
@@ -3498,10 +3542,12 @@ async function filterByLpLock(matches) {
       const maxUnlockedPS = 25; // Nov-13: 40→25 — tighter PumpSwap gate
       if (rc.riskScore <= maxUnlockedPS) {
         console.log(`[RUGCHECK] ✅ ${coin.symbol} — PumpSwap graduated, risk ${rc.riskScore}/100, PASSED`);
+        lpPeriodStats.passed++;
         lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
         passed.add(coin.addr);
       } else {
         console.log(`[RUGCHECK] ❌ ${coin.symbol} — PumpSwap risk ${rc.riskScore}/100 > ${maxUnlockedPS}, rejected`);
+        lpPeriodStats.failRisk++;
         lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
       }
       continue;
@@ -3520,16 +3566,20 @@ async function filterByLpLock(matches) {
 
     if (rc.riskScore > maxUnlockedRisk) {
       console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked, risk ${rc.riskScore}/100 (>${maxUnlockedRisk}), rejected`);
+      lpPeriodStats.failRisk++;
       lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
     } else if (!liqOk) {
       console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked + liq $${coin.liq.toFixed(0)} < $${strictLiq} strict floor, rejected`);
+      lpPeriodStats.failLiq++;
       lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
     } else if (!ratioOk) {
       console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked + MC/Liq ${(coin.mcLiqRatio||0).toFixed(1)}× > ${strictRatio}×, rejected`);
+      lpPeriodStats.failRatio++;
       lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
     } else {
-      // Risk ≤ 40, liq OK, ratio OK — pass without requiring LP lock
+      // Risk ≤ maxUnlockedRisk, liq OK, ratio OK — pass without requiring LP lock
       console.log(`[RUGCHECK] ✅ ${coin.symbol} — LP unlocked but risk ${rc.riskScore}/100 ≤ ${maxUnlockedRisk}, liq $${coin.liq.toFixed(0)}, PASSED`);
+      lpPeriodStats.passed++;
       lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
       passed.add(coin.addr);
     }
@@ -4813,6 +4863,10 @@ async function scanForEntries() {
         const price = parseFloat(pair.priceUsd || 0);
         const m5Sells = (result.m5Txns || 0) - (result.m5Buys || 0);
         recordPriceHistory(result.addr, price, result.score, result.m5Vol || 0, result.m5Buys || 0, Math.max(0, m5Sells));
+        // Track strategy distribution for period stats
+        const _stratKeys = ['bb','am','sc','or','ps'];
+        const _sk = _stratKeys[result.strategy.id];
+        if (_sk !== undefined) stratPeriodStats[_sk]++;
         matches.push(result);
       } else {
         nearMissCount++;
@@ -4841,6 +4895,8 @@ async function scanForEntries() {
     ].filter(Boolean).join(' + ');
     const bypassPrefix = bypassNote ? ` [${bypassNote}]` : '';
     console.log(`[SCAN-DIAG]${bypassPrefix} dex:${g.dex} mom:${g.mom} dead:${g.dead} young:${g.young} ratio:${g.ratio} avgT:${g.avgT} noAct:${g.noAct} noMatch:${g.noMatch} | honey:${g.honey} txns:${g.txns} chain:${g.chain} liqFloor:${g.liqFloor} price:${g.price} age:${g.age} live:${g.live} | TOTAL:${g.total}`);
+    // Accumulate into period stats before resetting (period stats are flushed to Telegram on heartbeat)
+    Object.keys(gateStats).forEach(k => { gatePeriodStats[k] = (gatePeriodStats[k] || 0) + gateStats[k]; });
     Object.keys(gateStats).forEach(k => { gateStats[k] = 0; });
   }
 
@@ -4896,11 +4952,39 @@ async function scanForEntries() {
     const mode = (cfg2.tradingMode || 'paper').toUpperCase();
     const paused = cfg2.running === false ? ' ⏸PAUSED' : '';
     const halted = dayHaltedToday ? ' 🚨HALTED' : '';
+
+    // ── Build gate diagnostic section ────────────────────────────────────
+    const gp = gatePeriodStats;
+    const lp = lpPeriodStats;
+    const sp = stratPeriodStats;
+    const totalGlobal = gp.total;
+
+    // Top rejections (sorted by count, top 5)
+    const topRej = Object.entries({ dex:gp.dex, mom:gp.mom, dead:gp.dead, young:gp.young,
+      noMatch:gp.noMatch, ratio:gp.ratio, avgT:gp.avgT, noAct:gp.noAct,
+      age:gp.age, live:gp.live, honey:gp.honey, txns:gp.txns, liqFloor:gp.liqFloor })
+      .filter(([,v]) => v > 0).sort(([,a],[,b]) => b-a).slice(0,5)
+      .map(([k,v]) => `${k}:${v}`).join(' ');
+
+    const stratLine = `BB:${sp.bb} AM:${sp.am} SC:${sp.sc} OR:${sp.or} PS:${sp.ps}`;
+
+    const lpLine = lp.checked > 0
+      ? `LP: ${lp.checked} chk→${lp.passed} pass | risk:${lp.failRisk} liq:${lp.failLiq} ratio:${lp.failRatio}${lp.rcFail > 0 ? ` ⚠️rc-fail:${lp.rcFail}` : ''}`
+      : '';
+
+    const gateSection = totalGlobal > 0 || lp.checked > 0
+      ? `\n\n📊 *Gates (${scanCount - 19}–${scanCount})*\n` +
+        (totalGlobal > 0 ? `Global: ${totalGlobal} processed${topRej ? ` | ${topRej}` : ' | no rejections'}\n` : '') +
+        (lpLine ? lpLine + '\n' : '') +
+        `Strats: ${stratLine}`
+      : '';
+
     await sendTelegram(
       `🔍 *Scan #${scanCount}*${paused}${halted}\n` +
-      `Mode: *${mode}* · Open positions: ${openPositions.length}/${MAX_POSITIONS}\n` +
-      `${candidates.length} candidates → ${matches.length} matched → ${lockedMatches.length} LP OK → ${qualityMatches.length} quality\n` +
+      `Mode: *${mode}* · Open: ${openPositions.length}/${MAX_POSITIONS}\n` +
+      `${candidates.length} cands→${matches.length} scored→${lockedMatches.length} LP OK→${qualityMatches.length} quality\n` +
       `${nearMissCount} near-misses (score ${MIN_SCORE - 8}-${scoreThreshold - 1})` +
+      gateSection +
       (globalGatesBypass || lpLockBypass || !strategyFiltersActive
         ? `\n\n🔓 *OPEN MODE ACTIVE*` +
           (globalGatesBypass      ? `\n⚠️ Global gates: BYPASSED (/skipgates to restore)`  : '') +
@@ -4909,6 +4993,11 @@ async function scanForEntries() {
           `\n_/openmode to restore all at once_`
         : '')
     ).catch(() => {});
+
+    // Reset period stats after sending heartbeat
+    Object.keys(gatePeriodStats).forEach(k => { gatePeriodStats[k] = 0; });
+    Object.keys(lpPeriodStats).forEach(k => { lpPeriodStats[k] = 0; });
+    Object.keys(stratPeriodStats).forEach(k => { stratPeriodStats[k] = 0; });
   }
 
   const usedThisScan = new Set();
