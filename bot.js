@@ -146,10 +146,10 @@ const SL_TIGHTEN_PCT         = 0.85;           // after grace, if still below en
 // ─── ANTI-MANIPULATION THRESHOLDS ────────────────────────────────────────────
 // Applied globally in detectStrategy() before any strategy-specific scoring.
 // Catches bot farms (micro-trade spam), thin-pool manipulation, and wash trading.
-const ANTI_MANIP_AVG_TRADE_FLOOR  = 8;    // global: avg trade must be ≥$8 (kills $0.01–$2 spam; lowered for slow markets)
-const ANTI_MANIP_M5_TXNS_MAX      = 200;  // global: >200 txns in 5min = 40/min = bots
-const ANTI_MANIP_MC_LIQ_RATIO_MAX        = 30;   // global: mc/liq > 30× = thin pool, easy to manipulate (enforced for UNLOCKED LP)
-const ANTI_MANIP_MC_LIQ_RATIO_MAX_LOCKED = 40;   // relaxed when LP is confirmed locked — dev can't drain the pool
+const ANTI_MANIP_AVG_TRADE_FLOOR  = 1;    // MIN: ≥$1 (was 8) — set to floor for baseline calibration
+const ANTI_MANIP_M5_TXNS_MAX      = 1000; // MIN: >1000 txns (was 200) — essentially disabled; raise incrementally
+const ANTI_MANIP_MC_LIQ_RATIO_MAX        = 30;   // global: mc/liq > 30× = thin pool (unlocked LP — unchanged)
+const ANTI_MANIP_MC_LIQ_RATIO_MAX_LOCKED = 200;  // MIN: 200× (was 40) — essentially disabled; raise incrementally
 const ANTI_MANIP_SC_AVG_TRADE     = 15;   // Surge Catch own gate: $15 filters micro-spam while allowing young coin activity; SC bypasses the global $20 gate
 const ANTI_MANIP_SC_TXNS_MAX      = 150;  // Surge Catch only: 30/min ceiling
 // ANTI_MANIP_SC_MC_LIQ_MAX removed Nov-10 — SC now uses ANTI_MANIP_MC_LIQ_RATIO_MAX_LOCKED (40×) same as other strategies
@@ -440,7 +440,7 @@ function detectStrategy(pair, openStrategies) {
   const rej = gate => { gateStats[gate]++; return null; };
   if (!isSolana && !isEVM) return rej('chain');
   if (!globalGatesBypass) {
-    if (liq < 3000) return rej('liqFloor'); // Nov-13: 10k→3k — $10k was blocking 75-80% of all coins; real liq floors are in LP gate per strategy
+    if (liq < 500) return rej('liqFloor'); // MIN: $500 (was 3k) — absolute floor; raise incrementally
   }
   if (price <= 0)  return rej('price');  // always keep — zero price breaks arithmetic
   if (!globalGatesBypass) {
@@ -472,16 +472,13 @@ function detectStrategy(pair, openStrategies) {
   if (!globalGatesBypass && ageDays < 1) {
     // avgTrade gate: $20 for all strategies except SC and pump.fun→S5
     // SC has its own $15 gate; pump.fun coins for S5 use the global floor ($8) only.
-    if (!scIsOpen && !s5OpenForYoung && avgTrade !== null && avgTrade < 12) return rej('young'); // Nov-13: 20→12 — $20 was blocking most pump.fun ecosystem coins
+    if (!scIsOpen && !s5OpenForYoung && avgTrade !== null && avgTrade < 1) return rej('young'); // MIN: $1 (was 12) — essentially disabled; raise incrementally
     if (s5OpenForYoung) {
-      // Nov-11: aligned to PS's current thresholds (was 55/10, PS now accepts 50/6)
-      if (buyPct < 50) return rej('young');  // S5 minBuyPct (updated)
-      if (m5Txns  <  6) return rej('young'); // S5 minM5Txns (updated)
+      if (buyPct < 10) return rej('young');  // MIN: 10% (was 50)
+      if (m5Txns  <  1) return rej('young'); // MIN: 1 txn (was 6)
     } else {
-      // Nov-11: lowered to match the most lenient strategy thresholds across all open strategies
-      // (was 60/25 — far stricter than any strategy's own filter, blocking most PumpSwap young coins)
-      if (buyPct < 50)  return rej('young'); // matches OR/PS minBuyPct (50)
-      if (m5Txns  <  6) return rej('young'); // matches PS minM5Txns (6, the lowest)
+      if (buyPct < 10)  return rej('young'); // MIN: 10% (was 50)
+      if (m5Txns  <  1) return rej('young'); // MIN: 1 txn (was 6)
     }
   }
 
@@ -509,16 +506,16 @@ function detectStrategy(pair, openStrategies) {
   if (!globalGatesBypass) {
     if (ch1 === null) {
       const s5OpenDead = openStrategies.some(st => st.id === 4);
-      const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 0.5) // Nov-13: 2→0.5 — aligns with AM minM5Ch; unlocks AM candidates
-                || (m5Ch >= 3)
-                || (s5OpenDead && ageMinutes < 60 && m5Ch >= -5);        // Nov-13: PS exemption — enters on pullbacks, ch1 often null for <1h coins
+      const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= -20) // MIN: -20% (was 0.5)
+                || (m5Ch >= -20)                                          // MIN: -20% (was 3)
+                || (s5OpenDead && ageMinutes < 60 && m5Ch >= -20);       // MIN: -20% (was -5)
       if (!pass) return rej('dead');
     } else if (Math.abs(ch1) < 0.5) {
       const s5OpenDead = openStrategies.some(st => st.id === 4);
-      const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 0.5) // Nov-13: 2→0.5 — aligns with AM minM5Ch
-                || (ch24 <= -5 && buyPct >= 50 && liq >= 5000)           // bottom bounce stabilising
-                || (m5Ch >= 3)                                            // actively surging now
-                || (s5OpenDead && ageMinutes < 60 && m5Ch >= -5);        // Nov-13: PS exemption — pullback entry
+      const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= -20) // MIN: -20% (was 0.5)
+                || (ch24 <= 0 && buyPct >= 10 && liq >= 500)             // MIN: ch24≤0, buyPct≥10%, liq≥$500
+                || (m5Ch >= -20)                                          // MIN: -20% (was 3)
+                || (s5OpenDead && ageMinutes < 60 && m5Ch >= -20);       // MIN: -20% (was -5)
       if (!pass) return rej('dead');
     }
 
@@ -561,20 +558,16 @@ function detectStrategy(pair, openStrategies) {
     // it can have a slightly negative m5 as the coin is stabilising. Allow m5Ch ≥ -3%.
     // Strategy 5 (Pump Spec) enters on pullbacks — allow m5Ch down to -5% when s5 is open.
     // All other strategies require m5Ch ≥ -1% (no meaningful decline allowed).
-    // Nov-13: BB extended from -1% to -3% — bounce forming coins often show slight negative m5
-    if (m5Ch !== null && m5Ch < -1) {
-      const s5Open = openStrategies.some(st => st.id === 4);
-      const bbOpen = openStrategies.some(st => st.id === 0);
-      if (s5Open && m5Ch >= -5) { /* PS exemption — pullback entry allowed */ }
-      else if (bbOpen && m5Ch >= -3) { /* BB exemption Nov-13: -1→-3 — bounce forming */ }
-      else return rej('mom'); // declining too hard — skip
+    // MIN: -20% threshold (was -1%) — essentially disabled; raise incrementally
+    if (m5Ch !== null && m5Ch < -20) {
+      return rej('mom'); // catastrophic decline only — raise threshold incrementally
     }
 
     const liveHist = priceHistory.get(addr) || [];
     if (liveHist.length >= 3) {
       const newest = liveHist[liveHist.length - 1]?.price;
       const older  = liveHist[liveHist.length - 3]?.price; // ~6 seconds ago
-      if (newest && older && newest < older * 0.995) return rej('live'); // price declining in live feed — Nov-13: 0.999→0.995 (allow up to 0.5% tick dip; 0.1% was too hair-trigger)
+      if (newest && older && newest < older * 0.90) return rej('live'); // MIN: 10% dip allowed (was 0.5%) — essentially disabled; raise incrementally
     }
   } // end globalGatesBypass check
 
