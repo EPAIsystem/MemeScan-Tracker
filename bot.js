@@ -113,7 +113,7 @@ const priceHistory  = new Map(); // addr → [{price, score, ts}, ...]
 // SC rug detection: 15s rolling price window per live position
 const scPriceWindow = new Map(); // addr → [{price, ts}, ...]
 const scRugSignals  = new Map(); // addr → number of rug signals fired this session
-const PRICE_HIST_MAX    = 40;   // keep last 40 scan snapshots per coin (~10 min of data at 15s scans)
+const PRICE_HIST_MAX    = 300;  // keep last 300 scan snapshots per coin (~75 min at 15s scans; needed for TA indicators)
 const PRICE_HIST_TREND  = 3;    // consecutive rising points = confirmed uptrend
 const PRICE_HIST_REBOUND_PCT = 0.05; // 5% recovery from dip = rebound confirmed
 
@@ -572,7 +572,8 @@ function detectStrategy(pair, openStrategies) {
     chain:  pair.chainId || 'unknown',
     dexUrl: `https://dexscreener.com/${pair.chainId}/${addr}`,
     isPumpFun,
-    dexId,  // Nov-12: propagate dexId so filterByLpLock gate 3.5 (PumpSwap pass-through) can read it
+    dexId,          // Nov-12: propagate dexId so filterByLpLock gate 3.5 (PumpSwap pass-through) can read it
+    pairAddress: pair.pairAddress || '', // pair/pool address — used by GeckoTerminal OHLCV fetch
   };
 
   // Try each open strategy, return first match with highest confidence
@@ -2058,6 +2059,264 @@ async function processMomentumReentry(positions) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// ─── TECHNICAL ANALYSIS SCORING ──────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Adds up to +20 bonus points to a coin's base score before the MIN_SCORE
+// threshold check in scanForEntries.  Never a hard block — it only helps.
+//
+//   RSI(14)              +8 / +5 / +2 / 0
+//   EMA(9) > EMA(21)     +5 / +2 / 0
+//   Bollinger position   +4 / +2 / 0
+//   Volume trend         +3 / +1 / 0
+//   ──────────────────────────────────
+//   Max bonus             +20
+//
+// Candle source (chosen per strategy / coin age):
+//   PS (id=4)              raw 15-s ticks (1 tick = 1 virtual candle)
+//   SC (id=2)              1-min virtual candles (4 ticks)
+//   AM <1h (id=1)          1-min virtual candles
+//   AM 1h–6h (id=1)        5-min virtual candles (20 ticks)
+//   AM ≥6h, BB, OR         GeckoTerminal OHLCV (15-min or 1-h), cached 60 s
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build virtual OHLCV candles from priceHistory ticks.
+ * resolution = number of 15-s ticks to aggregate into one candle.
+ * Returns array of {ts, open, high, low, close, vol, buys, sells} oldest-first.
+ */
+function buildVirtualCandles(addr, resolution) {
+  const hist = priceHistory.get(addr) || [];
+  if (hist.length < 2) return [];
+  const candles = [];
+  for (let i = 0; i < hist.length; i += resolution) {
+    const slice  = hist.slice(i, i + resolution);
+    const prices = slice.map(h => h.price).filter(p => p > 0);
+    if (prices.length === 0) continue;
+    const vol   = slice.reduce((s, h) => s + (h.vol   || 0), 0);
+    const buys  = slice.reduce((s, h) => s + (h.buys  || 0), 0);
+    const sells = slice.reduce((s, h) => s + (h.sells || 0), 0);
+    candles.push({
+      ts:    slice[0].ts,
+      open:  prices[0],
+      high:  Math.max(...prices),
+      low:   Math.min(...prices),
+      close: prices[prices.length - 1],
+      vol, buys, sells,
+    });
+  }
+  return candles;
+}
+
+/**
+ * Fetch OHLCV candles from GeckoTerminal (CoinGecko Onchain API).
+ * timeframe : 'minute' | 'hour'
+ * aggregate : e.g. 15 for 15-min candles
+ * limit     : up to 1000, default 50
+ * Returns array of {ts, open, high, low, close, vol} oldest-first, or [].
+ */
+async function fetchOHLCV(pairAddress, network, timeframe, aggregate, limit = 50) {
+  if (!pairAddress) return [];
+  try {
+    const path = `/api/v3/onchain/networks/${network}/pools/${pairAddress}/ohlcv/${timeframe}?aggregate=${aggregate}&limit=${limit}`;
+    const r = await httpGet('api.coingecko.com', path);
+    if (r.status !== 200) return [];
+    const d    = JSON.parse(r.body);
+    const list = d?.data?.attributes?.ohlcv_list || [];
+    // API returns newest-first → reverse to oldest-first for indicator maths
+    return list.slice().reverse().map(c => ({
+      ts:    (c[0] || 0) * 1000,
+      open:  parseFloat(c[1]) || 0,
+      high:  parseFloat(c[2]) || 0,
+      low:   parseFloat(c[3]) || 0,
+      close: parseFloat(c[4]) || 0,
+      vol:   parseFloat(c[5]) || 0,
+    })).filter(c => c.close > 0);
+  } catch(e) {
+    return [];
+  }
+}
+
+/**
+ * Wilder-smoothed RSI (default period 14).
+ * candles must be oldest-first with a .close field.
+ * Returns the RSI value (0–100) or null if not enough data.
+ */
+function computeRSI(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const chg = candles[i].close - candles[i - 1].close;
+    if (chg > 0) gains  += chg;
+    else         losses -= chg;
+  }
+  let avgGain = gains  / period;
+  let avgLoss = losses / period;
+  for (let i = period + 1; i < candles.length; i++) {
+    const chg  = candles[i].close - candles[i - 1].close;
+    const gain = chg > 0 ? chg : 0;
+    const loss = chg < 0 ? -chg : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+  }
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
+}
+
+/**
+ * Exponential Moving Average — returns final EMA value or null.
+ */
+function computeEMA(candles, period) {
+  if (candles.length < period) return null;
+  const k   = 2 / (period + 1);
+  let   ema = candles.slice(0, period).reduce((s, c) => s + c.close, 0) / period;
+  for (let i = period; i < candles.length; i++) {
+    ema = candles[i].close * k + ema * (1 - k);
+  }
+  return ema;
+}
+
+/**
+ * Bollinger Bands (default 20,2).
+ * Returns { upper, middle, lower } using last `period` candles, or null.
+ */
+function computeBollingerBands(candles, period = 20, stdDevMult = 2) {
+  if (candles.length < period) return null;
+  const slice    = candles.slice(-period);
+  const mean     = slice.reduce((s, c) => s + c.close, 0) / period;
+  const variance = slice.reduce((s, c) => s + Math.pow(c.close - mean, 2), 0) / period;
+  const std      = Math.sqrt(variance);
+  return { upper: mean + stdDevMult * std, middle: mean, lower: mean - stdDevMult * std };
+}
+
+/**
+ * Volume trend: compares sum of last `periods` candles vs prior `periods` candles.
+ * Returns 'up' | 'flat' | 'down'.
+ */
+function computeVolumeTrend(candles, periods = 5) {
+  if (candles.length < periods * 2) return 'flat';
+  const recent = candles.slice(-periods).reduce((s, c) => s + (c.vol || 0), 0);
+  const prior  = candles.slice(-periods * 2, -periods).reduce((s, c) => s + (c.vol || 0), 0);
+  if (prior === 0) return recent > 0 ? 'up' : 'flat';
+  const ratio = recent / prior;
+  if (ratio >= 1.2) return 'up';
+  if (ratio <= 0.8) return 'down';
+  return 'flat';
+}
+
+// Cache TA bonuses per token address — avoids re-fetching GeckoTerminal within 60 s
+const taScoreCache = new Map(); // addr → { taBonus, ts }
+const TA_CACHE_TTL = 60_000;   // 60 seconds
+
+/**
+ * Compute TA bonus (0–20 points) for a scan result.
+ * Uses virtual candles (from priceHistory) for fast strategies,
+ * and GeckoTerminal OHLCV for older/slower strategies (BB, OR, AM ≥6h).
+ * Returns the integer bonus (0 when indicators are inconclusive or data is thin).
+ */
+async function computeTAScore(result) {
+  const addr = result.addr;
+
+  // Return cached value if fresh
+  const cached = taScoreCache.get(addr);
+  if (cached && (Date.now() - cached.ts) < TA_CACHE_TTL) return cached.taBonus;
+
+  const stratId    = (result.strategy?.id ?? result.strategyId ?? -1);
+  const ageMinutes = result.ageMinutes || (result.ageDays || 0) * 1440 || 60;
+  const pairAddr   = result.pairAddress || '';
+  const network    = (result.chain || 'solana').toLowerCase();
+
+  let candles = [];
+  try {
+    if (stratId === 4) {
+      // PS — raw 15-s ticks, 1 tick per candle
+      candles = buildVirtualCandles(addr, 1);
+    } else if (stratId === 2 || (stratId === 1 && ageMinutes < 60)) {
+      // SC or AM new (<1h) — 1-min candles (4 ticks of 15s)
+      candles = buildVirtualCandles(addr, 4);
+    } else if (stratId === 1 && ageMinutes < 360) {
+      // AM mid (1h–6h) — 5-min candles (20 ticks)
+      candles = buildVirtualCandles(addr, 20);
+    } else if (stratId === 1 || stratId === 0) {
+      // AM ≥6h or BB — GeckoTerminal 15-min candles; fallback to virtual if sparse
+      if (pairAddr) {
+        candles = await fetchOHLCV(pairAddr, network, 'minute', 15, 50);
+      }
+      if (candles.length < 5) candles = buildVirtualCandles(addr, 20); // fallback
+    } else if (stratId === 3) {
+      // OR — GeckoTerminal 1-h candles; fallback to virtual
+      if (pairAddr) {
+        candles = await fetchOHLCV(pairAddr, network, 'hour', 1, 50);
+      }
+      if (candles.length < 5) candles = buildVirtualCandles(addr, 80); // ~20-min per candle
+    } else {
+      // Unknown strategy — 1-min virtual candles
+      candles = buildVirtualCandles(addr, 4);
+    }
+  } catch(e) {
+    candles = [];
+  }
+
+  // Need at least 5 candles to do anything meaningful
+  if (candles.length < 5) {
+    taScoreCache.set(addr, { taBonus: 0, ts: Date.now() });
+    return 0;
+  }
+
+  let bonus = 0;
+  const price = candles[candles.length - 1].close;
+
+  // ── RSI (up to +8) ─────────────────────────────────────────────────────────
+  const rsi = computeRSI(candles, 14);
+  if (rsi !== null) {
+    if      (rsi >= 50 && rsi <= 70) bonus += 8; // ideal momentum zone — trending up, not overbought
+    else if (rsi >= 40 && rsi <  50) bonus += 5; // building momentum
+    else if (rsi >= 70 && rsi <  80) bonus += 2; // strong but approaching overbought
+    else if (rsi >= 30 && rsi <  40) bonus += 2; // oversold recovery potential (BB zone)
+    // rsi < 30 (deeply oversold, may keep falling) or >= 80 (overbought): no bonus
+  }
+
+  // ── EMA alignment (up to +5) ───────────────────────────────────────────────
+  const ema9  = computeEMA(candles, 9);
+  const ema21 = computeEMA(candles, 21);
+  if (ema9 !== null && ema21 !== null && price > 0) {
+    if      (ema9 > ema21 && price > ema9)  bonus += 5; // bullish: price above fast EMA above slow EMA
+    else if (price > ema21)                 bonus += 2; // price above at least the slow EMA
+  } else if (ema9 !== null && price > 0) {
+    if (price > ema9) bonus += 2; // only fast EMA available (not enough candles for ema21)
+  }
+
+  // ── Bollinger Bands position (up to +4) ────────────────────────────────────
+  const bb = computeBollingerBands(candles, 20, 2);
+  if (bb !== null && price > 0) {
+    const bbRange = bb.upper - bb.lower;
+    if (bbRange > 0) {
+      const pctInBand = (price - bb.lower) / bbRange; // 0 = at lower band, 1 = at upper band
+      if      (pctInBand >= 0.5 && pctInBand <= 0.8) bonus += 4; // upper half but not at extreme — healthy trend
+      else if (pctInBand >= 0.2 && pctInBand <  0.5) bonus += 2; // lower half — potential bounce
+      // near lower band (<0.2) or near upper band (>0.8): no bonus
+    }
+  }
+
+  // ── Volume trend (up to +3) ─────────────────────────────────────────────────
+  const volTrend = computeVolumeTrend(candles, 5);
+  if      (volTrend === 'up')   bonus += 3;
+  else if (volTrend === 'flat') bonus += 1;
+  // volume declining: no bonus
+
+  const taBonus = Math.min(20, bonus); // cap at +20
+
+  if (taBonus > 0) {
+    const bbPct = bb ? (((price - bb.lower) / (bb.upper - bb.lower)) * 100).toFixed(0) + '%' : 'n/a';
+    console.log(`[TA] ${result.symbol} +${taBonus}pts | RSI:${rsi?.toFixed(0) ?? 'n/a'} EMA:${ema9 !== null ? (price > ema9 ? '▲' : '▼') : '-'}/${ema21 !== null ? (ema9 > ema21 ? '▲' : '▼') : '-'} BB:${bbPct} vol:${volTrend} candles:${candles.length} strat:${stratId} age:${Math.round(ageMinutes)}m`);
+  }
+
+  taScoreCache.set(addr, { taBonus, ts: Date.now() });
+  return taBonus;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // ─── POSITION MONITOR ────────────────────────────────────────────────────────
 // ═════════════════════════════════════════════════════════════════════════════
 async function isBotRunning() {
@@ -2101,6 +2360,7 @@ async function checkDayRestart() {
     recentSLCoins.clear();
     alertCooldown.clear();
     momentumReentryWatch.clear();
+    taScoreCache.clear();
     dayHaltedToday = false;
 
     // Clear the flag so we don't restart again immediately
@@ -2860,10 +3120,10 @@ async function openSurgeReinvest(pos, exitPrice, totalPnL) {
 }
 
 // ─── PRICE HISTORY HELPERS ────────────────────────────────────────────────────
-function recordPriceHistory(addr, price, score) {
+function recordPriceHistory(addr, price, score, vol = 0, buys = 0, sells = 0) {
   if (!price || price <= 0) return;
   const hist = priceHistory.get(addr) || [];
-  hist.push({ price, score, ts: Date.now() });
+  hist.push({ price, score, ts: Date.now(), vol, buys, sells });
   if (hist.length > PRICE_HIST_MAX) hist.shift();
   priceHistory.set(addr, hist);
 }
@@ -4525,11 +4785,25 @@ async function scanForEntries() {
         ? Math.max(34, scoreThreshold - 4)
         : scoreThreshold;
 
+      // ── TA BONUS (RSI + EMA + Bollinger + Volume, up to +20) ───────────────
+      // Computed before the threshold check so it can lift near-miss coins over the bar.
+      // Only run when the coin is within striking distance (base score ≥ threshold - 20).
+      // Virtual candles (PS/SC/AM <6h): instant in-memory — no API call.
+      // GeckoTerminal fetch (BB/OR/AM ≥6h): async, 60-s cached to avoid repeat calls.
+      if (result.score >= effectiveThreshold - 20) {
+        const taBonus = await computeTAScore(result);
+        if (taBonus > 0) {
+          result.score    = Math.min(result.score + taBonus, 120); // allow up to 120 with TA bonus
+          result._taBonus = taBonus;
+        }
+      }
+
       if (result.score >= effectiveThreshold) {
         if (trendCount > 0) result._trendingPlatforms = trendCount; // attach badge for Telegram
-        // Record price snapshot for trend/rebound tracking
+        // Record price snapshot for trend/rebound tracking (also store volume/buys for TA indicators)
         const price = parseFloat(pair.priceUsd || 0);
-        recordPriceHistory(result.addr, price, result.score);
+        const m5Sells = (result.m5Txns || 0) - (result.m5Buys || 0);
+        recordPriceHistory(result.addr, price, result.score, result.m5Vol || 0, result.m5Buys || 0, Math.max(0, m5Sells));
         matches.push(result);
       } else {
         nearMissCount++;
@@ -4721,6 +4995,9 @@ async function scanForEntries() {
     const rangeReentryBadge = coin._rangeReentry
       ? `🔄 Range re-entry — support bounce confirmed\n`
       : '';
+    const taBadge = coin._taBonus
+      ? `📐 TA boost: +${coin._taBonus}pts (RSI/EMA/BB/Volume)\n`
+      : '';
 
     // ── If auto-entry is paused: send full signal alert but skip entering ─────────
     if (autoEntryPaused) {
@@ -4735,6 +5012,7 @@ async function scanForEntries() {
         `${pullbackBadge}` +
         `${explosiveBadge}` +
         `${rangeReentryBadge}` +
+        `${taBadge}` +
         `💡 ${s.desc}\n\n` +
         `💵 Price now: $${fmtPrice(coin.price)}\n` +
         `📊 Buy%: ${coin.buyPct.toFixed(0)}% | Liq: $${(coin.liq/1000).toFixed(0)}k\n` +
@@ -4778,6 +5056,7 @@ async function scanForEntries() {
       `${pullbackBadge}` +
       `${explosiveBadge}` +
       `${rangeReentryBadge}` +
+      `${taBadge}` +
       `💡 ${s.desc}\n\n` +
       `💵 Entry: $${fmtPrice(coin.price)}\n` +
       `💰 Position: ${pos.sizeNote || '$'+pos.size}${pos.walletLabel ? ` · ${pos.walletLabel}` : ''}\n` +
