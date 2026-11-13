@@ -1456,8 +1456,9 @@ async function enterPosition(coin, overrides = {}) {
     lastWithdrawalPrice:  null,     // price at last profit withdrawal (for +50% re-trigger)
     // Surge momentum: skip TP1/TP2, ride to 80%+ then full-exit & reinvest
     surgeMomentum: isSurge,
-    // Strategy 5 (Pump Spec) profit-halving at 4× — false until triggered, null for other strategies
-    s5ProfitHalved: s.id === 4 ? false : undefined,
+    // Strategy 5 (Pump Spec) profit-halving at 4× — false until triggered; false for all others
+    // (undefined breaks Firestore writes — use false universally, logic only fires when strategyId===4)
+    s5ProfitHalved: false,
     // Moon bag: funded from surge reinvestment — uses graduated SL, no TP exits
     isMoonBag: overrides.isMoonBag || false,
     isReinvest: overrides.isReinvest || false,
