@@ -196,7 +196,7 @@ const rangeReentryWatchlist = new Map();
 // Higher low = postExitLow > snapshotLow (structural low recorded at time of exit).
 // Entry trigger = 3% bounce from that postExitLow (curve reversing from the dip).
 // Window = 30 minutes. Sizing = standard dynamic (1% liq).
-const MOMENTUM_REENTRY_STRATEGIES  = new Set([1, 2, 4]); // AM, SC, PUMP SPEC
+const MOMENTUM_REENTRY_STRATEGIES  = new Set([0, 1, 2, 3, 4]); // all strategies; BB+OR have no time limit
 const MOMENTUM_REENTRY_BOUNCE_PCT  = 0.03;               // 3% bounce from postExitLow
 const MOMENTUM_REENTRY_WINDOW_MS   = 30 * 60 * 1000;     // 30-min watch window
 const MOMENTUM_REENTRY_MAX_LOSS    = -0.10;               // ignore if loss > 10% of size
@@ -1948,9 +1948,9 @@ async function processMomentumReentry(positions) {
   const now = Date.now();
 
   for (const [addr, entry] of momentumReentryWatch) {
-    // ── Expire ───────────────────────────────────────────────────────────────
-    if (now - entry.exitTime > MOMENTUM_REENTRY_WINDOW_MS) {
-      console.log(`[MREENTRY] ${entry.symbol} — 30min window expired, removing`);
+    // ── Expire (BB/OR have no expiry; AM/SC/PS expire after 30 min) ──────────
+    if (now > entry.expiry) {
+      console.log(`[MREENTRY] ${entry.symbol} — window expired, removing`);
       momentumReentryWatch.delete(addr);
       continue;
     }
@@ -3757,6 +3757,9 @@ async function monitorPositions() {
           const snapshotLow  = recentPrices.length > 0
             ? Math.min(...recentPrices)
             : pos.entryPrice;
+          // BB(0) and OR(3) are patient strategies — no time limit on the watch.
+          // AM(1), SC(2), PS(4) are momentum plays — expire after 30 min.
+          const isPatient = pos.strategyId === 0 || pos.strategyId === 3;
           momentumReentryWatch.set(pos.address, {
             symbol: pos.symbol, strategyId: pos.strategyId, strategyLabel: pos.strategyLabel,
             dexUrl: pos.dexUrl, chain: pos.chain, liq: pos.liq || 0, mcap: pos.mcap || 0,
@@ -3765,6 +3768,7 @@ async function monitorPositions() {
             postExitLow: exitFillPrice, // tracks lowest price seen after exit
             exitPrice: exitFillPrice,
             exitTime: Date.now(),
+            expiry: isPatient ? Infinity : Date.now() + MOMENTUM_REENTRY_WINDOW_MS,
             pnlPct,
           });
           console.log(`[MREENTRY] ${pos.symbol} — watching for higher-low re-entry | snapshotLow:$${fmtPrice(snapshotLow)} exitPrice:$${fmtPrice(exitFillPrice)} pnl:${(pnlPct*100).toFixed(1)}%`);
