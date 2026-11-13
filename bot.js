@@ -258,8 +258,8 @@ const STRATEGIES = [
     minCh1: -8,         // Nov-9: h1 turning; not in freefall
     minM5Ch: 0,         // Nov-10: 1.5→0 — pullback watchlist confirms the bounce; scan detects stabilisation
     minBuyPct: 55,      // Nov-11: 60→55 — relaxed to accommodate pump.fun/PumpSwap ecosystem
-    minLiq: 5000,       // Nov-11: 25k→5k — pump.fun/PumpSwap ecosystem has thin pools; RugCheck handles rug risk
-    minLiqLocked: 3000, // Nov-11: 15k→3k — relaxed floor for LP-locked coins
+    minLiq: 12000,      // Nov-13: 5k→12k — tighter liq floor to filter noise
+    minLiqLocked: 8000, // Nov-13: 3k→8k — higher bar for LP-locked coins
     minM5Txns: 5,       // Nov-10: 12→5 — crashed coins have thin volume; 5 confirms it's not dead
     // ── TP / SL (standard 3-step) ──
     tp1x: 1.20, tp2x: 1.45, tp3x: 2.00,
@@ -280,8 +280,8 @@ const STRATEGIES = [
     minM5Txns: 8,        // Nov-11: 15→8 — pump.fun coins have thinner activity
     minBuyPct: 52,       // Nov-11: 58→52 — marginal buyer edge is enough with RugCheck backing it
     minCh1: -2,          // Nov-11: 0→-2 — allow slight h1 dip as long as m5 is positive
-    minLiq: 5000,        // Nov-11: 15k→5k — pump.fun/PumpSwap ecosystem; RugCheck handles rug risk
-    minLiqLocked: 3000,  // Nov-11: 10k→3k — relaxed floor for LP-locked coins
+    minLiq: 12000,       // Nov-13: 5k→12k — tighter liq floor to filter noise
+    minLiqLocked: 8000,  // Nov-13: 3k→8k — higher bar for LP-locked coins
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.28, tp2x: 1.70, tp3x: 3.00,  // Nov-9: TP1 at +28% — captures the common 20–40% pop
     slx: 0.86,           // Nov-9: –14% SL (was –20% — the single biggest loss driver)
@@ -301,8 +301,8 @@ const STRATEGIES = [
     minM5Txns: 10,       // Nov-11: 20→10 — allow thinner activity in pump ecosystem
     minCh1: 0,           // h1 not negative (newly graduated coins may lack h1 history)
     minBuyPct: 55,       // Nov-11: 62→55 — align with pump.fun ecosystem reality
-    minLiq: 3000,        // Nov-11: 8k→3k — pump.fun/PumpSwap ecosystem; RugCheck handles rug risk
-    minLiqLocked: 2000,  // Nov-11: 5k→2k — relaxed floor for LP-locked coins
+    minLiq: 8000,        // Nov-13: 3k→8k — tighter liq floor to filter noise
+    minLiqLocked: 5000,  // Nov-13: 2k→5k — higher bar for LP-locked coins
     maxAgeDays: 1,       // Nov-9: SC is for young graduated coins only; AM handles 1–3 days
     // ── TP / SL (quick first profit, trail the rest) ──
     tp1x: 1.30, tp2x: 2.00, tp3x: 4.00,  // Nov-9: genuine surges can run far
@@ -321,8 +321,8 @@ const STRATEGIES = [
     minCh1: 0.5,         // Nov-10: 1.5→0.5 — ch24≥2% already confirms recovery; 0.5% checks h1 trend intact
     maxCh1: 20,          // Nov-9: tighter spike guard — >20% in 1h on old coin is suspicious
     minBuyPct: 50,       // Nov-11: 58→50 — marginal buyer dominance allowed with RugCheck backing
-    minLiq: 10000,       // Nov-11: 25k→10k — open to pump.fun ecosystem; RugCheck handles rug risk
-    minLiqLocked: 5000,  // Nov-11: 15k→5k — relaxed floor for LP-locked coins
+    minLiq: 20000,       // Nov-13: 10k→20k — older coin, higher liq standard
+    minLiqLocked: 12000, // Nov-13: 5k→12k — higher bar for LP-locked coins
     minBuys24: 15,       // Nov-11: 35→15 — lower activity floor for pump ecosystem
     // ── TP / SL (conservative) ──
     tp1x: 1.12, tp2x: 1.30, tp3x: 1.65,
@@ -336,8 +336,8 @@ const STRATEGIES = [
     desc: 'pump.fun / PumpSwap < 1 hour old — speculative pullback entry',
     // ── Entry criteria ──
     maxAgeDays: 0.042,  // Nov-12: < 1 hour — strictly new coins; anything older routes to BB/SC/AM/OR
-    minLiq: 3000,
-    minLiqLocked: 3000,
+    minLiq: 6000,        // Nov-13: 3k→6k — tighter liq floor
+    minLiqLocked: 5000,  // Nov-13: 3k→5k — higher bar for LP-locked
     minH1Ch: 2,          // Nov-11: 5→2 — h1 just needs to show positive trend, not strongly up
     minM5Ch: -5,         // allow pullback entry — not chasing the top
     maxM5Ch: 4,          // Nov-11: 2→4 — wider pullback window; allows more entry points
@@ -433,7 +433,7 @@ function detectStrategy(pair, openStrategies) {
   const rej = gate => { gateStats[gate]++; return null; };
   if (!isSolana && !isEVM) return rej('chain');
   if (!globalGatesBypass) {
-    if (liq < 3000)  return rej('liqFloor');
+    if (liq < 10000) return rej('liqFloor'); // Nov-13: 3k→10k — eliminate micro-cap noise coins
   }
   if (price <= 0)  return rej('price');  // always keep — zero price breaks arithmetic
   if (!globalGatesBypass) {
@@ -3453,7 +3453,7 @@ async function filterByLpLock(matches) {
 
     // ── 1: Risk score gate ──────────────────────────────────────────────
     // Strategy 4 (Pump Spec) uses stricter threshold (50 vs standard 60).
-    const maxRiskScore = coin.strategy?.rugCheckMaxRisk ?? 60;
+    const maxRiskScore = coin.strategy?.rugCheckMaxRisk ?? 50; // Nov-13: 60→50 — stricter locked-LP default
     if (rc.riskScore > maxRiskScore) {
       console.log(`[RUGCHECK] ❌ ${coin.symbol} — risk score ${rc.riskScore}/100 (>${maxRiskScore}), rejected`);
       lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
@@ -3486,7 +3486,7 @@ async function filterByLpLock(matches) {
     const isPumpSwap = ['pumpswap','pump_amm','pump-amm','pump_swap','pump-swap']
       .includes((coin.dexId || '').toLowerCase());
     if (isPumpSwap) {
-      const maxUnlockedPS = 40;
+      const maxUnlockedPS = 25; // Nov-13: 40→25 — tighter PumpSwap gate
       if (rc.riskScore <= maxUnlockedPS) {
         console.log(`[RUGCHECK] ✅ ${coin.symbol} — PumpSwap graduated, risk ${rc.riskScore}/100, PASSED`);
         lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
@@ -3507,7 +3507,7 @@ async function filterByLpLock(matches) {
     const strictRatio     = ANTI_MANIP_MC_LIQ_RATIO_MAX; // 30×
     const liqOk           = coin.liq >= strictLiq;
     const ratioOk         = (coin.mcLiqRatio || 999) <= strictRatio;
-    const maxUnlockedRisk = 40;
+    const maxUnlockedRisk = 25; // Nov-13: 40→25 — tighter unlocked-LP gate
 
     if (rc.riskScore > maxUnlockedRisk) {
       console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked, risk ${rc.riskScore}/100 (>${maxUnlockedRisk}), rejected`);
