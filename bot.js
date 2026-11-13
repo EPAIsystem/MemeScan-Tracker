@@ -280,10 +280,11 @@ const STRATEGIES = [
     minCh1: -8,         // Nov-9: h1 turning; not in freefall
     minM5Ch: 0,         // Nov-10: 1.5→0 — pullback watchlist confirms the bounce; scan detects stabilisation
     minBuyPct: 55,      // Nov-11: 60→55 — relaxed to accommodate pump.fun/PumpSwap ecosystem
-    minLiq: 12000,      // Nov-13: 5k→12k — tighter liq floor to filter noise
-    minLiqLocked: 8000, // Nov-13: 3k→8k — higher bar for LP-locked coins
+    minLiq: 18000,      // Nov-13: 12k→18k — tighter LP liq floor; compensates for looser rug risk
+    minLiqLocked: 12000,// Nov-13: 8k→12k — higher bar for LP-locked coins
     minM5Txns: 3,       // Nov-13: 5→3 — crashed coins have very thin volume; 3 is enough to confirm it's alive
-    rugCheckMaxUnlockedRisk: 40, // Nov-13: BB targets crashed coins — risk scores run higher; needs wider unlocked LP gate than other strategies
+    rugCheckMaxRisk: 65,         // Nov-13: BB crashed coins score higher on rug checks; slightly below standard 75
+    rugCheckMaxUnlockedRisk: 50, // Nov-13: 40→50 — unlocked LP ceiling raised alongside liq floor increase
     // ── TP / SL (standard 3-step) ──
     tp1x: 1.20, tp2x: 1.45, tp3x: 2.00,
     slx: 0.90,          // –10% SL: if a bounce thesis fails –10%, thesis is wrong
@@ -303,8 +304,8 @@ const STRATEGIES = [
     minM5Txns: 8,        // Nov-11: 15→8 — pump.fun coins have thinner activity
     minBuyPct: 52,       // Nov-11: 58→52 — marginal buyer edge is enough with RugCheck backing it
     minCh1: -2,          // Nov-11: 0→-2 — allow slight h1 dip as long as m5 is positive
-    minLiq: 12000,       // Nov-13: 5k→12k — tighter liq floor to filter noise
-    minLiqLocked: 8000,  // Nov-13: 3k→8k — higher bar for LP-locked coins
+    minLiq: 18000,       // Nov-13: 12k→18k — tighter LP liq floor; compensates for looser rug risk
+    minLiqLocked: 12000, // Nov-13: 8k→12k — higher bar for LP-locked coins
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.28, tp2x: 1.70, tp3x: 3.00,  // Nov-9: TP1 at +28% — captures the common 20–40% pop
     slx: 0.86,           // Nov-9: –14% SL (was –20% — the single biggest loss driver)
@@ -324,8 +325,8 @@ const STRATEGIES = [
     minM5Txns: 10,       // Nov-11: 20→10 — allow thinner activity in pump ecosystem
     minCh1: 0,           // h1 not negative (newly graduated coins may lack h1 history)
     minBuyPct: 55,       // Nov-11: 62→55 — align with pump.fun ecosystem reality
-    minLiq: 8000,        // Nov-13: 3k→8k — tighter liq floor to filter noise
-    minLiqLocked: 5000,  // Nov-13: 2k→5k — higher bar for LP-locked coins
+    minLiq: 12000,       // Nov-13: 8k→12k — tighter LP liq floor; compensates for looser rug risk
+    minLiqLocked: 8000,  // Nov-13: 5k→8k — higher bar for LP-locked coins
     maxAgeDays: 1,       // Nov-9: SC is for young graduated coins only; AM handles 1–3 days
     // ── TP / SL (quick first profit, trail the rest) ──
     tp1x: 1.30, tp2x: 2.00, tp3x: 4.00,  // Nov-9: genuine surges can run far
@@ -344,8 +345,8 @@ const STRATEGIES = [
     minCh1: 0.5,         // Nov-10: 1.5→0.5 — ch24≥2% already confirms recovery; 0.5% checks h1 trend intact
     maxCh1: 20,          // Nov-9: tighter spike guard — >20% in 1h on old coin is suspicious
     minBuyPct: 50,       // Nov-11: 58→50 — marginal buyer dominance allowed with RugCheck backing
-    minLiq: 20000,       // Nov-13: 10k→20k — older coin, higher liq standard
-    minLiqLocked: 12000, // Nov-13: 5k→12k — higher bar for LP-locked coins
+    minLiq: 28000,       // Nov-13: 20k→28k — tighter LP liq floor; compensates for looser rug risk
+    minLiqLocked: 18000, // Nov-13: 12k→18k — higher bar for LP-locked coins
     minBuys24: 15,       // Nov-11: 35→15 — lower activity floor for pump ecosystem
     // ── TP / SL (conservative) ──
     tp1x: 1.12, tp2x: 1.30, tp3x: 1.65,
@@ -359,8 +360,8 @@ const STRATEGIES = [
     desc: 'pump.fun / PumpSwap < 1 hour old — speculative pullback entry',
     // ── Entry criteria ──
     maxAgeDays: 0.042,  // Nov-12: < 1 hour — strictly new coins; anything older routes to BB/SC/AM/OR
-    minLiq: 6000,        // Nov-13: 3k→6k — tighter liq floor
-    minLiqLocked: 5000,  // Nov-13: 3k→5k — higher bar for LP-locked
+    minLiq: 8000,        // Nov-13: 6k→8k — tighter LP liq floor; compensates for looser rug risk
+    minLiqLocked: 6000,  // Nov-13: 5k→6k — higher bar for LP-locked
     minH1Ch: 2,          // Nov-11: 5→2 — h1 just needs to show positive trend, not strongly up
     minM5Ch: -5,         // allow pullback entry — not chasing the top
     maxM5Ch: 4,          // Nov-11: 2→4 — wider pullback window; allows more entry points
@@ -368,7 +369,7 @@ const STRATEGIES = [
     minBuyPct: 50,       // Nov-11: 55→50 — marginal buyer edge enough for speculative entries
     minM5Txns: 6,        // Nov-11: 10→6 — allow thinner activity
     maxMcLiqRatio: 60,   // more lenient ratio for thin pump pools
-    rugCheckMaxRisk: 50, // stricter rug threshold (50 vs standard 60)
+    rugCheckMaxRisk: 65, // Nov-13: 50→65 — +25% from prior 50; still below standard 75 (pump.fun is higher risk)
     // ── SL / TP (custom schedule — handled in monitor loop for id=4) ──
     slx: 0.60,           // initial SL = entry − 40%
     // Nov-12: removed maxPositionSize:50 — now respects /setsize ceiling like all other strategies
@@ -503,13 +504,13 @@ function detectStrategy(pair, openStrategies) {
     if (!(m5Ch >= 0))                                  gateSimStats.bbM5Ch++;
     if (!(buyPct >= 55))                               gateSimStats.bbBuy++;
     if (!(m5Txns >= 3))                                gateSimStats.bbTxns++;  // NEW: 5→3
-    if (!(liq >= 8000))                                gateSimStats.bbLiq++;   // minLiqLocked
+    if (!(liq >= 12000))                               gateSimStats.bbLiq++;   // minLiqLocked=12000 (Nov-13 raised)
 
     // — AM strategy gates (independent — reflects NEW thresholds) —
     if (!(m5Ch >= 0))                                  gateSimStats.amM5Ch++;  // NEW: 0.5→0
     if (!(buyPct >= 52))                               gateSimStats.amBuy++;
     if (!(m5Txns >= 8))                                gateSimStats.amTxns++;
-    if (!(liq >= 8000))                                gateSimStats.amLiq++;   // minLiqLocked
+    if (!(liq >= 12000))                               gateSimStats.amLiq++;   // minLiqLocked=12000 (Nov-13 raised)
     if (!(ch1 >= -2))                                  gateSimStats.amCh1++;
 
     // — SC strategy gates (independent) —
@@ -517,7 +518,7 @@ function detectStrategy(pair, openStrategies) {
     if (!(m5Ch >= 3))                                  gateSimStats.scM5Ch++;
     if (!(buyPct >= 55))                               gateSimStats.scBuy++;
     if (!(m5Txns >= 10))                               gateSimStats.scTxns++;
-    if (!(liq >= 5000))                                gateSimStats.scLiq++;   // minLiqLocked
+    if (!(liq >= 8000))                                gateSimStats.scLiq++;   // minLiqLocked=8000 (Nov-13 raised)
     if (avgTrade !== null && !(avgTrade >= 15))        gateSimStats.scAvgT++;  // ANTI_MANIP_SC_AVG_TRADE
 
     // — OR strategy gates (independent — reflects NEW thresholds) —
@@ -525,7 +526,7 @@ function detectStrategy(pair, openStrategies) {
     if (!(ch24 >= 0.5))                                gateSimStats.orCh24++;  // NEW: 2→0.5
     if (!(ch1 >= 0.5 && ch1 <= 20))                    gateSimStats.orCh1++;
     if (!(buyPct >= 50))                               gateSimStats.orBuy++;
-    if (!(liq >= 12000))                               gateSimStats.orLiq++;   // minLiqLocked
+    if (!(liq >= 18000))                               gateSimStats.orLiq++;   // minLiqLocked=18000 (Nov-13 raised)
     if (!(buys24 >= 15))                               gateSimStats.orBuys24++;
 
     // — PS strategy gates (independent — pump.fun / PumpSwap only) —
@@ -534,14 +535,14 @@ function detectStrategy(pair, openStrategies) {
     if (!(m5Ch >= -5 && m5Ch <= 4))                    gateSimStats.psM5Ch++;
     if (!(buyPct >= 50))                               gateSimStats.psBuy++;
     if (!(m5Txns >= 6))                                gateSimStats.psTxns++;
-    if (!(liq >= 5000))                                gateSimStats.psLiq++;   // minLiq (same as minLiqLocked for PS)
+    if (!(liq >= 6000))                                gateSimStats.psLiq++;   // minLiqLocked=6000 (Nov-13 raised)
 
     // — LP gate simulation (liq-floor checks — RugCheck risk can't be simulated here) —
-    if (liq < 12000) gateSimStats.lpBB++;   // BB minLiq=12000
-    if (liq < 12000) gateSimStats.lpAM++;   // AM minLiq=12000
-    if (liq < 8000)  gateSimStats.lpSC++;   // SC minLiq=8000
-    if (liq < 20000) gateSimStats.lpOR++;   // OR minLiq=20000
-    if (liq < 6000)  gateSimStats.lpPS++;   // PS minLiq=6000
+    if (liq < 18000) gateSimStats.lpBB++;   // BB minLiq=18000 (Nov-13 raised)
+    if (liq < 18000) gateSimStats.lpAM++;   // AM minLiq=18000 (Nov-13 raised)
+    if (liq < 12000) gateSimStats.lpSC++;   // SC minLiq=12000 (Nov-13 raised)
+    if (liq < 28000) gateSimStats.lpOR++;   // OR minLiq=28000 (Nov-13 raised)
+    if (liq < 8000)  gateSimStats.lpPS++;   // PS minLiq=8000  (Nov-13 raised)
     if (mcLiqRatio > ANTI_MANIP_MC_LIQ_RATIO_MAX) gateSimStats.lpRatio++; // unlocked ratio gate
   }
 
@@ -3570,11 +3571,11 @@ async function processLpProbation() {
 
 // ─── LP LOCK + SECURITY FILTER ───────────────────────────────────────────────
 // Security filter — RugCheck only (Solana-native, GoPlus removed Nov-11):
-//   1. Risk score > maxRiskScore (default 60) → hard block
+//   1. Risk score > maxRiskScore (default 75; BB=65, PS=65) → hard block
 //   2. LP locked → pass
-//   3. pump.fun bonding-curve → pass on risk score alone (≤ 50)
-//   3.5. PumpSwap graduated → pass on risk score alone (≤ 40)
-//   4. LP unlocked + risk ≤ 40 + strict liq/ratio floors → PASS (no probation)
+//   3. pump.fun bonding-curve → pass on risk score alone (≤ default 75)
+//   3.5. PumpSwap graduated → pass on risk score alone (≤ 35)
+//   4. LP unlocked + risk ≤ 40 (BB=50) + strict liq/ratio floors → PASS (no probation)
 //   4r. LP unlocked + too risky / thin pool → hard block
 //
 // EVM chains: fail open (no checker after GoPlus removal).
@@ -3621,7 +3622,7 @@ async function filterByLpLock(matches) {
 
     // ── 1: Risk score gate ──────────────────────────────────────────────
     // Strategy 4 (Pump Spec) uses stricter threshold (50 vs standard 60).
-    const maxRiskScore = coin.strategy?.rugCheckMaxRisk ?? 50; // Nov-13: 60→50 — stricter locked-LP default
+    const maxRiskScore = coin.strategy?.rugCheckMaxRisk ?? 75; // Nov-13: 50→75 — +25% loosening; prior tightening was blocking all entries
     if (rc.riskScore > maxRiskScore) {
       console.log(`[RUGCHECK] ❌ ${coin.symbol} — risk score ${rc.riskScore}/100 (>${maxRiskScore}), rejected`);
       lpPeriodStats.failRisk++;
@@ -3657,7 +3658,7 @@ async function filterByLpLock(matches) {
     const isPumpSwap = ['pumpswap','pump_amm','pump-amm','pump_swap','pump-swap']
       .includes((coin.dexId || '').toLowerCase());
     if (isPumpSwap) {
-      const maxUnlockedPS = 25; // Nov-13: 40→25 — tighter PumpSwap gate
+      const maxUnlockedPS = 35; // Nov-13: 25→35 — +25% loosening; PumpSwap was rejecting everything
       if (rc.riskScore <= maxUnlockedPS) {
         console.log(`[RUGCHECK] ✅ ${coin.symbol} — PumpSwap graduated, risk ${rc.riskScore}/100, PASSED`);
         lpPeriodStats.passed++;
@@ -3680,7 +3681,7 @@ async function filterByLpLock(matches) {
     const strictRatio     = ANTI_MANIP_MC_LIQ_RATIO_MAX; // 30×
     const liqOk           = coin.liq >= strictLiq;
     const ratioOk         = (coin.mcLiqRatio || 999) <= strictRatio;
-    const maxUnlockedRisk = coin.strategy?.rugCheckMaxUnlockedRisk ?? 30; // Nov-13: per-strategy ceiling — BB=40, all others=30 (global raised from 25; 25 was blocking AM/SC/PS)
+    const maxUnlockedRisk = coin.strategy?.rugCheckMaxUnlockedRisk ?? 40; // Nov-13: 30→40 — +25% loosening on unlocked LP default; BB overrides to 50
 
     if (rc.riskScore > maxUnlockedRisk) {
       console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked, risk ${rc.riskScore}/100 (>${maxUnlockedRisk}), rejected`);
