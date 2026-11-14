@@ -3571,13 +3571,13 @@ async function processLpProbation() {
 
 // ─── LP LOCK + SECURITY FILTER ───────────────────────────────────────────────
 // Security filter — RugCheck LP lock check (Solana-native, GoPlus removed Nov-11):
-//   NOTE: Rug risk score checks REMOVED Nov-13 — using liq+ratio floors only.
-//   1. RugCheck unavailable (rc-fail) → liq+ratio filter, same as gate 4
-//   2. LP locked → pass
-//   3. pump.fun bonding-curve → pass (no traditional LP pool)
-//   3.5. PumpSwap graduated → pass (strategy liq gates already applied)
-//   4. LP unlocked + liq ≥ minLiq + ratio ≤ 30× → PASS
-//   4r. LP unlocked + thin pool / bad ratio → hard block
+//   Nov-14: Rug risk ceiling RESTORED at 80 (removed Nov-13, back Nov-14).
+//   1. RugCheck unavailable (rc-fail) → liq+ratio filter only (no risk check)
+//   2. LP locked → pass unconditionally
+//   3. pump.fun bonding-curve → pass unconditionally (no traditional LP pool)
+//   3.5. PumpSwap graduated → pass if risk ≤ 80, reject if > 80
+//   4. LP unlocked + risk ≤ 80 + liq ≥ minLiq + ratio ≤ 30× → PASS
+//   4r. LP unlocked + risk > 80 OR thin pool / bad ratio → hard block
 //
 // EVM chains: fail open (no checker after GoPlus removal).
 // Results cached 10 min.
@@ -3663,11 +3663,17 @@ async function filterByLpLock(matches) {
     const isPumpSwap = ['pumpswap','pump_amm','pump-amm','pump_swap','pump-swap']
       .includes((coin.dexId || '').toLowerCase());
     if (isPumpSwap) {
-      // Nov-13: rug risk skipped — PumpSwap coins pass on strategy liq gates alone
-      console.log(`[RUGCHECK] ✅ ${coin.symbol} — PumpSwap graduated, risk skipped (${rc.riskScore}/100), PASSED`);
-      lpPeriodStats.passed++;
-      lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
-      passed.add(coin.addr);
+      // Nov-14: risk ceiling restored at 80
+      if (rc.riskScore > 80) {
+        console.log(`[RUGCHECK] ❌ ${coin.symbol} — PumpSwap graduated, risk ${rc.riskScore}/100 > 80, rejected`);
+        lpPeriodStats.failRisk++;
+        lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
+      } else {
+        console.log(`[RUGCHECK] ✅ ${coin.symbol} — PumpSwap graduated, risk ${rc.riskScore}/100 ≤ 80, PASSED`);
+        lpPeriodStats.passed++;
+        lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
+        passed.add(coin.addr);
+      }
       continue;
     }
 
@@ -3676,13 +3682,18 @@ async function filterByLpLock(matches) {
     // entry in practice (Raydium meme coins rarely lock within 90 min). Coins
     // that clear risk (≤ 40) + liq + ratio floors pass directly — same logic as
     // gate 3.5 for PumpSwap but now extended to all DEXes.
-    // Nov-13: rug risk skipped — pass on liq+ratio only
+    // Nov-14: rug risk ceiling restored at 80 — risk checked first, then liq+ratio
     const strictLiq   = coin.strategy?.minLiq || Infinity;
     const strictRatio = ANTI_MANIP_MC_LIQ_RATIO_MAX; // 30×
+    const riskOk      = rc.riskScore <= 80;
     const liqOk       = coin.liq >= strictLiq;
     const ratioOk     = (coin.mcLiqRatio || 999) <= strictRatio;
 
-    if (!liqOk) {
+    if (!riskOk) {
+      console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked, risk ${rc.riskScore}/100 > 80, rejected`);
+      lpPeriodStats.failRisk++;
+      lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
+    } else if (!liqOk) {
       console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked, liq $${coin.liq.toFixed(0)} < $${strictLiq} strict floor, rejected`);
       lpPeriodStats.failLiq++;
       lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
@@ -3691,8 +3702,7 @@ async function filterByLpLock(matches) {
       lpPeriodStats.failRatio++;
       lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
     } else {
-      // liq OK, ratio OK — pass on liq+ratio alone (risk skipped)
-      console.log(`[RUGCHECK] ✅ ${coin.symbol} — LP unlocked, risk skipped (${rc.riskScore}/100), liq $${coin.liq.toFixed(0)}, PASSED`);
+      console.log(`[RUGCHECK] ✅ ${coin.symbol} — LP unlocked, risk ${rc.riskScore}/100 ≤ 80, liq $${coin.liq.toFixed(0)}, PASSED`);
       lpPeriodStats.passed++;
       lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
       passed.add(coin.addr);
