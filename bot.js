@@ -1149,7 +1149,8 @@ async function jupiterQuote(inputMint, outputMint, amountLamports, slippageBps =
     try {
       const r = await httpGet('quote-api.jup.ag', path);
       if (r.status === 200) return JSON.parse(r.body);
-      console.error(`[JUPITER] Quote HTTP ${r.status} (attempt ${attempt}/${MAX_ATTEMPTS})`);
+      const bodySnip = r.body ? String(r.body).slice(0, 300) : '(empty)';
+      console.error(`[JUPITER] Quote HTTP ${r.status} (attempt ${attempt}/${MAX_ATTEMPTS}) | body: ${bodySnip}`);
       // Only retry on server-side errors (5xx) — 4xx errors won't resolve with a retry
       if (r.status < 500 || attempt === MAX_ATTEMPTS) return null;
       await sleep(RETRY_DELAY);
