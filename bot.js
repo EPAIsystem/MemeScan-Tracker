@@ -146,10 +146,10 @@ const SL_TIGHTEN_PCT         = 0.85;           // after grace, if still below en
 // ─── ANTI-MANIPULATION THRESHOLDS ────────────────────────────────────────────
 // Applied globally in detectStrategy() before any strategy-specific scoring.
 // Catches bot farms (micro-trade spam), thin-pool manipulation, and wash trading.
-const ANTI_MANIP_AVG_TRADE_FLOOR  = 1;    // MIN: ≥$1 (was 8) — set to floor for baseline calibration
-const ANTI_MANIP_M5_TXNS_MAX      = 1000; // MIN: >1000 txns (was 200) — essentially disabled; raise incrementally
+const ANTI_MANIP_AVG_TRADE_FLOOR  = 8;    // ≥$8 avg trade — filters micro-trade bot spam (restored Nov-14)
+const ANTI_MANIP_M5_TXNS_MAX      = 200;  // ≤200 txns/5min — 40/min ceiling catches bot farms (restored Nov-14)
 const ANTI_MANIP_MC_LIQ_RATIO_MAX        = 30;   // global: mc/liq > 30× = thin pool (unlocked LP — unchanged)
-const ANTI_MANIP_MC_LIQ_RATIO_MAX_LOCKED = 200;  // MIN: 200× (was 40) — essentially disabled; raise incrementally
+const ANTI_MANIP_MC_LIQ_RATIO_MAX_LOCKED = 40;   // global: mc/liq > 40× = thin pool (locked LP gate; unlocked LP tightens to 30× in filterByLpLock) (restored Nov-14)
 const ANTI_MANIP_SC_AVG_TRADE     = 15;   // Surge Catch own gate: $15 filters micro-spam while allowing young coin activity; SC bypasses the global $20 gate
 const ANTI_MANIP_SC_TXNS_MAX      = 150;  // Surge Catch only: 30/min ceiling
 // ANTI_MANIP_SC_MC_LIQ_MAX removed Nov-10 — SC now uses ANTI_MANIP_MC_LIQ_RATIO_MAX_LOCKED (40×) same as other strategies
@@ -547,7 +547,7 @@ function detectStrategy(pair, openStrategies) {
   }
 
   if (!globalGatesBypass) {
-    if (liq < 500) return rej('liqFloor'); // MIN: $500 (was 3k) — absolute floor; raise incrementally
+    if (liq < 3000) return rej('liqFloor'); // $3,000 absolute floor — below this, any position faces severe slippage (restored Nov-14)
   }
   if (price <= 0)  return rej('price');  // always keep — zero price breaks arithmetic
   if (!globalGatesBypass) {
@@ -579,13 +579,13 @@ function detectStrategy(pair, openStrategies) {
   if (!globalGatesBypass && ageDays < 1) {
     // avgTrade gate: $20 for all strategies except SC and pump.fun→S5
     // SC has its own $15 gate; pump.fun coins for S5 use the global floor ($8) only.
-    if (!scIsOpen && !s5OpenForYoung && avgTrade !== null && avgTrade < 1) return rej('young'); // MIN: $1 (was 12) — essentially disabled; raise incrementally
+    if (!scIsOpen && !s5OpenForYoung && avgTrade !== null && avgTrade < 12) return rej('young'); // $12 avg trade — young coin stricter gate (restored Nov-14)
     if (s5OpenForYoung) {
-      if (buyPct < 10) return rej('young');  // MIN: 10% (was 50)
-      if (m5Txns  <  1) return rej('young'); // MIN: 1 txn (was 6)
+      if (buyPct < 50) return rej('young');  // ≥50% buy dominance — restored Nov-14
+      if (m5Txns  <  6) return rej('young'); // ≥6 txns/5min — restored Nov-14
     } else {
-      if (buyPct < 10)  return rej('young'); // MIN: 10% (was 50)
-      if (m5Txns  <  1) return rej('young'); // MIN: 1 txn (was 6)
+      if (buyPct < 50)  return rej('young'); // ≥50% buy dominance — restored Nov-14
+      if (m5Txns  <  6) return rej('young'); // ≥6 txns/5min — restored Nov-14
     }
   }
 
@@ -613,16 +613,16 @@ function detectStrategy(pair, openStrategies) {
   if (!globalGatesBypass) {
     if (ch1 === null) {
       const s5OpenDead = openStrategies.some(st => st.id === 4);
-      const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= -20) // MIN: -20% (was 0.5)
-                || (m5Ch >= -20)                                          // MIN: -20% (was 3)
-                || (s5OpenDead && ageMinutes < 60 && m5Ch >= -20);       // MIN: -20% (was -5)
+      const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 0.5)  // young coin pumping NOW — h1 covers whole life
+                || (m5Ch >= 3)                                            // strong m5 on any coin overrides flat h1
+                || (s5OpenDead && ageMinutes < 60 && m5Ch >= -5);        // PS: very young, slight pullback ok
       if (!pass) return rej('dead');
     } else if (Math.abs(ch1) < 0.5) {
       const s5OpenDead = openStrategies.some(st => st.id === 4);
-      const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= -20) // MIN: -20% (was 0.5)
-                || (ch24 <= 0 && buyPct >= 10 && liq >= 500)             // MIN: ch24≤0, buyPct≥10%, liq≥$500
-                || (m5Ch >= -20)                                          // MIN: -20% (was 3)
-                || (s5OpenDead && ageMinutes < 60 && m5Ch >= -20);       // MIN: -20% (was -5)
+      const pass = (ageMinutes >= 60 && ageMinutes < 240 && m5Ch >= 0.5) // young coin pumping NOW
+                || (ch24 <= -10 && buyPct >= 50 && liq >= 5000)          // BB: genuinely crashed, buyers present
+                || (m5Ch >= 3)                                            // strong m5 overrides flat h1
+                || (s5OpenDead && ageMinutes < 60 && m5Ch >= -5);        // PS: very young, slight pullback ok
       if (!pass) return rej('dead');
     }
 
@@ -666,15 +666,15 @@ function detectStrategy(pair, openStrategies) {
     // Strategy 5 (Pump Spec) enters on pullbacks — allow m5Ch down to -5% when s5 is open.
     // All other strategies require m5Ch ≥ -1% (no meaningful decline allowed).
     // MIN: -20% threshold (was -1%) — essentially disabled; raise incrementally
-    if (m5Ch !== null && m5Ch < -20) {
-      return rej('mom'); // catastrophic decline only — raise threshold incrementally
+    if (m5Ch !== null && m5Ch < -1) {
+      return rej('mom'); // −1% m5 floor — bot must not enter a falling coin (restored Nov-14)
     }
 
     const liveHist = priceHistory.get(addr) || [];
     if (liveHist.length >= 3) {
       const newest = liveHist[liveHist.length - 1]?.price;
       const older  = liveHist[liveHist.length - 3]?.price; // ~6 seconds ago
-      if (newest && older && newest < older * 0.90) return rej('live'); // MIN: 10% dip allowed (was 0.5%) — essentially disabled; raise incrementally
+      if (newest && older && newest < older * 0.995) return rej('live'); // 0.5% live dip floor — price must not be falling between scans (restored Nov-14)
     }
   } // end globalGatesBypass check
 
