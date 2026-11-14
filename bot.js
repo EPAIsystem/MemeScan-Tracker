@@ -1142,12 +1142,24 @@ async function getSolPriceUsd() {
 }
 
 async function jupiterQuote(inputMint, outputMint, amountLamports, slippageBps = 100) {
-  try {
-    const path = `/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}`;
-    const r = await httpGet('quote-api.jup.ag', path);
-    if (r.status !== 200) { console.error('[JUPITER] Quote HTTP', r.status); return null; }
-    return JSON.parse(r.body);
-  } catch(e) { console.error('[JUPITER] Quote error:', e.message); return null; }
+  const path = `/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}`;
+  const MAX_ATTEMPTS = 3;
+  const RETRY_DELAY  = 600; // ms between retries — covers transient 500s
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const r = await httpGet('quote-api.jup.ag', path);
+      if (r.status === 200) return JSON.parse(r.body);
+      console.error(`[JUPITER] Quote HTTP ${r.status} (attempt ${attempt}/${MAX_ATTEMPTS})`);
+      // Only retry on server-side errors (5xx) — 4xx errors won't resolve with a retry
+      if (r.status < 500 || attempt === MAX_ATTEMPTS) return null;
+      await sleep(RETRY_DELAY);
+    } catch(e) {
+      console.error(`[JUPITER] Quote error (attempt ${attempt}/${MAX_ATTEMPTS}):`, e.message);
+      if (attempt === MAX_ATTEMPTS) return null;
+      await sleep(RETRY_DELAY);
+    }
+  }
+  return null;
 }
 
 async function jupiterGetSwapTx(quote, walletPublicKey) {
