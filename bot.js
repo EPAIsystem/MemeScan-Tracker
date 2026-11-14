@@ -898,6 +898,11 @@ const pausedAlertCooldown = new Map(); // set on pause-mode signals — separate
 // Block re-entry for 6h after SL or rug — prevents the triple-entry bug
 // (address → timestamp of SL/rug close)
 const recentSLCoins = new Map();
+// Jupiter quote failure cooldown — after 2 consecutive scan-level failures, skip token 30 min
+// Prevents retrying tokens Jupiter persistently can't route (empty-body 500s)
+const quoteFailCooldown      = new Map(); // addr → { count: number, until: number }
+const QUOTE_FAIL_COOLDOWN_MS = 30 * 60 * 1000; // 30-min block
+const QUOTE_FAIL_THRESHOLD   = 2;               // consecutive failures before block
 // Guards against concurrent-tick races: positions currently being closed
 // (added before the async Firestore write; cleared when done)
 const closingNow    = new Set();
@@ -1318,8 +1323,32 @@ async function executeRealEntry(coin, wallet, posSize) {
       console.warn(`[REAL] Balance check failed (proceeding): ${balErr.message}`);
     }
 
+    // ── JUPITER QUOTE COOLDOWN CHECK ─────────────────────────────────────────
+    // Skip tokens that have failed Jupiter quote repeatedly — prevents spamming
+    // tokens Jupiter can't route (returns {} on 500) on every scan indefinitely.
+    const _qfc = quoteFailCooldown.get(coin.addr);
+    if (_qfc && Date.now() < _qfc.until) {
+      const minsLeft = Math.ceil((_qfc.until - Date.now()) / 60000);
+      console.log(`[REAL] ⏸ ${coin.symbol} — Jupiter cooldown active (${minsLeft}m left), skipping entry`);
+      return { txHash: null, executedPrice: coin.price, error: 'Jupiter quote cooldown' };
+    }
+
     const quote = await jupiterQuote(SOL_MINT, coin.addr, lamports, 150); // 1.5% slippage
-    if (!quote) return { txHash: null, executedPrice: coin.price, error: 'Jupiter quote failed' };
+    if (!quote) {
+      // Track consecutive failures — block after QUOTE_FAIL_THRESHOLD
+      const prev    = quoteFailCooldown.get(coin.addr);
+      const prevOk  = !prev || Date.now() >= prev.until; // expired or never set
+      const count   = prevOk ? 1 : (prev.count + 1);
+      if (count >= QUOTE_FAIL_THRESHOLD) {
+        quoteFailCooldown.set(coin.addr, { count, until: Date.now() + QUOTE_FAIL_COOLDOWN_MS });
+        console.warn(`[REAL] ⛔ ${coin.symbol} — Jupiter failed ${count}x in a row, cooldown 30 min`);
+      } else {
+        quoteFailCooldown.set(coin.addr, { count, until: 0 });
+        console.warn(`[REAL] ⚠️ ${coin.symbol} — Jupiter quote failed (${count}/${QUOTE_FAIL_THRESHOLD})`);
+      }
+      return { txHash: null, executedPrice: coin.price, error: 'Jupiter quote failed' };
+    }
+    quoteFailCooldown.delete(coin.addr); // quote succeeded — clear any failure history
 
     // ── PRICE IMPACT GUARD — protect capital from thin liquidity ──────────
     const MAX_ENTRY_IMPACT = 0.015; // 1.5% — abort if our buy moves price more than this
