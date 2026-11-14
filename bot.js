@@ -5627,8 +5627,8 @@ function httpGet(hostname, path, extraHeaders = {}) {
     }, res => {
       let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve({status:res.statusCode,body:d}));
     });
-    req.on('error', () => resolve({status:500,body:'{}'}));
-    req.on('timeout', () => { req.destroy(); resolve({status:504,body:'{}'}); });
+    req.on('error', (e) => { console.error(`[HTTP] Network error → ${hostname}: ${e.message}`); resolve({status:500,body:'{}'}); });
+    req.on('timeout', () => { req.destroy(); console.error(`[HTTP] Timeout → ${hostname}`); resolve({status:504,body:'{}'}); });
     req.end();
   });
 }
