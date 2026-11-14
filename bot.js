@@ -1186,8 +1186,8 @@ async function jupiterGetSwapTx(quote, walletPublicKey) {
       }, (res) => {
         let d = ''; res.on('data', c => d += c); res.on('end', () => resolve({ status: res.statusCode, body: d }));
       });
-      req.on('error', () => resolve({ status: 500, body: '{}' }));
-      req.on('timeout', () => { req.destroy(); resolve({ status: 504, body: '{}' }); });
+      req.on('error', (e) => { console.error('[JUPITER] Swap network error:', e.message); resolve({ status: 500, body: '{}' }); });
+      req.on('timeout', () => { req.destroy(); console.error('[JUPITER] Swap timeout'); resolve({ status: 504, body: '{}' }); });
       req.write(body); req.end();
     });
     if (r.status !== 200) { console.error('[JUPITER] Swap HTTP', r.status, r.body.slice(0,200)); return null; }
@@ -1257,8 +1257,8 @@ async function sendViaJitoBundle(swapTxBase64, keypair) {
       let d = ''; res.on('data', c => d += c);
       res.on('end', () => resolve({ status: res.statusCode, body: d }));
     });
-    req.on('error',   () => resolve({ status: 500, body: '{}' }));
-    req.on('timeout', () => { req.destroy(); resolve({ status: 504, body: '{}' }); });
+    req.on('error',   (e) => { console.error('[JITO] Network error:', e.message); resolve({ status: 500, body: '{}' }); });
+    req.on('timeout', () => { req.destroy(); console.error('[JITO] Timeout'); resolve({ status: 504, body: '{}' }); });
     req.write(body); req.end();
   });
 
