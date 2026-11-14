@@ -1016,7 +1016,7 @@ function normaliseChain(chainId = '') {
 // Preference order: manually pinned override → first matching active wallet
 async function selectWalletForChain(chain, cfg) {
   const wallets = await getWallets();
-  const matching = wallets.filter(w => w.chain === chain && w.active !== false);
+  const matching = wallets.filter(w => normaliseChain(w.chain) === chain && w.active !== false);
   if (!matching.length) return null;
 
   // Check manual override in config: cfg.activeWalletId[chain]
