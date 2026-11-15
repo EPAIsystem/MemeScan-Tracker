@@ -903,6 +903,11 @@ const recentSLCoins = new Map();
 const quoteFailCooldown      = new Map(); // addr → { count: number, until: number }
 const QUOTE_FAIL_COOLDOWN_MS = 30 * 60 * 1000; // 30-min block
 const QUOTE_FAIL_THRESHOLD   = 2;               // consecutive failures before block
+// Jito bundle failure cooldown — after 2 consecutive bundle failures, skip token 30 min
+// Prevents spamming tokens whose swap TX Jito consistently rejects
+const jitoBundleCooldown      = new Map(); // addr → { count: number, until: number }
+const JITO_FAIL_COOLDOWN_MS   = 30 * 60 * 1000;
+const JITO_FAIL_THRESHOLD     = 2;
 // Guards against concurrent-tick races: positions currently being closed
 // (added before the async Firestore write; cleared when done)
 const closingNow    = new Set();
@@ -1179,12 +1184,13 @@ async function jupiterGetSwapTx(quote, walletPublicKey) {
       wrapAndUnwrapSol: true,
       prioritizationFeeLamports: 5000, // ~0.000005 SOL tip for faster landing
     });
-    const swapHeaders = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
-    if (process.env.JUPITER_API_KEY) swapHeaders['x-api-key'] = process.env.JUPITER_API_KEY;
+    // Swap TX still uses the stable v6 endpoint — api.jup.ag/swap/v1/swap produces
+    // transactions that Jito's bundle engine rejects with HTTP 500. The API key
+    // benefit is on the quote side (better routing), not needed here.
     const r = await new Promise((resolve) => {
       const req = https.request({
-        hostname: 'api.jup.ag',
-        path: '/swap/v1/swap',
+        hostname: 'quote-api.jup.ag',
+        path: '/v6/swap',
         method: 'POST',
         headers: swapHeaders,
         timeout: 15000,
@@ -1377,7 +1383,31 @@ async function executeRealEntry(coin, wallet, posSize) {
     const swapTx = await jupiterGetSwapTx(quote, keypair.publicKey.toBase58());
     if (!swapTx) return { txHash: null, executedPrice: coin.price, error: 'Jupiter swap TX failed' };
 
-    const sig = await sendViaJitoBundle(swapTx, keypair);
+    // ── JITO BUNDLE COOLDOWN CHECK ──────────────────────────────────────────
+    const _jbc = jitoBundleCooldown.get(coin.addr);
+    if (_jbc && Date.now() < _jbc.until) {
+      const minsLeft = Math.ceil((_jbc.until - Date.now()) / 60000);
+      console.log(`[REAL] ⏸ ${coin.symbol} — Jito cooldown active (${minsLeft}m left), skipping`);
+      return { txHash: null, executedPrice: coin.price, error: 'Jito bundle cooldown' };
+    }
+
+    let sig;
+    try {
+      sig = await sendViaJitoBundle(swapTx, keypair);
+    } catch(jitoErr) {
+      const prev   = jitoBundleCooldown.get(coin.addr);
+      const prevOk = !prev || Date.now() >= prev.until;
+      const count  = prevOk ? 1 : (prev.count + 1);
+      if (count >= JITO_FAIL_THRESHOLD) {
+        jitoBundleCooldown.set(coin.addr, { count, until: Date.now() + JITO_FAIL_COOLDOWN_MS });
+        console.warn(`[REAL] ⛔ ${coin.symbol} — Jito failed ${count}x, cooldown 30 min`);
+      } else {
+        jitoBundleCooldown.set(coin.addr, { count, until: 0 });
+        console.warn(`[REAL] ⚠️ ${coin.symbol} — Jito bundle failed (${count}/${JITO_FAIL_THRESHOLD}): ${jitoErr.message}`);
+      }
+      throw jitoErr; // bubble to outer catch → logs and returns null tx
+    }
+    jitoBundleCooldown.delete(coin.addr); // success — clear failure history
     console.log(`[REAL] ✅ ENTRY TX confirmed (Jito): https://solscan.io/tx/${sig}`);
     const entryImpactPct = parseFloat(quote.priceImpactPct || 0) * 100;
     const jitoTipUsd     = (_jitoTip / 1e9) * solPrice;
