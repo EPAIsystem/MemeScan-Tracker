@@ -1152,11 +1152,10 @@ async function getSolPriceUsd() {
 }
 
 async function jupiterQuote(inputMint, outputMint, amountLamports, slippageBps = 100) {
-  // Use stable v6 endpoint — Jito bundle engine requires v6 swap transactions;
-  // v1 swap produces a tx format Jito rejects with HTTP 500.
-  const jupHost    = 'quote-api.jup.ag';
-  const jupHeaders = {};
-  const path = `/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}`;
+  // v1 endpoint covers newer tokens; API key doubles rate limit (1 req/s vs 0.5)
+  const jupHost    = 'api.jup.ag';
+  const jupHeaders = process.env.JUPITER_API_KEY ? { 'x-api-key': process.env.JUPITER_API_KEY } : {};
+  const path = `/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}`;
   const MAX_ATTEMPTS = 3;
   const RETRY_DELAY  = 600; // ms between retries — covers transient 500s
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -1185,12 +1184,13 @@ async function jupiterGetSwapTx(quote, walletPublicKey) {
       wrapAndUnwrapSol: true,
       prioritizationFeeLamports: 'auto', // let Jupiter calculate the optimal priority fee
     });
-    // Both quote and swap use v6 — Jito rejects transactions produced by v1/swap.
+    // v1 quote + v1 swap — consistent pair; transactions submitted via direct RPC (no Jito)
     const swapHeaders = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
+    if (process.env.JUPITER_API_KEY) swapHeaders['x-api-key'] = process.env.JUPITER_API_KEY;
     const r = await new Promise((resolve) => {
       const req = https.request({
-        hostname: 'quote-api.jup.ag',
-        path: '/v6/swap',
+        hostname: 'api.jup.ag',
+        path: '/swap/v1/swap',
         method: 'POST',
         headers: swapHeaders,
         timeout: 15000,
