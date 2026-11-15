@@ -2644,8 +2644,26 @@ async function checkDayRestart() {
     // The cache TTL is 30s, so restart commands are picked up within 30 seconds.
     const data = await getTradingConfig();
     if (!data.restartDay) return false;
-    // Invalidate cache so the flag-clear write below is reflected immediately
+    // Invalidate cache immediately so stale restartDay=true doesn't re-trigger
     _tradingCfg = null; _tradingCfgAt = 0;
+
+    // ── Atomically claim the restart flag ──
+    // Two instances can race here during rolling deploys.  Only the one that
+    // successfully flips restartDay true→false inside the transaction may proceed;
+    // the other finds it already false and exits cleanly.
+    const ctrlRef = db.collection('paper_config').doc('control');
+    let claimed = false;
+    try {
+      await db.runTransaction(async (txn) => {
+        const ctrlDoc = await txn.get(ctrlRef);
+        if (!ctrlDoc.data()?.restartDay) throw Object.assign(new Error('already_claimed'), { code: 'already_claimed' });
+        txn.update(ctrlRef, { restartDay: false, lastRestartAt: Date.now() });
+      });
+      claimed = true;
+    } catch(e) {
+      if (e.code === 'already_claimed') return false; // other instance got here first
+      throw e; // unexpected Firestore error — propagate
+    }
 
     // ── Read today's current stats ──
     const today = new Date().toISOString().slice(0, 10);
@@ -2680,11 +2698,6 @@ async function checkDayRestart() {
     momentumReentryWatch.clear();
     taScoreCache.clear();
     dayHaltedToday = false;
-
-    // Clear the flag so we don't restart again immediately
-    await db.collection('paper_config').doc('control').update({
-      restartDay: false, lastRestartAt: Date.now(),
-    });
 
     const pnlStr = prevPnL >= 0
       ? `+$${prevPnL.toFixed(2)}`
