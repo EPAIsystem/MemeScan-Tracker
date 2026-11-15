@@ -184,6 +184,37 @@ header {
 .pnl-split-tag.manual { background: rgba(255,193,7,.15);  color: var(--yellow); }
 
 /* ── Stats tiles ─────────────────────────────────────────────────────────────── */
+/* ── Trading Period Banner ───────────────────────────────────────────────────── */
+.period-banner {
+  border-radius: 11px;
+  padding: 14px 16px;
+  margin-bottom: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.period-banner.green  { background: rgba(46,194,126,.07);  border: 1px solid rgba(46,194,126,.22); }
+.period-banner.red    { background: rgba(232,83,74,.07);   border: 1px solid rgba(232,83,74,.22); }
+.period-banner.yellow { background: rgba(232,168,56,.07);  border: 1px solid rgba(232,168,56,.22); }
+.period-left  { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
+.period-emoji { font-size: 22px; flex-shrink: 0; }
+.period-info  { min-width: 0; }
+.period-name  { font-size: 13px; font-weight: 600; }
+.period-desc  { font-size: 11px; color: var(--fg2); margin-top: 2px; }
+.period-tip   { font-size: 11px; color: var(--fg3); font-style: italic; margin-top: 2px; }
+.period-right { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; flex-shrink: 0; }
+.mode-toggle-btn {
+  font-family: var(--sans); font-size: 12px; font-weight: 600;
+  border-radius: 20px; padding: 6px 16px; cursor: pointer;
+  transition: opacity .15s; border: 1px solid;
+}
+.mode-toggle-btn:hover { opacity: .75; }
+.mode-toggle-btn.is-auto   { background: rgba(79,110,247,.18); color: var(--accent); border-color: rgba(79,110,247,.4); }
+.mode-toggle-btn.is-manual { background: rgba(232,168,56,.18);  color: var(--yellow); border-color: rgba(232,168,56,.4); }
+.period-hint { font-size: 10px; color: var(--fg3); }
+
 .stats-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -1132,6 +1163,7 @@ function render() {
 
       ${errHTML}
       ${modeBanner}
+      ${periodBannerHTML()}
 
       <div class="stats-grid">
         <div class="stat-tile">
@@ -1404,6 +1436,57 @@ async function toggleTP(posId, currentlyDisabled) {
     loadData();
   } catch (e) {
     S.error = 'TP toggle failed: ' + e.message;
+    render();
+  }
+}
+
+// ── Trading Period Banner ─────────────────────────────────────────────────────
+function periodBannerHTML() {
+  const p = S.control.currentPeriod;
+  if (!p) return ''; // bot hasn't written a period yet (first run)
+
+  const paused  = !!S.control.autoEntryPaused;
+  const btnLabel = paused ? '🖐 MANUAL — tap for AUTO' : '🤖 AUTO — tap for MANUAL';
+  const btnClass = paused ? 'is-manual' : 'is-auto';
+  const hint     = paused
+    ? `Override active · /auto in Telegram to match`
+    : `Override active · /manual in Telegram to match`;
+  // Show override hint only if mode doesn't match period's recommendation
+  const mismatch = paused === p.autoMode; // paused=true means manual; autoMode=true means auto expected
+  return `
+    <div class="period-banner ${p.color || 'yellow'}">
+      <div class="period-left">
+        <div class="period-emoji">${p.emoji || '🕐'}</div>
+        <div class="period-info">
+          <div class="period-name">${p.name}</div>
+          <div class="period-desc">${p.description}</div>
+          <div class="period-tip">${p.tip}</div>
+        </div>
+      </div>
+      <div class="period-right">
+        <button class="mode-toggle-btn ${btnClass}" onclick="toggleEntryMode()">${btnLabel}</button>
+        ${mismatch ? `<div class="period-hint">⚠ Overridden · resets at next period</div>` : ''}
+      </div>
+    </div>`;
+}
+
+async function toggleEntryMode() {
+  const newPaused = !S.control.autoEntryPaused;
+  S.control.autoEntryPaused = newPaused; // optimistic
+  render();
+  try {
+    const base = `https://firestore.googleapis.com/v1/projects/${S.config.projectId}/databases/(default)/documents`;
+    const url  = `${base}/paper_config/control?key=${S.config.apiKey}&updateMask.fieldPaths=autoEntryPaused`;
+    const body = { fields: { autoEntryPaused: { booleanValue: newPaused } } };
+    const r = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', ...(await authHeaders(S.config)) },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+  } catch(e) {
+    S.control.autoEntryPaused = !newPaused; // roll back
+    S.error = 'Mode toggle failed: ' + e.message;
     render();
   }
 }

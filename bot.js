@@ -923,6 +923,95 @@ let lpLockBypass        = false; // /skiplp toggle  — bypasses filterByLpLock(
 let autoEntryPaused     = false; // /pauseentry toggle — signals alert but bot skips auto-entry
 let telegramOffset      = 0; // for Telegram command polling
 
+// ─── TRADING PERIODS ──────────────────────────────────────────────────────────
+// 4 non-overlapping UTC windows. autoMode=true → bot switches to AUTO at boundary.
+// autoMode=false → bot switches to MANUAL. User can override within a period;
+// the next boundary always resets to the period's default.
+const TRADING_PERIODS = [
+  {
+    key: 'noise', name: 'Noise Period', emoji: '🔴', color: 'red',
+    startH: 0,  startM: 0,  endH: 8,  endM: 0,
+    autoMode: false, recommendation: 'Manual',
+    description: 'Asia-only hours. Low volume, pump-and-dump micro-caps, bonding curve traps common.',
+    tip: 'Pick your own coins — bot stays alert.',
+  },
+  {
+    key: 'moderate', name: 'Moderate Period', emoji: '🟡', color: 'yellow',
+    startH: 8,  startM: 0,  endH: 13, endM: 30,
+    autoMode: false, recommendation: 'Manual',
+    description: 'EU morning. Moderate activity, inconsistent quality, caution advised.',
+    tip: 'Watch signals closely before entering.',
+  },
+  {
+    key: 'quality', name: 'Quality Window', emoji: '🟢', color: 'green',
+    startH: 13, startM: 30, endH: 22, endM: 0,
+    autoMode: true, recommendation: 'Auto',
+    description: 'US market hours. Real momentum tokens, best volume and liquidity.',
+    tip: 'Bot catches qualifying coins as they launch.',
+  },
+  {
+    key: 'latenight', name: 'Late Night', emoji: '🟡', color: 'yellow',
+    startH: 22, startM: 0,  endH: 24, endM: 0,
+    autoMode: true, recommendation: 'Auto',
+    description: 'US evening session. Second wave of activity.',
+    tip: 'Bot watches while you sleep.',
+  },
+];
+let lastAnnouncedPeriodKey = null; // restored from Firestore on startup
+
+function getCurrentTradingPeriod() {
+  const now  = new Date();
+  const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  for (const p of TRADING_PERIODS) {
+    const start = p.startH * 60 + p.startM;
+    const end   = p.endH === 24 ? 1440 : p.endH * 60 + p.endM;
+    if (mins >= start && mins < end) return p;
+  }
+  return TRADING_PERIODS[0]; // fallback
+}
+
+function fmtUtcTime(h, m) {
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+}
+
+async function checkTradingPeriod() {
+  try {
+    const period = getCurrentTradingPeriod();
+    if (period.key === lastAnnouncedPeriodKey) return; // no change, nothing to do
+    lastAnnouncedPeriodKey = period.key;
+
+    // Auto-switch entry mode to this period's default
+    autoEntryPaused = !period.autoMode;
+    _tradingCfg = null; // bust config cache
+    await db.collection('paper_config').doc('control').set({
+      autoEntryPaused,
+      currentPeriod: {
+        key:            period.key,
+        name:           period.name,
+        emoji:          period.emoji,
+        color:          period.color,
+        recommendation: period.recommendation,
+        description:    period.description,
+        tip:            period.tip,
+        autoMode:       period.autoMode,
+        activeSince:    Date.now(),
+      },
+    }, { merge: true });
+
+    const modeStr  = autoEntryPaused ? '🖐 MANUAL' : '🤖 AUTO';
+    const override = period.autoMode ? '/manual to override' : '/auto to override';
+    await sendTelegram(
+      `${period.emoji} *${period.name.toUpperCase()}* — ${fmtUtcTime(period.startH, period.startM)} UTC\n\n` +
+      `${period.description}\n\n` +
+      `Bot switched to *${modeStr}*.\n` +
+      `_${period.tip}_\n\n` +
+      `Send /${period.autoMode ? 'manual' : 'auto'} to override.`
+    );
+  } catch(e) {
+    console.error('[BOT] checkTradingPeriod error:', e.message);
+  }
+}
+
 // ─── POSITION CACHE ───────────────────────────────────────────────────────────
 // Reduces Firestore reads from ~250K/day to ~1.5K/day
 // Full re-query every 60s; individual updates/closes patch in-place.
@@ -3952,8 +4041,9 @@ async function filterByLpLock(matches) {
 async function monitorPositions() {
   if (!(await isBotRunning())) return;
 
-  // Check for day-restart and add-funds requests before anything else
+  // Check for day-restart, period transitions, and add-funds requests
   await checkDayRestart();
+  await checkTradingPeriod();
   const cfg = await getTradingConfig();
   await checkAddFunds(cfg);
 
@@ -5181,6 +5271,7 @@ async function scanForEntries() {
     await checkDayRestart(); // check if user sent /restart
     return;
   }
+  await checkTradingPeriod();
   const positions = await getVisiblePositions();
   if (positions.length >= MAX_POSITIONS) return;
 
@@ -5716,7 +5807,8 @@ async function main() {
   globalGatesBypass     = !!startCfg.gatesOpen;
   lpLockBypass          = !!startCfg.lpOpen;
   strategyFiltersActive = !startCfg.stratsSkipped; // inverted: true = filters on
-  autoEntryPaused       = !!startCfg.autoEntryPaused;
+  autoEntryPaused          = !!startCfg.autoEntryPaused;
+  lastAnnouncedPeriodKey   = startCfg.currentPeriod?.key || null; // don't re-announce on restart
   if (globalGatesBypass || lpLockBypass || !strategyFiltersActive) {
     const active = [
       globalGatesBypass      ? '⚠️ Global gates: BYPASSED' : null,
