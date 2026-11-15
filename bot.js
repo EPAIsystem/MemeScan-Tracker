@@ -1426,16 +1426,19 @@ async function executeRealEntry(coin, wallet, posSize) {
   }
 }
 
-async function executeRealExit(pos, wallet, exitPrice) {
+// Core Solana sell: query wallet balance, sell `sellFrac` of it via Jupiter.
+// sellFrac = 1.0 for full exit, 0.5 for half of remaining, etc.
+// Used by both full exits (executeRealExit) and partial profit-taking (realPartialSell).
+async function executeRealSell(pos, wallet, sellFrac, exitPrice) {
   if (pos.chain !== 'solana') {
-    console.warn(`[REAL] Chain "${pos.chain}" not yet supported. Exit logged as paper.`);
+    console.warn(`[REAL] Chain "${pos.chain}" not yet supported. Sell logged as paper.`);
     return { txHash: null, executedPrice: exitPrice, simulated: true };
   }
   if (!SolanaWeb3 || !bs58) return { txHash: null, executedPrice: exitPrice, error: 'Solana SDK not installed' };
 
   const privKeyStr = process.env[`${wallet.envKey}_PRIVATE_KEY`];
   if (!privKeyStr) {
-    console.warn(`[REAL] ⚠️  No private key for ${wallet.label}. Exit NOT executed.`);
+    console.warn(`[REAL] ⚠️  No private key for ${wallet.label}. Sell NOT executed.`);
     return { txHash: null, executedPrice: exitPrice, error: 'Missing private key' };
   }
 
@@ -1444,8 +1447,6 @@ async function executeRealExit(pos, wallet, exitPrice) {
   catch(e) { return { txHash: null, executedPrice: exitPrice, error: e.message }; }
 
   try {
-    const remaining = pos.remaining || 1.0;
-
     // ── Query actual wallet token balance (avoids stored wrong-unit amounts) ──
     const { Connection, PublicKey } = SolanaWeb3;
     const connection = new Connection(SOL_RPC, 'confirmed');
@@ -1460,14 +1461,14 @@ async function executeRealExit(pos, wallet, exitPrice) {
         rawBalance += BigInt(acct.account.data.parsed.info.tokenAmount.amount);
       }
       if (rawBalance === BigInt(0)) {
-        console.warn(`[REAL] EXIT ${pos.symbol} — zero token balance in wallet (already sold or not received). Skipping on-chain sell.`);
+        console.warn(`[REAL] SELL ${pos.symbol} — zero token balance in wallet (already sold or not received). Skipping.`);
         return { txHash: null, executedPrice: exitPrice, simulated: false, error: 'Zero token balance — already sold?' };
       }
       // Sell the requested fraction of real wallet balance
-      tokensToSell = remaining >= 1.0
+      tokensToSell = sellFrac >= 1.0
         ? rawBalance
-        : rawBalance * BigInt(Math.round(remaining * 10000)) / BigInt(10000);
-      console.log(`[REAL] EXIT ${pos.symbol} | wallet: ${rawBalance} raw → selling ${(remaining*100).toFixed(0)}% = ${tokensToSell}`);
+        : rawBalance * BigInt(Math.round(sellFrac * 10000)) / BigInt(10000);
+      console.log(`[REAL] SELL ${pos.symbol} | wallet: ${rawBalance} raw → ${(sellFrac*100).toFixed(1)}% = ${tokensToSell}`);
     } catch (balErr) {
       // Fallback: use stored realTokenAmount (string raw units for new positions)
       console.warn(`[REAL] Wallet balance query failed: ${balErr.message}. Falling back to stored realTokenAmount.`);
@@ -1477,42 +1478,47 @@ async function executeRealExit(pos, wallet, exitPrice) {
       }
       try {
         const rawFallback = BigInt(stored); // works for both string "500000000000" and old numeric values
-        tokensToSell = remaining >= 1.0
+        tokensToSell = sellFrac >= 1.0
           ? rawFallback
-          : rawFallback * BigInt(Math.round(remaining * 10000)) / BigInt(10000);
+          : rawFallback * BigInt(Math.round(sellFrac * 10000)) / BigInt(10000);
       } catch {
-        tokensToSell = BigInt(Math.floor(Number(stored) * remaining));
+        tokensToSell = BigInt(Math.floor(Number(stored) * sellFrac));
       }
-      console.log(`[REAL] EXIT ${pos.symbol} | fallback stored: ${tokensToSell}`);
+      console.log(`[REAL] SELL ${pos.symbol} | fallback stored: ${tokensToSell}`);
     }
 
-    const quote = await jupiterQuote(pos.address, SOL_MINT, tokensToSell.toString(), 200); // 2% slippage on sell
-    if (!quote) return { txHash: null, executedPrice: exitPrice, error: 'Jupiter exit quote failed' };
+    const quote = await jupiterQuote(pos.address, SOL_MINT, tokensToSell.toString(), 200); // 2% slippage
+    if (!quote) return { txHash: null, executedPrice: exitPrice, error: 'Jupiter quote failed' };
 
-    // ── PRICE IMPACT GUARD on exit — warn if selling into thin liquidity ──
-    const MAX_EXIT_IMPACT = 0.02; // 2% — warn and log but still exit (must sell)
-    const impactExit = parseFloat(quote.priceImpactPct || 0);
-    if (impactExit > MAX_EXIT_IMPACT) {
-      const impactStr = (impactExit * 100).toFixed(2);
-      console.warn(`[REAL] ⚠️  EXIT high impact ${impactStr}% for ${pos.symbol} — proceeding (must exit)`);
+    // ── PRICE IMPACT GUARD — warn if selling into thin liquidity ──
+    const MAX_SELL_IMPACT = 0.02; // 2% — warn but always proceed (position must close)
+    const impactSell = parseFloat(quote.priceImpactPct || 0);
+    if (impactSell > MAX_SELL_IMPACT) {
+      const impactStr = (impactSell * 100).toFixed(2);
+      console.warn(`[REAL] ⚠️  High sell impact ${impactStr}% for ${pos.symbol} — proceeding`);
       await sendTelegram(
-        `⚠️ *HIGH IMPACT EXIT — ${pos.symbol}*\n\n` +
+        `⚠️ *HIGH IMPACT SELL — ${pos.symbol}*\n\n` +
         `Selling into thin liquidity — price impact *${impactStr}%*\n` +
-        `Proceeding anyway (position must close).`
+        `Proceeding anyway.`
       );
     }
 
     const swapTx = await jupiterGetSwapTx(quote, keypair.publicKey.toBase58());
-    if (!swapTx) return { txHash: null, executedPrice: exitPrice, error: 'Jupiter exit swap TX failed' };
+    if (!swapTx) return { txHash: null, executedPrice: exitPrice, error: 'Jupiter swap TX failed' };
 
     const sig = await sendViaRpc(swapTx, keypair);
-    console.log(`[REAL] ✅ EXIT TX confirmed: https://solscan.io/tx/${sig}`);
+    console.log(`[REAL] ✅ SELL TX confirmed: https://solscan.io/tx/${sig}`);
     const exitImpactPct = parseFloat(quote.priceImpactPct || 0) * 100;
     return { txHash: sig, executedPrice: exitPrice, exitImpactPct, jitoTipUsd: 0 };
   } catch(e) {
-    console.error(`[REAL] EXIT failed for ${pos.symbol}:`, e.message);
+    console.error(`[REAL] SELL failed for ${pos.symbol}:`, e.message);
     return { txHash: null, executedPrice: exitPrice, error: e.message };
   }
+}
+
+// Full exit wrapper: sells pos.remaining of wallet balance.
+async function executeRealExit(pos, wallet, exitPrice) {
+  return executeRealSell(pos, wallet, pos.remaining || 1.0, exitPrice);
 }
 
 async function getOpenPositions() {
@@ -1569,11 +1575,16 @@ function simulateFillPrice(rawPrice, positionSize, liquidityUsd, isBuy) {
 }
 
 // Returns the dollar cost of the fee/slippage haircut on an exit fill.
-// paper mode only — for real mode, use jitoTipUsd + exitImpactPct from the tx.
-function calcExitFeeUsd(pos, rawPrice, fillPrice, fraction) {
+// For real mode, pass realImpactPct (from exitResult.exitImpactPct) for accurate tracking.
+// Falls back to simulated fill-price haircut for paper mode or when realImpactPct is absent.
+function calcExitFeeUsd(pos, rawPrice, fillPrice, fraction, realImpactPct) {
   if (!rawPrice || rawPrice <= 0) return 0;
   const frac = fraction != null ? fraction : (pos.remaining || 1);
-  // Cost = dollars we lost vs fair value: position_value * (1 - fillPrice/rawPrice)
+  if (realImpactPct != null && realImpactPct >= 0) {
+    // Real mode: cost = position_value × impact fraction
+    return pos.size * frac * (realImpactPct / 100);
+  }
+  // Paper mode / fallback: Cost = dollars we lost vs fair value: position_value * (1 - fillPrice/rawPrice)
   return pos.size * frac * Math.max(0, 1 - fillPrice / rawPrice);
 }
 
@@ -1959,9 +1970,12 @@ async function closePosition(id, data) {
 }
 
 // Wraps closePosition for real-trade positions: executes the on-chain sell FIRST.
-// Returns true when the position was closed, false when the sell failed (stays open).
-// Callers must check the return value and skip stats/notifications on false.
+// Returns { ok: true, txHash?, exitImpactPct? } on success,
+//         { ok: false, error } when the sell failed (position stays open).
+// Callers MUST check .ok and skip stats/notifications when false.
 async function realClose(pos, exitPrice, exitReason, pnl, extraData = {}) {
+  let txHash = null;
+  let exitImpactPct = null;
   if (pos.tradingMode === 'real' && pos.walletId) {
     const wallets = await getWallets();
     const wallet  = wallets.find(w => w.id === pos.walletId);
@@ -1976,14 +1990,40 @@ async function realClose(pos, exitPrice, exitReason, pnl, extraData = {}) {
           `Reason: ${reason}\n\n` +
           `_Position is still open. Tokens are in your wallet. Bot will retry on next trigger._`
         ).catch(() => {});
-        return false;
+        return { ok: false, error: reason };
       }
-      extraData.exitTxHash   = exitResult.txHash;
-      if (exitResult.exitImpactPct != null) extraData.exitImpactPct = exitResult.exitImpactPct;
+      txHash = exitResult.txHash;
+      exitImpactPct = exitResult.exitImpactPct ?? null;
+      extraData.exitTxHash = txHash;
+      if (exitImpactPct != null) extraData.exitImpactPct = exitImpactPct;
     }
   }
   await closePosition(pos.id, { exitPrice, exitReason, pnl, ...extraData });
-  return true;
+  return { ok: true, txHash, exitImpactPct };
+}
+
+// Convenience wrapper for partial exits: executes real on-chain sell of `sellFrac`
+// of CURRENT wallet balance for real-mode trades. No-op for paper mode.
+// Returns { ok: true, txHash?, exitImpactPct? } or { ok: false, error }.
+// If the sell fails, Firestore is NOT updated — position stays at current remaining.
+async function realPartialSell(pos, sellFrac, exitPrice) {
+  if (pos.tradingMode !== 'real' || !pos.walletId) return { ok: true };
+  const wallets = await getWallets();
+  const wallet  = wallets.find(w => w.id === pos.walletId);
+  if (!wallet) return { ok: false, error: 'Wallet not found' };
+  const result = await executeRealSell(pos, wallet, sellFrac, exitPrice);
+  if (!result?.txHash) {
+    const error = result?.error || 'Partial sell failed';
+    console.error(`[REAL] ⛔ PARTIAL SELL failed for ${pos.symbol}: ${error} — Firestore NOT updated`);
+    await sendTelegram(
+      `⛔ *REAL PARTIAL SELL FAILED*\n\n` +
+      `*${pos.symbol}* — partial exit skipped\n` +
+      `Reason: ${error}\n\n` +
+      `_Position size unchanged. Bot will try again on next trigger._`
+    ).catch(() => {});
+    return { ok: false, error };
+  }
+  return { ok: true, txHash: result.txHash, exitImpactPct: result.exitImpactPct ?? 0 };
 }
 
 async function getDailyStats() {
@@ -2910,8 +2950,8 @@ async function pollTelegramCommands() {
               const price   = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
               const exitPnl = (price - pos.entryPrice) / pos.entryPrice * (pos.size || POSITION_SIZE) * (pos.remaining || 1);
               const pnl     = (pos.pnl || 0) + exitPnl;
-              const _closed = await realClose(pos, price, 'MANUAL_CLEARALL', pnl);
-              if (!_closed) continue;
+              const _result = await realClose(pos, price, 'MANUAL_CLEARALL', pnl);
+              if (!_result?.ok) continue;
               await updateDailyStats(exitPnl, exitPnl > 0, !!pos.isManual, 0);
               enteredToday.delete(pos.address);
               cleared++;
@@ -3886,14 +3926,15 @@ async function monitorPositions() {
       : price;
     const exitPnl  = (exitFillPriceManual - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
     const pnl      = (pos.pnl || 0) + exitPnl;
-    const _closedManual = await realClose(pos, exitFillPriceManual, 'MANUAL_CLOSE', pnl);
-    if (!_closedManual) continue;
-    await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPriceManual, pos.remaining));
+    const _result = await realClose(pos, exitFillPriceManual, 'MANUAL_CLOSE', pnl);
+    if (!_result?.ok) continue;
+    await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPriceManual, pos.remaining, _result.exitImpactPct));
     enteredToday.delete(pos.address);
     await sendTelegram(
       `🚫 *MANUAL CLOSE*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
       `${fmtTradeResult(pos.size, pnl)}\n` +
-      `📥 Exit price: $${fmtPrice(exitFillPriceManual)}\n🔗 [Chart](${pos.dexUrl})`
+      `📥 Exit price: $${fmtPrice(exitFillPriceManual)}\n🔗 [Chart](${pos.dexUrl})` +
+      `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
     );
   }
 
@@ -3914,10 +3955,11 @@ async function monitorPositions() {
           : price;
         const exitPnl       = (exitFillPrice - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
         const pnl           = (pos.pnl || 0) + exitPnl;
-        const _closedDL = await realClose(pos, exitFillPrice, 'DAILY_LIMIT', pnl);
-        if (!_closedDL) continue;
-        await updateDailyStats(exitPnl, exitPnl > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
-        await sendTelegram(`🚨 *DAILY LOSS LIMIT*\n*${pos.symbol}* ${pos.strategyLabel}\n${fmtTradeResult(pos.size, pnl)}`);
+        const _result = await realClose(pos, exitFillPrice, 'DAILY_LIMIT', pnl);
+        if (!_result?.ok) continue;
+        await updateDailyStats(exitPnl, exitPnl > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct));
+        await sendTelegram(`🚨 *DAILY LOSS LIMIT*\n*${pos.symbol}* ${pos.strategyLabel}\n${fmtTradeResult(pos.size, pnl)}` +
+          `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`);
       }
       const lostPct = Math.abs((stats.realizedPnL / stats.startBalance) * 100).toFixed(1);
       await sendTelegram(
@@ -3949,10 +3991,11 @@ async function monitorPositions() {
         : price;
       const exitPnl = (exitFillPriceExp - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
       const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
-      const _closedExp = await realClose(pos, exitFillPriceExp, 'EXPIRED', pnl);
-      if (!_closedExp) continue;
-      await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPriceExp, pos.remaining));
-      await sendTelegram(`⏰ *EXPIRED* — *${pos.symbol}* ${pos.strategyLabel}\n${fmtTradeResult(pos.size, pnl)}\n📥 Exit: $${fmtPrice(exitFillPriceExp)}\n🔗 [Chart](${pos.dexUrl})`);
+      const _result = await realClose(pos, exitFillPriceExp, 'EXPIRED', pnl);
+      if (!_result?.ok) continue;
+      await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPriceExp, pos.remaining, _result.exitImpactPct));
+      await sendTelegram(`⏰ *EXPIRED* — *${pos.symbol}* ${pos.strategyLabel}\n${fmtTradeResult(pos.size, pnl)}\n📥 Exit: $${fmtPrice(exitFillPriceExp)}\n🔗 [Chart](${pos.dexUrl})` +
+        `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`);
       enteredToday.delete(pos.address);
       continue;
     }
@@ -3971,15 +4014,16 @@ async function monitorPositions() {
           : price;
         const exitPnL = (exitFillPrice - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
         const pnl     = (pos.pnl || 0) + exitPnL;
-        const _closedLiq = await realClose(pos, exitFillPrice, 'LIQ_DRAINED', pnl);
-        if (!_closedLiq) continue;
-        await updateDailyStats(exitPnL, exitPnL > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
+        const _result = await realClose(pos, exitFillPrice, 'LIQ_DRAINED', pnl);
+        if (!_result?.ok) continue;
+        await updateDailyStats(exitPnL, exitPnL > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct));
         await sendTelegram(
           `⚠️ *LIQ DRAINED — EMERGENCY EXIT*\n\n` +
           `*${pos.symbol}* ${pos.strategyLabel}\n` +
           `💧 Liquidity collapsed to $${currentLiq < 1 ? '<1' : currentLiq.toFixed(0)} — rug pull risk\n` +
           `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
-          `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})`
+          `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})` +
+          `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
         );
         enteredToday.delete(pos.address);
         console.log(`[BOT] LIQ_DRAINED ${pos.symbol}: liq=$${currentLiq?.toFixed(0)}`);
@@ -4035,16 +4079,17 @@ async function monitorPositions() {
                   : price;
                 const rugGain  = (rugFill - rugPos.entryPrice) / rugPos.entryPrice;
                 const rugPnL   = rugGain * rugPos.size * rugPos.remaining + (rugPos.pnl || 0);
-                const _closedRug = await realClose(rugPos, rugFill, 'RUG_EMERGENCY', rugPnL);
-                if (!_closedRug) continue;
+                const _result = await realClose(rugPos, rugFill, 'RUG_EMERGENCY', rugPnL);
+                if (!_result?.ok) continue;
                 await updateDailyStats(rugPnL, false, rugPos.isManual || false,
-                  calcExitFeeUsd(rugPos, price, rugFill, rugPos.remaining));
+                  calcExitFeeUsd(rugPos, price, rugFill, rugPos.remaining, _result.exitImpactPct));
                 await sendTelegram(
                   `🚨 *RUG EMERGENCY EXIT*\n\n` +
                   `*${rugPos.symbol}* ${rugPos.strategyLabel}\n` +
                   `📉 *${(drop*100).toFixed(0)}% crash in ${Math.round((now - refEntry.ts)/1000)}s* (signal #${sigCount})\n` +
                   `📥 Entry: $${fmtPrice(rugPos.entryPrice)} → Exit: $${fmtPrice(rugFill)}\n` +
-                  `${fmtTradeResult(rugPos.size, rugPnL)}\n🔗 [Chart](${rugPos.dexUrl})`
+                  `${fmtTradeResult(rugPos.size, rugPnL)}\n🔗 [Chart](${rugPos.dexUrl})` +
+                  `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
                 );
               } finally {
                 closingNow.delete(rugPos.id);
@@ -4163,16 +4208,17 @@ async function monitorPositions() {
           try {
             const exitPnl = fillGain * pos.size * pos.remaining;
             const pnl     = (pos.pnl || 0) + exitPnl;
-            const _closedSP = await realClose(pos, exitFillPrice, 'SURGE_STALE_PROFIT', pnl);
-            if (!_closedSP) continue;
-            await updateDailyStats(exitPnl, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
+            const _result = await realClose(pos, exitFillPrice, 'SURGE_STALE_PROFIT', pnl);
+            if (!_result?.ok) continue;
+            await updateDailyStats(exitPnl, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct));
             enteredToday.delete(pos.address);
             await sendTelegram(
               `⏱ *SURGE FADED — QUICK EXIT*\n\n` +
               `*${pos.symbol}* ${pos.strategyLabel}\n` +
               `📊 Held ${Math.round(ageMs/60000)}min — surge didn't continue\n` +
               `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
-              `💰 P&L: *+$${pnl.toFixed(2)}* (+${gainPct.toFixed(1)}%) | Slot freed\n🔗 [Chart](${pos.dexUrl})`
+              `💰 P&L: *+$${pnl.toFixed(2)}* (+${gainPct.toFixed(1)}%) | Slot freed\n🔗 [Chart](${pos.dexUrl})` +
+              `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
             );
           } finally {
             closingNow.delete(pos.id);
@@ -4187,16 +4233,17 @@ async function monitorPositions() {
           try {
             const exitPnl = fillGain * pos.size * pos.remaining;
             const pnl     = (pos.pnl || 0) + exitPnl;
-            const _closedSL2 = await realClose(pos, exitFillPrice, 'SURGE_STALE_LOSS', pnl);
-            if (!_closedSL2) continue;
-            await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
+            const _result = await realClose(pos, exitFillPrice, 'SURGE_STALE_LOSS', pnl);
+            if (!_result?.ok) continue;
+            await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct));
             // Loss exit — keep in enteredToday (blocked for the rest of the day)
             await sendTelegram(
               `⏱ *SURGE STALE — EXIT WITH LOSS*\n\n` +
               `*${pos.symbol}* ${pos.strategyLabel}\n` +
               `📉 ${gainPct.toFixed(1)}% after ${Math.round(ageMs/60000)}min — no recovery\n` +
               `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
-              `💸 P&L: *$${pnl.toFixed(2)}* | Slot freed for new surges\n🔗 [Chart](${pos.dexUrl})`
+              `💸 P&L: *$${pnl.toFixed(2)}* | Slot freed for new surges\n🔗 [Chart](${pos.dexUrl})` +
+              `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
             );
           } finally {
             closingNow.delete(pos.id);
@@ -4246,9 +4293,9 @@ async function monitorPositions() {
               try {
                 const exitPnl = fillGain * pos.size * pos.remaining;
                 const pnl     = (pos.pnl || 0) + exitPnl;
-                const _closedRE = await realClose(pos, exitFillPrice, 'RANGE_EXIT', pnl);
-                if (!_closedRE) continue;
-                await updateDailyStats(exitPnl, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
+                const _result = await realClose(pos, exitFillPrice, 'RANGE_EXIT', pnl);
+                if (!_result?.ok) continue;
+                await updateDailyStats(exitPnl, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct));
                 enteredToday.delete(pos.address);
                 rangeReentryWatchlist.set(pos.address, {
                   symbol: pos.symbol, strategyId: pos.strategyId, strategyLabel: pos.strategyLabel,
@@ -4259,7 +4306,8 @@ async function monitorPositions() {
                   `📊 At resistance $${fmtPrice(rangeHigh)}, momentum declining\n` +
                   `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
                   `💰 P&L: *+$${pnl.toFixed(2)}* (+${gainPct.toFixed(1)}%)\n` +
-                  `👀 Watching for re-entry near $${fmtPrice(rangeLow)}\n🔗 [Chart](${pos.dexUrl})`
+                  `👀 Watching for re-entry near $${fmtPrice(rangeLow)}\n🔗 [Chart](${pos.dexUrl})` +
+                  `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
                 );
               } finally {
                 closingNow.delete(pos.id);
@@ -4295,9 +4343,9 @@ async function monitorPositions() {
       try {
         const exitPnl = fillGain * pos.size * pos.remaining;
         const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
-        const _closedRD = await realClose(pos, exitFillPrice, 'RUG_DETECTED', pnl);
-        if (!_closedRD) continue;
-        await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
+        const _result = await realClose(pos, exitFillPrice, 'RUG_DETECTED', pnl);
+        if (!_result?.ok) continue;
+        await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct));
         recentSLCoins.set(pos.address, Date.now()); // block re-entry for 6h
         const dropPct = ((price / currentPeak - 1) * 100).toFixed(0);
         await sendTelegram(
@@ -4305,7 +4353,8 @@ async function monitorPositions() {
           `*${pos.symbol}* ${pos.strategyLabel}\n` +
           `📉 Dropped *${dropPct}%* from peak in one tick\n` +
           `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
-          `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})`
+          `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})` +
+          `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
         );
         console.log(`[BOT] RUG_DETECTED ${pos.symbol}: peak $${fmtPrice(currentPeak)} → now $${fmtPrice(price)} (${dropPct}%)`);
       } finally {
@@ -4322,9 +4371,9 @@ async function monitorPositions() {
       try {
         const exitPnl = fillGain * pos.size * pos.remaining;
         const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial TP exits
-        const _closedSLoss = await realClose(pos, exitFillPrice, 'STOP_LOSS', pnl);
-        if (!_closedSLoss) { closingNow.delete(pos.id); continue; }
-        await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
+        const _result = await realClose(pos, exitFillPrice, 'STOP_LOSS', pnl);
+        if (!_result?.ok) { closingNow.delete(pos.id); continue; }
+        await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct));
         // Slippage check — lifted here so it's available for both loss and profit paths
         const slippagePct = pos.currentSL > 0
           ? (pos.currentSL - exitFillPrice) / pos.currentSL
@@ -4380,7 +4429,8 @@ async function monitorPositions() {
           `*${pos.symbol}* ${pos.strategyLabel}\n` +
           `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
           `🛑 SL: $${fmtPrice(pos.currentSL)} | Trail: ${pos.trailPct != null ? pos.trailPct : '—'}%\n` +
-          `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})`
+          `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})` +
+          `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
         );
       } finally {
         closingNow.delete(pos.id);
@@ -4416,15 +4466,19 @@ async function monitorPositions() {
             pnl:                 (pos.pnl || 0) + partPnL,
             tpDisabled:          true, // TP sells done — profit trail takes over
           };
-          await updatePosition(pos.id, capUpdates);
-          await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, capitalFrac));
-          Object.assign(pos, capUpdates);
-          alertMsg = `🛡️ *CAPITAL RECOVERED*\n\n` +
-            `*${pos.symbol}* ${pos.strategyLabel}\n` +
-            `📥 Entry: $${fmtPrice(pos.entryPrice)} | Trigger: +50% (house money)\n` +
-            `💰 Sold ${(capitalFrac * 100).toFixed(1)}% → recovered $${newRecovered.toFixed(2)}\n` +
-            `🎯 ${(newRemaining * 100).toFixed(1)}% remains — 5× $${((pos.originalPositionSize || pos.size) * 0.20).toFixed(0)} profit withdrawals ahead\n` +
-            `🔗 [Chart](${pos.dexUrl})`;
+          const _cSell = await realPartialSell(pos, capitalFrac, exitFillPrice);
+          if (_cSell.ok) {
+            await updatePosition(pos.id, capUpdates);
+            await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, capitalFrac, _cSell.exitImpactPct));
+            Object.assign(pos, capUpdates);
+            alertMsg = `🛡️ *CAPITAL RECOVERED*\n\n` +
+              `*${pos.symbol}* ${pos.strategyLabel}\n` +
+              `📥 Entry: $${fmtPrice(pos.entryPrice)} | Trigger: +50% (house money)\n` +
+              `💰 Sold ${(capitalFrac * 100).toFixed(1)}% → recovered $${newRecovered.toFixed(2)}\n` +
+              `🎯 ${(newRemaining * 100).toFixed(1)}% remains — 5× $${((pos.originalPositionSize || pos.size) * 0.20).toFixed(0)} profit withdrawals ahead\n` +
+              `🔗 [Chart](${pos.dexUrl})` +
+              `${_cSell.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_cSell.txHash})` : ''}`;
+          }
         } else {
           // Prior TP sells already recovered full capital — just flip the flag
           const capUpdates = {
@@ -4482,18 +4536,22 @@ async function monitorPositions() {
             lastWithdrawalPrice: price,
             isMoonBag:          toMoonBag,
           };
-          await updatePosition(pos.id, wUpdates);
-          await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, wFill, closeRatio));
-          Object.assign(pos, wUpdates);
-          await sendTelegram(
-            `💰 *PROFIT WITHDRAWAL ${newCount}/5*\n\n` +
-            `*${pos.symbol}* ${pos.strategyLabel}\n` +
-            `📥 Entry: $${fmtPrice(pos.entryPrice)} | Now: +${gainPct.toFixed(1)}%\n` +
-            `💸 Sold ${(closeRatio*100).toFixed(1)}% → locked *$${partPnL.toFixed(2)}*\n` +
-            `🎯 ${(newRemaining*100).toFixed(1)}% remains${toMoonBag ? '\n🌕 *MOON BAG MODE — 20% trailing SL from ATH*' : ` — next at $${fmtPrice(price * 1.50)}`}\n` +
-            `🔗 [Chart](${pos.dexUrl})`
-          );
-          console.log(`[BOT] PROFIT_WITHDRAWAL ${newCount}/5 ${pos.symbol}: +${gainPct.toFixed(1)}%, sold ${(closeRatio*100).toFixed(1)}%, locked $${partPnL.toFixed(2)}`);
+          const _wSell = await realPartialSell(pos, closeRatio, wFill);
+          if (_wSell.ok) {
+            await updatePosition(pos.id, wUpdates);
+            await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, wFill, closeRatio, _wSell.exitImpactPct));
+            Object.assign(pos, wUpdates);
+            await sendTelegram(
+              `💰 *PROFIT WITHDRAWAL ${newCount}/5*\n\n` +
+              `*${pos.symbol}* ${pos.strategyLabel}\n` +
+              `📥 Entry: $${fmtPrice(pos.entryPrice)} | Now: +${gainPct.toFixed(1)}%\n` +
+              `💸 Sold ${(closeRatio*100).toFixed(1)}% → locked *$${partPnL.toFixed(2)}*\n` +
+              `🎯 ${(newRemaining*100).toFixed(1)}% remains${toMoonBag ? '\n🌕 *MOON BAG MODE — 20% trailing SL from ATH*' : ` — next at $${fmtPrice(price * 1.50)}`}\n` +
+              `🔗 [Chart](${pos.dexUrl})` +
+              `${_wSell.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_wSell.txHash})` : ''}`
+            );
+            console.log(`[BOT] PROFIT_WITHDRAWAL ${newCount}/5 ${pos.symbol}: +${gainPct.toFixed(1)}%, sold ${(closeRatio*100).toFixed(1)}%, locked $${partPnL.toFixed(2)}`);
+          }
         }
       }
     }
@@ -4519,18 +4577,22 @@ async function monitorPositions() {
         remaining:      newRemaining,
         pnl:            (pos.pnl || 0) + partPnL,
       };
-      await updatePosition(pos.id, halvUpdates);
-      await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, halveExit, amountSold));
-      Object.assign(pos, halvUpdates);
-      await sendTelegram(
-        `📤 *PROFIT HALVED — LOCKED*\n\n` +
-        `*${pos.symbol}* ${pos.strategyLabel}\n` +
-        `📥 Entry: $${fmtPrice(pos.entryPrice)} | Now: 4× (+${gainPct.toFixed(0)}%)\n` +
-        `💰 Sold 50% → $${proceeds.toFixed(2)} locked\n` +
-        `🎯 ${(newRemaining * 100).toFixed(1)}% remains — riding −10% trail\n` +
-        `🔗 [Chart](${pos.dexUrl})`
-      );
-      console.log(`[BOT] S5_PROFIT_HALVED ${pos.symbol}: +${gainPct.toFixed(0)}%, locked $${proceeds.toFixed(2)}, ${(newRemaining*100).toFixed(1)}% remains`);
+      const _hSell = await realPartialSell(pos, halveFrac, halveExit);
+      if (_hSell.ok) {
+        await updatePosition(pos.id, halvUpdates);
+        await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, halveExit, amountSold, _hSell.exitImpactPct));
+        Object.assign(pos, halvUpdates);
+        await sendTelegram(
+          `📤 *PROFIT HALVED — LOCKED*\n\n` +
+          `*${pos.symbol}* ${pos.strategyLabel}\n` +
+          `📥 Entry: $${fmtPrice(pos.entryPrice)} | Now: 4× (+${gainPct.toFixed(0)}%)\n` +
+          `💰 Sold 50% → $${proceeds.toFixed(2)} locked\n` +
+          `🎯 ${(newRemaining * 100).toFixed(1)}% remains — riding −10% trail\n` +
+          `🔗 [Chart](${pos.dexUrl})` +
+          `${_hSell.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_hSell.txHash})` : ''}`
+        );
+        console.log(`[BOT] S5_PROFIT_HALVED ${pos.symbol}: +${gainPct.toFixed(0)}%, locked $${proceeds.toFixed(2)}, ${(newRemaining*100).toFixed(1)}% remains`);
+      }
     }
 
     // ── RESISTANCE EXIT — 50% partial at estimated overhead resistance ─────────
@@ -4551,19 +4613,23 @@ async function monitorPositions() {
         remaining:     newRemaining,
         pnl:           (pos.pnl || 0) + partPnL,
       };
-      await updatePosition(pos.id, resistUpdates);
-      await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, amountSold));
-      Object.assign(pos, resistUpdates);
-      await sendTelegram(
-        `🧱 *RESISTANCE — PARTIAL EXIT*\n\n` +
-        `*${pos.symbol}* ${pos.strategyLabel}\n` +
-        `📐 Resistance hit at $${fmtPrice(pos.resistancePrice)}\n` +
-        `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
-        `💰 P&L (${(exitFrac*100).toFixed(0)}%): *${partPnL >= 0 ? '+' : ''}$${partPnL.toFixed(2)}*\n` +
-        `📊 ${(newRemaining * 100).toFixed(0)}% remains — riding with SL & trail\n` +
-        `🔗 [Chart](${pos.dexUrl})`
-      );
-      console.log(`[BOT] RESISTANCE_EXIT ${pos.symbol}: hit $${fmtPrice(pos.resistancePrice)}, pnL +$${partPnL.toFixed(2)}`);
+      const _reSell = await realPartialSell(pos, exitFrac, exitFillPrice);
+      if (_reSell.ok) {
+        await updatePosition(pos.id, resistUpdates);
+        await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, amountSold, _reSell.exitImpactPct));
+        Object.assign(pos, resistUpdates);
+        await sendTelegram(
+          `🧱 *RESISTANCE — PARTIAL EXIT*\n\n` +
+          `*${pos.symbol}* ${pos.strategyLabel}\n` +
+          `📐 Resistance hit at $${fmtPrice(pos.resistancePrice)}\n` +
+          `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
+          `💰 P&L (${(exitFrac*100).toFixed(0)}%): *${partPnL >= 0 ? '+' : ''}$${partPnL.toFixed(2)}*\n` +
+          `📊 ${(newRemaining * 100).toFixed(0)}% remains — riding with SL & trail\n` +
+          `🔗 [Chart](${pos.dexUrl})` +
+          `${_reSell.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_reSell.txHash})` : ''}`
+        );
+        console.log(`[BOT] RESISTANCE_EXIT ${pos.symbol}: hit $${fmtPrice(pos.resistancePrice)}, pnL +$${partPnL.toFixed(2)}`);
+      }
     }
 
     // ── TP EXITS REMOVED ─────────────────────────────────────────────────────
