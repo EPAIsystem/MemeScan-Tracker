@@ -193,7 +193,7 @@ const gateSimStats = {
 // Position scales with liquidity (1% of pool ≈ <1% price impact) and market cap.
 // POSITION_SIZE env var is now the MAXIMUM cap — not a fixed amount.
 // MC sweet spot ($25k–$200k): fast-moving small caps where small traders make the most.
-const POS_FLOOR = 10;   // $10 minimum — below this, fees erase profits
+const POS_FLOOR = 1;    // $1 minimum — allows small trial trades for real-mode testing
 
 // ─── RANGE-TRADE MODE (Bottom Bounce id 0, Active Momentum id 1, Old Recovery id 3) ──
 // When a position gains <5% in 30 minutes (slow movement), the bot identifies the
@@ -1611,9 +1611,9 @@ async function enterPosition(coin, overrides = {}) {
   if (ceiling > dynRec * 1.5 && dynRec > POS_FLOOR) {
     // User's ceiling is well above what the bot actually uses for this coin
     advisoryNote = `⚠️ Your ceiling ($${ceiling}) far exceeds what the bot calculated for this coin ($${dynRec}). Actual entry: $${posSize}. For larger trades, choose coins with higher liquidity.`;
-  } else if (ceiling < dynRec * 0.5 && ceiling < 50) {
-    // User's ceiling is too restrictive — entry may not cover fees
-    advisoryNote = `⚠️ Set size $${ceiling} is well below the bot's recommended $${dynRec} (liq × 1%). At this size, profits may not cover fees. Suggested: $${dynRec}.`;
+  } else if (ceiling < dynRec * 0.5 && ceiling < 10) {
+    // User's ceiling is very small — note that profits may not cover fees
+    advisoryNote = `⚠️ Set size $${ceiling} is well below the bot's recommended $${dynRec} (liq × 1%). At this size, profits may not cover fees. This is fine for trial/testing.`;
   }
   // Surge momentum disabled — surge exit + reinvest removed; capital floor handles profit protection
   const isSurge = false;
@@ -1832,13 +1832,6 @@ async function processManualQueue() {
             m5Ch:     result.m5Ch,
             ageMinutes: result.ageMinutes,
           };
-
-          // ── Young coin block ─────────────────────────────────────────────────
-          if (positions.length < 10 && (coin.ageMinutes || 0) < 20) {
-            await doc.ref.update({ status: 'skipped', reason: 'young_coin_block', ageMinutes: coin.ageMinutes, processedAt: Date.now() });
-            console.log(`[PRO-BRIDGE] BLOCKED ${coin.symbol} — ${(coin.ageMinutes||0).toFixed(1)}min old (young-coin block: positions=${positions.length})`);
-            continue;
-          }
 
           const pos = await enterPosition(coin);
           if (!pos) {
@@ -2206,12 +2199,6 @@ async function processPullbackWatchlist(positions, slotCount, usedThisScan) {
       coin._pulledBackPct = pullPct;
       coin._bouncedPct    = bouncePct;
 
-      // ── Young coin block ───────────────────────────────────────────────────
-      if (positions.length < 10 && (coin.ageMinutes || 0) < 20) {
-        console.log(`[PBW] BLOCKED ${coin.symbol} — ${(coin.ageMinutes||0).toFixed(1)}min old (young-coin block: positions=${positions.length})`);
-        continue;
-      }
-
       enteredToday.add(addr);
       usedThisScan.add(addr);
       const pos = await enterPosition(coin);
@@ -2351,12 +2338,6 @@ async function processMomentumReentry(positions) {
       _snapshotLow:      entry.snapshotLow,
       _postExitLow:      entry.postExitLow,
     };
-
-    // ── Young coin block ─────────────────────────────────────────────────────
-    if (positions.length < 10 && (coin.ageMinutes || 0) < 20) {
-      console.log(`[MREENTRY] BLOCKED ${coin.symbol} — ${(coin.ageMinutes||0).toFixed(1)}min old (young-coin block: positions=${positions.length})`);
-      continue;
-    }
 
     enteredToday.delete(addr); // clear so enterPosition doesn't reject it
     enteredToday.add(addr);
@@ -5517,15 +5498,6 @@ async function scanForEntries() {
         `_Resume auto-entry: /pauseentry off_`
       );
       console.log(`[BOT] ENTRY PAUSED — signal fired for ${coin.symbol} (${s.label}) but auto-entry is off`);
-      continue;
-    }
-
-    // ── Young coin block ─────────────────────────────────────────────────────
-    // Fewer than 10 open positions + coin younger than 20 minutes → block.
-    // Protects against rugs on ultra-new coins early in a session.
-    if (positions.length < 10 && (coin.ageMinutes || 0) < 20) {
-      console.log(`[SCAN] BLOCKED ${coin.symbol} — ${(coin.ageMinutes||0).toFixed(1)}min old (young-coin block: positions=${positions.length})`);
-      usedThisScan.add(coin.addr); // suppress repeat logs this tick
       continue;
     }
 
