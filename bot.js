@@ -1406,10 +1406,12 @@ async function executeRealEntry(coin, wallet, posSize) {
       return { txHash: null, executedPrice: coin.price, error: `Price impact too high: ${impactStr}%` };
     }
 
-    const tokensOut = parseFloat(quote.outAmount); // raw units (must divide by decimals later)
+    const tokensOutRaw = quote.outAmount || '0'; // raw units string from Jupiter
     const outDecimals = parseInt(quote.outputDecimals || quote.swapInfo?.outputMint?.decimals || 6, 10);
-    const tokenAmount = tokensOut / (10 ** outDecimals);
-    console.log(`[REAL] Jupiter: ${solAmount.toFixed(4)} SOL → ${tokenAmount.toLocaleString()} ${coin.symbol}`);
+    const tokenAmountHuman = Number(tokensOutRaw) / (10 ** outDecimals); // human-readable for display only
+    // Store raw units string so executeRealExit fallback can pass them directly to Jupiter
+    const tokenAmount = tokensOutRaw; // string — Firestore-safe
+    console.log(`[REAL] Jupiter: ${solAmount.toFixed(4)} SOL → ${tokenAmountHuman.toLocaleString()} ${coin.symbol} (${tokensOutRaw} raw)`);
 
     const swapTx = await jupiterGetSwapTx(quote, keypair.publicKey.toBase58());
     if (!swapTx) return { txHash: null, executedPrice: coin.price, error: 'Jupiter swap TX failed' };
@@ -1442,17 +1444,49 @@ async function executeRealExit(pos, wallet, exitPrice) {
   catch(e) { return { txHash: null, executedPrice: exitPrice, error: e.message }; }
 
   try {
-    // Token amount stored at entry. "remaining" fraction applies for partial exits.
-    const remaining   = pos.remaining || 1.0;
-    const totalTokens = pos.realTokenAmount || 0; // raw units set at entry
-    if (!totalTokens) {
-      console.warn(`[REAL] EXIT ${pos.symbol} — no realTokenAmount on position, cannot sell. Logging as paper.`);
-      return { txHash: null, executedPrice: exitPrice, simulated: true, error: 'No token amount stored' };
-    }
-    const tokensToSell = Math.floor(totalTokens * remaining);
-    console.log(`[REAL] EXIT ${pos.symbol} | ${tokensToSell} raw tokens (${(remaining*100).toFixed(0)}% of ${totalTokens})`);
+    const remaining = pos.remaining || 1.0;
 
-    const quote = await jupiterQuote(pos.address, SOL_MINT, tokensToSell, 200); // 2% slippage on sell
+    // ── Query actual wallet token balance (avoids stored wrong-unit amounts) ──
+    const { Connection, PublicKey } = SolanaWeb3;
+    const connection = new Connection(SOL_RPC, 'confirmed');
+    let tokensToSell;
+    try {
+      const { value: tokenAccounts } = await connection.getParsedTokenAccountsByOwner(
+        keypair.publicKey,
+        { mint: new PublicKey(pos.address) }
+      );
+      let rawBalance = BigInt(0);
+      for (const acct of tokenAccounts) {
+        rawBalance += BigInt(acct.account.data.parsed.info.tokenAmount.amount);
+      }
+      if (rawBalance === BigInt(0)) {
+        console.warn(`[REAL] EXIT ${pos.symbol} — zero token balance in wallet (already sold or not received). Skipping on-chain sell.`);
+        return { txHash: null, executedPrice: exitPrice, simulated: false, error: 'Zero token balance — already sold?' };
+      }
+      // Sell the requested fraction of real wallet balance
+      tokensToSell = remaining >= 1.0
+        ? rawBalance
+        : rawBalance * BigInt(Math.round(remaining * 10000)) / BigInt(10000);
+      console.log(`[REAL] EXIT ${pos.symbol} | wallet: ${rawBalance} raw → selling ${(remaining*100).toFixed(0)}% = ${tokensToSell}`);
+    } catch (balErr) {
+      // Fallback: use stored realTokenAmount (string raw units for new positions)
+      console.warn(`[REAL] Wallet balance query failed: ${balErr.message}. Falling back to stored realTokenAmount.`);
+      const stored = pos.realTokenAmount;
+      if (!stored) {
+        return { txHash: null, executedPrice: exitPrice, simulated: true, error: `No token amount stored and wallet query failed: ${balErr.message}` };
+      }
+      try {
+        const rawFallback = BigInt(stored); // works for both string "500000000000" and old numeric values
+        tokensToSell = remaining >= 1.0
+          ? rawFallback
+          : rawFallback * BigInt(Math.round(remaining * 10000)) / BigInt(10000);
+      } catch {
+        tokensToSell = BigInt(Math.floor(Number(stored) * remaining));
+      }
+      console.log(`[REAL] EXIT ${pos.symbol} | fallback stored: ${tokensToSell}`);
+    }
+
+    const quote = await jupiterQuote(pos.address, SOL_MINT, tokensToSell.toString(), 200); // 2% slippage on sell
     if (!quote) return { txHash: null, executedPrice: exitPrice, error: 'Jupiter exit quote failed' };
 
     // ── PRICE IMPACT GUARD on exit — warn if selling into thin liquidity ──
