@@ -1183,7 +1183,7 @@ async function jupiterGetSwapTx(quote, walletPublicKey) {
       quoteResponse: quote,
       userPublicKey: walletPublicKey,
       wrapAndUnwrapSol: true,
-      prioritizationFeeLamports: 5000, // ~0.000005 SOL tip for faster landing
+      prioritizationFeeLamports: 'auto', // let Jupiter calculate the optimal priority fee
     });
     // Both quote and swap use v6 — Jito rejects transactions produced by v1/swap.
     const swapHeaders = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
@@ -1294,6 +1294,37 @@ async function sendViaJitoBundle(swapTxBase64, keypair) {
   return sig;
 }
 
+// ─── DIRECT RPC SENDER ───────────────────────────────────────────────────────
+// Sends a signed Jupiter swap transaction directly via the Solana RPC node.
+// Simpler and more reliable than Jito for small trades ($10–$100) where MEV
+// risk is negligible. Priority fee is set to 'auto' by Jupiter at quote time.
+async function sendViaRpc(swapTxBase64, keypair) {
+  const { Connection, VersionedTransaction } = SolanaWeb3;
+  const connection = new Connection(SOL_RPC, 'confirmed');
+
+  // Deserialize and sign the Jupiter swap transaction
+  const swapBuf = Buffer.from(swapTxBase64, 'base64');
+  const swapTx  = VersionedTransaction.deserialize(swapBuf);
+  swapTx.sign([keypair]);
+
+  // Submit — skipPreflight false so the RPC validates before forwarding
+  const sig = await connection.sendRawTransaction(swapTx.serialize(), {
+    skipPreflight: false,
+    maxRetries: 3,
+  });
+  console.log(`[RPC] Tx sent: https://solscan.io/tx/${sig}`);
+
+  // Wait for confirmation
+  const latestBlockhash = await connection.getLatestBlockhash('confirmed');
+  const { value } = await connection.confirmTransaction(
+    { signature: sig, ...latestBlockhash },
+    'confirmed'
+  );
+  if (value.err) throw new Error(`Tx landed but failed on-chain: ${JSON.stringify(value.err)}`);
+
+  return sig;
+}
+
 async function executeRealEntry(coin, wallet, posSize) {
   if (coin.chain !== 'solana') {
     console.warn(`[REAL] Chain "${coin.chain}" not yet supported for real trading. Logging as paper.`);
@@ -1383,35 +1414,10 @@ async function executeRealEntry(coin, wallet, posSize) {
     const swapTx = await jupiterGetSwapTx(quote, keypair.publicKey.toBase58());
     if (!swapTx) return { txHash: null, executedPrice: coin.price, error: 'Jupiter swap TX failed' };
 
-    // ── JITO BUNDLE COOLDOWN CHECK ──────────────────────────────────────────
-    const _jbc = jitoBundleCooldown.get(coin.addr);
-    if (_jbc && Date.now() < _jbc.until) {
-      const minsLeft = Math.ceil((_jbc.until - Date.now()) / 60000);
-      console.log(`[REAL] ⏸ ${coin.symbol} — Jito cooldown active (${minsLeft}m left), skipping`);
-      return { txHash: null, executedPrice: coin.price, error: 'Jito bundle cooldown' };
-    }
-
-    let sig;
-    try {
-      sig = await sendViaJitoBundle(swapTx, keypair);
-    } catch(jitoErr) {
-      const prev   = jitoBundleCooldown.get(coin.addr);
-      const prevOk = !prev || Date.now() >= prev.until;
-      const count  = prevOk ? 1 : (prev.count + 1);
-      if (count >= JITO_FAIL_THRESHOLD) {
-        jitoBundleCooldown.set(coin.addr, { count, until: Date.now() + JITO_FAIL_COOLDOWN_MS });
-        console.warn(`[REAL] ⛔ ${coin.symbol} — Jito failed ${count}x, cooldown 30 min`);
-      } else {
-        jitoBundleCooldown.set(coin.addr, { count, until: 0 });
-        console.warn(`[REAL] ⚠️ ${coin.symbol} — Jito bundle failed (${count}/${JITO_FAIL_THRESHOLD}): ${jitoErr.message}`);
-      }
-      throw jitoErr; // bubble to outer catch → logs and returns null tx
-    }
-    jitoBundleCooldown.delete(coin.addr); // success — clear failure history
-    console.log(`[REAL] ✅ ENTRY TX confirmed (Jito): https://solscan.io/tx/${sig}`);
+    const sig = await sendViaRpc(swapTx, keypair);
+    console.log(`[REAL] ✅ ENTRY TX confirmed: https://solscan.io/tx/${sig}`);
     const entryImpactPct = parseFloat(quote.priceImpactPct || 0) * 100;
-    const jitoTipUsd     = (_jitoTip / 1e9) * solPrice;
-    return { txHash: sig, executedPrice: coin.price, tokenAmount, tokenDecimals: outDecimals, entryImpactPct, jitoTipUsd };
+    return { txHash: sig, executedPrice: coin.price, tokenAmount, tokenDecimals: outDecimals, entryImpactPct, jitoTipUsd: 0 };
   } catch(e) {
     console.error(`[REAL] ENTRY failed for ${coin.symbol}:`, e.message);
     return { txHash: null, executedPrice: coin.price, error: e.message };
@@ -1465,12 +1471,10 @@ async function executeRealExit(pos, wallet, exitPrice) {
     const swapTx = await jupiterGetSwapTx(quote, keypair.publicKey.toBase58());
     if (!swapTx) return { txHash: null, executedPrice: exitPrice, error: 'Jupiter exit swap TX failed' };
 
-    const sig = await sendViaJitoBundle(swapTx, keypair);
-    console.log(`[REAL] ✅ EXIT TX confirmed (Jito): https://solscan.io/tx/${sig}`);
+    const sig = await sendViaRpc(swapTx, keypair);
+    console.log(`[REAL] ✅ EXIT TX confirmed: https://solscan.io/tx/${sig}`);
     const exitImpactPct = parseFloat(quote.priceImpactPct || 0) * 100;
-    const solPriceExit  = await getSolPriceUsd();
-    const jitoTipUsd    = (_jitoTip / 1e9) * solPriceExit;
-    return { txHash: sig, executedPrice: exitPrice, exitImpactPct, jitoTipUsd };
+    return { txHash: sig, executedPrice: exitPrice, exitImpactPct, jitoTipUsd: 0 };
   } catch(e) {
     console.error(`[REAL] EXIT failed for ${pos.symbol}:`, e.message);
     return { txHash: null, executedPrice: exitPrice, error: e.message };
