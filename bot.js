@@ -902,7 +902,7 @@ const recentSLCoins = new Map();
 // Prevents retrying tokens Jupiter persistently can't route (empty-body 500s)
 const quoteFailCooldown      = new Map(); // addr → { count: number, until: number }
 const QUOTE_FAIL_COOLDOWN_MS = 30 * 60 * 1000; // 30-min block
-const QUOTE_FAIL_THRESHOLD   = 2;               // consecutive failures before block
+const QUOTE_FAIL_THRESHOLD   = 1;               // block after first failure — new coins rarely recover within minutes
 // Jito bundle failure cooldown — after 2 consecutive bundle failures, skip token 30 min
 // Prevents spamming tokens whose swap TX Jito consistently rejects
 const jitoBundleCooldown      = new Map(); // addr → { count: number, until: number }
@@ -1579,6 +1579,11 @@ async function enterPosition(coin, overrides = {}) {
     // If the on-chain tx failed (no hash), abort entirely — do NOT create a ghost position
     if (!realTx || !realTx.txHash) {
       const reason = realTx?.error || 'Transaction not executed';
+      // Cooldown skips are expected — log silently, no Telegram noise
+      if (reason === 'Jupiter quote cooldown' || reason === 'Jito bundle cooldown') {
+        console.log(`[REAL] ⏸ ${coin.symbol} skipped (${reason}) — no notification sent.`);
+        return null;
+      }
       console.warn(`[REAL] ⛔ Entry TX failed for ${coin.symbol}: ${reason}. No position created.`);
       await sendTelegram(
         `⛔ *REAL ENTRY FAILED — No Position Opened*\n\n` +
