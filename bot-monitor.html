@@ -1045,7 +1045,8 @@ function render() {
 
   const s = S.stats || {};
   const openLivePnl = S.positions.reduce((sum, p) => sum + (livePnl(p) || 0), 0);
-  const portfolio = (s.startBalance || 2000) + (s.realizedPnL || 0) + openLivePnl;
+  const posSize   = S.control.positionSize != null ? S.control.positionSize : 100;
+  const portfolio = (s.startBalance || posSize * 20) + (s.realizedPnL || 0) + openLivePnl;
   const todayPnl  = s.realizedPnL || 0;
   const winRate   = s.trades > 0 ? Math.round(s.wins / s.trades * 100) : null;
   const updTime   = S.lastUpdated
@@ -1406,13 +1407,14 @@ async function toggleTP(posId, currentlyDisabled) {
 // ── Manual queue UI ───────────────────────────────────────────────────────────
 function manualQueueHTML() {
   const statusIcon = { pending: '⏳', entered: '✅', failed: '❌' };
+  const cfgSize    = S.control.positionSize != null ? S.control.positionSize : 100;
 
   const items = S.manualQueue.length
     ? S.manualQueue.map(item => `
         <div class="manual-item">
           <span class="manual-item-sym">${item.symbol || '?'}</span>
           <span class="manual-item-addr" title="${item.address}">${item.address}</span>
-          <span class="manual-item-size">$${item.size || 100}</span>
+          <span class="manual-item-size">$${item.size || cfgSize}</span>
           <span class="manual-item-status ${item.status}">${statusIcon[item.status] || ''} ${item.status}</span>
           ${item.status === 'pending'
             ? `<button class="manual-item-del" onclick="removeManualToken('${item._id}')" title="Cancel">✕</button>`
@@ -1425,7 +1427,7 @@ function manualQueueHTML() {
       <div class="manual-title">🎯 Manual Token Queue</div>
       <div class="manual-form">
         <input class="manual-input addr" id="m-addr" placeholder="Contract address (0x… or token CA)" autocomplete="off" spellcheck="false">
-        <input class="manual-input size" id="m-size" type="number" placeholder="$" min="10" step="10" value="100">
+        <input class="manual-input size" id="m-size" type="number" placeholder="$" min="10" step="10" value="${S.control.positionSize != null ? S.control.positionSize : 100}">
         <button class="manual-add-btn" id="m-addbtn" onclick="addManualToken()" ${S.manualAdding ? 'disabled' : ''}>
           ${S.manualAdding ? '…' : '+ Add'}
         </button>
@@ -1439,7 +1441,7 @@ async function addManualToken() {
   const addrEl = document.getElementById('m-addr');
   const sizeEl = document.getElementById('m-size');
   const addr   = addrEl?.value.trim();
-  const size   = parseFloat(sizeEl?.value) || 100;
+  const size   = parseFloat(sizeEl?.value) || (S.control.positionSize || 100);
   if (!addr) { addrEl?.focus(); return; }
 
   S.manualAdding = true;
