@@ -1118,6 +1118,10 @@ function render() {
           </div>
         </div>
         <div class="header-right">
+          ${S.control.autoEntryPaused
+            ? `<div class="live-badge" style="background:rgba(232,168,56,.1);border-color:rgba(232,168,56,.3);color:var(--yellow)">🖐 MANUAL</div>`
+            : `<div class="live-badge" style="background:rgba(79,110,247,.1);border-color:rgba(79,110,247,.3);color:var(--accent)">🤖 AUTO</div>`
+          }
           ${S.lastUpdated ? `<div class="live-badge"><div class="live-dot"></div>LIVE</div>` : ''}
           <span class="update-time">${updTime}</span>
           ${botCtrlBtn()}

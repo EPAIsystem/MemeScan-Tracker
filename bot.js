@@ -3210,27 +3210,28 @@ async function pollTelegramCommands() {
         continue;
       }
 
-      // ── /pauseentry [on|off] — pause/resume auto-entry without stopping monitoring ─
-      // When paused: signals fire the full alert (Option A) but bot skips enterPosition.
-      // Existing positions, SL, partial closes, and profit withdrawals are unaffected.
-      if (text === '/pauseentry' || text === '/pauseentry on' || text === '/pauseentry off') {
-        if (text === '/pauseentry on')  autoEntryPaused = true;
-        else if (text === '/pauseentry off') autoEntryPaused = false;
-        else autoEntryPaused = !autoEntryPaused; // toggle
+      // ── /manual | /auto | /pauseentry [on|off] — toggle manual-only mode ───────
+      // Manual-only: bot fires alerts but skips enterPosition; manual queue still works.
+      // /manual = manual-only on; /auto = back to full auto. Persists across restarts.
+      if (text === '/manual' || text === '/auto' ||
+          text === '/pauseentry' || text === '/pauseentry on' || text === '/pauseentry off') {
+        if (text === '/manual' || text === '/pauseentry on')  autoEntryPaused = true;
+        else if (text === '/auto' || text === '/pauseentry off') autoEntryPaused = false;
+        else autoEntryPaused = !autoEntryPaused; // /pauseentry toggle
         await saveBypassFlags();
         if (autoEntryPaused) {
           await sendTelegram(
-            `⏸ *AUTO-ENTRY PAUSED*\n\n` +
-            `The bot will *not* enter new positions automatically.\n\n` +
-            `When a signal fires you'll still get the *full signal alert* so you can decide to enter manually with /enter [address].\n\n` +
+            `🖐 *MANUAL-ONLY MODE ON*\n\n` +
+            `Auto-entry is *off* — the bot will not enter positions automatically.\n\n` +
+            `You still get full signal alerts. Add tokens to the queue yourself via the dashboard or /enter [address].\n\n` +
             `Monitoring, stop-losses, partial closes and profit withdrawals on existing positions continue normally.\n\n` +
-            `Send /pauseentry again (or /pauseentry off) to resume auto-entry.`
+            `Send /auto to return to full auto-entry.`
           );
         } else {
           await sendTelegram(
-            `▶️ *AUTO-ENTRY RESUMED*\n\n` +
+            `🤖 *AUTO MODE ON*\n\n` +
             `The bot will now enter positions automatically when signals qualify.\n\n` +
-            `Run /status to confirm.`
+            `Send /manual to switch back to manual-only.`
           );
         }
         continue;
