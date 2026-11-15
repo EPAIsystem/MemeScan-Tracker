@@ -2634,8 +2634,10 @@ async function isBotRunning() {
 
 // ─── DAY RESTART ─────────────────────────────────────────────────────────────
 // Called at the top of each scan/monitor cycle.
-// If paper_config/control.restartDay == true → zero out today's P&L, clear
-// in-memory state, resume trading.  Also handles real-mode restart (future).
+// If paper_config/control.restartDay == true → archive the closing session's
+// P&L into a sessions[] array, zero out today's live counters, clear in-memory
+// state, and resume trading.  Can be called multiple times per day — each call
+// creates a new numbered session.  Open positions are carried over (not closed).
 async function checkDayRestart() {
   try {
     // Use cached config first to avoid a Firestore read every monitor cycle.
@@ -2645,18 +2647,30 @@ async function checkDayRestart() {
     // Invalidate cache so the flag-clear write below is reflected immediately
     _tradingCfg = null; _tradingCfgAt = 0;
 
-    // ── Perform restart ──
+    // ── Read today's current stats ──
     const today = new Date().toISOString().slice(0, 10);
     const { stats: _statsCol2 } = await getCollections();
     const statsSnap = await db.collection(_statsCol2).doc(today).get();
-    const prevPnL   = statsSnap.exists ? (statsSnap.data().realizedPnL || 0) : 0;
+    const statsData  = statsSnap.exists ? statsSnap.data() : {};
+    const prevPnL    = statsData.realizedPnL || 0;
+    const prevCount  = statsData.restartCount || 0;        // sessions completed so far
+    const sessionNum = prevCount + 1;                      // this closing session's number
 
-    // Zero out today's P&L; accumulate total loss across restarts for transparency
+    // ── Archive the closing session, then zero the live counters ──
+    // sessions[] keeps every completed session's P&L + timestamp so the
+    // day's history is never lost, even across multiple restarts.
+    const closedSession = {
+      session:   sessionNum,
+      pnl:       prevPnL,
+      closedAt:  Date.now(),
+    };
     await db.collection(_statsCol2).doc(today).set({
-      realizedPnL: 0, autoPnL: 0, manualPnL: 0,
-      restartCount:   FieldValue.increment(1),
-      cumulativeLoss: FieldValue.increment(prevPnL < 0 ? prevPnL : 0),
-      lastRestartAt:  Date.now(),
+      realizedPnL:  0,
+      autoPnL:      0,
+      manualPnL:    0,
+      restartCount: FieldValue.increment(1),
+      sessions:     FieldValue.arrayUnion(closedSession),
+      lastRestartAt: Date.now(),
     }, { merge: true });
 
     // Clear in-memory state so old coins don't block fresh entries
@@ -2672,17 +2686,17 @@ async function checkDayRestart() {
       restartDay: false, lastRestartAt: Date.now(),
     });
 
-    const lostStr = prevPnL >= 0
+    const pnlStr = prevPnL >= 0
       ? `+$${prevPnL.toFixed(2)}`
       : `-$${Math.abs(prevPnL).toFixed(2)}`;
 
     await sendTelegram(
       `🔄 *DAY RESTARTED*\n\n` +
-      `Session P&L locked: *${lostStr}*\n` +
+      `Session ${sessionNum} P&L locked: *${pnlStr}*\n` +
       `Loss counter reset → $0. Bot scanning again.\n\n` +
-      `_Send /restart any time to reset again_`
+      `_Send /restart any time to start a new session_`
     );
-    console.log(`[BOT] Day restarted — prev session PnL: ${lostStr}`);
+    console.log(`[BOT] Day restarted — session ${sessionNum} P&L locked: ${pnlStr}`);
     return true;
   } catch(e) {
     console.error('[BOT] checkDayRestart error:', e.message);
