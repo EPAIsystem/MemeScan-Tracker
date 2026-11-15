@@ -1834,9 +1834,9 @@ async function processManualQueue() {
           };
 
           // ── Young coin block ─────────────────────────────────────────────────
-          if (POSITION_SIZE <= 100 && positions.length < 10 && (coin.ageMinutes || 0) < 20) {
+          if (positions.length < 10 && (coin.ageMinutes || 0) < 20) {
             await doc.ref.update({ status: 'skipped', reason: 'young_coin_block', ageMinutes: coin.ageMinutes, processedAt: Date.now() });
-            console.log(`[PRO-BRIDGE] BLOCKED ${coin.symbol} — ${(coin.ageMinutes||0).toFixed(1)}min old (young-coin block: posSize=$${POSITION_SIZE} positions=${positions.length})`);
+            console.log(`[PRO-BRIDGE] BLOCKED ${coin.symbol} — ${(coin.ageMinutes||0).toFixed(1)}min old (young-coin block: positions=${positions.length})`);
             continue;
           }
 
@@ -2207,8 +2207,8 @@ async function processPullbackWatchlist(positions, slotCount, usedThisScan) {
       coin._bouncedPct    = bouncePct;
 
       // ── Young coin block ───────────────────────────────────────────────────
-      if (POSITION_SIZE <= 100 && positions.length < 10 && (coin.ageMinutes || 0) < 20) {
-        console.log(`[PBW] BLOCKED ${coin.symbol} — ${(coin.ageMinutes||0).toFixed(1)}min old (young-coin block: posSize=$${POSITION_SIZE} positions=${positions.length})`);
+      if (positions.length < 10 && (coin.ageMinutes || 0) < 20) {
+        console.log(`[PBW] BLOCKED ${coin.symbol} — ${(coin.ageMinutes||0).toFixed(1)}min old (young-coin block: positions=${positions.length})`);
         continue;
       }
 
@@ -2353,8 +2353,8 @@ async function processMomentumReentry(positions) {
     };
 
     // ── Young coin block ─────────────────────────────────────────────────────
-    if (POSITION_SIZE <= 100 && positions.length < 10 && (coin.ageMinutes || 0) < 20) {
-      console.log(`[MREENTRY] BLOCKED ${coin.symbol} — ${(coin.ageMinutes||0).toFixed(1)}min old (young-coin block: posSize=$${POSITION_SIZE} positions=${positions.length})`);
+    if (positions.length < 10 && (coin.ageMinutes || 0) < 20) {
+      console.log(`[MREENTRY] BLOCKED ${coin.symbol} — ${(coin.ageMinutes||0).toFixed(1)}min old (young-coin block: positions=${positions.length})`);
       continue;
     }
 
@@ -5521,10 +5521,10 @@ async function scanForEntries() {
     }
 
     // ── Young coin block ─────────────────────────────────────────────────────
-    // When position size ≤ $100 AND fewer than 10 open positions, block coins
-    // younger than 20 minutes — they carry extreme rug / dump risk on thin capital.
-    if (POSITION_SIZE <= 100 && positions.length < 10 && (coin.ageMinutes || 0) < 20) {
-      console.log(`[SCAN] BLOCKED ${coin.symbol} — ${(coin.ageMinutes||0).toFixed(1)}min old (young-coin block: posSize=$${POSITION_SIZE} positions=${positions.length})`);
+    // Fewer than 10 open positions + coin younger than 20 minutes → block.
+    // Protects against rugs on ultra-new coins early in a session.
+    if (positions.length < 10 && (coin.ageMinutes || 0) < 20) {
+      console.log(`[SCAN] BLOCKED ${coin.symbol} — ${(coin.ageMinutes||0).toFixed(1)}min old (young-coin block: positions=${positions.length})`);
       usedThisScan.add(coin.addr); // suppress repeat logs this tick
       continue;
     }
