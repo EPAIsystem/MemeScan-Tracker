@@ -5432,27 +5432,21 @@ async function scanForEntries() {
       let _tierBlock  = null;
 
       if (_sz < 5) {
-        // $1–$4: any age, but need 5 buys/min + 2 sells/min
-        if (_buysMin  < 5) _tierBlock = `buys/min ${_buysMin.toFixed(1)} < 5 (tier $1–$4)`;
-        else if (_sellsMin < 2) _tierBlock = `sells/min ${_sellsMin.toFixed(1)} < 2 (tier $1–$4)`;
+        // $1–$4: any age, but need ≥3 buys/min + ≥1 sell/min — liquidity drain protection
+        if (_buysMin  < 3) _tierBlock = `buys/min ${_buysMin.toFixed(1)} < 3 (tier $1–$4)`;
+        else if (_sellsMin < 1) _tierBlock = `sells/min ${_sellsMin.toFixed(1)} < 1 (tier $1–$4)`;
       } else if (_sz < 10) {
-        // $5–$9: coin must be ≥5 min old + 5 buys/min + 2 sells/min
-        if (_age < 5)         _tierBlock = `age ${_age.toFixed(1)}min < 5 (tier $5–$9)`;
-        else if (_buysMin  < 5) _tierBlock = `buys/min ${_buysMin.toFixed(1)} < 5 (tier $5–$9)`;
-        else if (_sellsMin < 2) _tierBlock = `sells/min ${_sellsMin.toFixed(1)} < 2 (tier $5–$9)`;
+        // $5–$9: coin must be ≥5 min old (no txn minimum)
+        if (_age < 5) _tierBlock = `age ${_age.toFixed(1)}min < 5 (tier $5–$9)`;
       } else if (_sz < 20) {
         // $10–$19: coin must be ≥15 min old (no txn minimum)
         if (_age < 15) _tierBlock = `age ${_age.toFixed(1)}min < 15 (tier $10–$19)`;
       } else if (_sz < 50) {
-        // $20–$49: coin must be ≥15 min old + 6 buys/min + 3 sells/min
-        if (_age < 15)          _tierBlock = `age ${_age.toFixed(1)}min < 15 (tier $20–$49)`;
-        else if (_buysMin  < 6) _tierBlock = `buys/min ${_buysMin.toFixed(1)} < 6 (tier $20–$49)`;
-        else if (_sellsMin < 3) _tierBlock = `sells/min ${_sellsMin.toFixed(1)} < 3 (tier $20–$49)`;
+        // $20–$49: coin must be ≥15 min old (no txn minimum)
+        if (_age < 15) _tierBlock = `age ${_age.toFixed(1)}min < 15 (tier $20–$49)`;
       } else {
-        // $50+: coin must be ≥20 min old + 7 buys/min + 3 sells/min
-        if (_age < 20)          _tierBlock = `age ${_age.toFixed(1)}min < 20 (tier $50+)`;
-        else if (_buysMin  < 7) _tierBlock = `buys/min ${_buysMin.toFixed(1)} < 7 (tier $50+)`;
-        else if (_sellsMin < 3) _tierBlock = `sells/min ${_sellsMin.toFixed(1)} < 3 (tier $50+)`;
+        // $50+: coin must be ≥20 min old (no txn minimum)
+        if (_age < 20) _tierBlock = `age ${_age.toFixed(1)}min < 20 (tier $50+)`;
       }
 
       if (_tierBlock) {
