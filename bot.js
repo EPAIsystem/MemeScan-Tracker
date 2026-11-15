@@ -1184,9 +1184,10 @@ async function jupiterGetSwapTx(quote, walletPublicKey) {
       wrapAndUnwrapSol: true,
       prioritizationFeeLamports: 5000, // ~0.000005 SOL tip for faster landing
     });
-    // Swap TX still uses the stable v6 endpoint — api.jup.ag/swap/v1/swap produces
+    // Swap TX uses the stable v6 endpoint — api.jup.ag/swap/v1/swap produces
     // transactions that Jito's bundle engine rejects with HTTP 500. The API key
     // benefit is on the quote side (better routing), not needed here.
+    const swapHeaders = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
     const r = await new Promise((resolve) => {
       const req = https.request({
         hostname: 'quote-api.jup.ag',
