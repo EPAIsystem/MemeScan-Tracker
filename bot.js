@@ -1147,12 +1147,15 @@ async function getSolPriceUsd() {
 }
 
 async function jupiterQuote(inputMint, outputMint, amountLamports, slippageBps = 100) {
-  const path = `/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}`;
+  // Use authenticated endpoint when API key is available (better routing, 1 req/s vs 0.5)
+  const jupHost    = 'api.jup.ag';
+  const jupHeaders = process.env.JUPITER_API_KEY ? { 'x-api-key': process.env.JUPITER_API_KEY } : {};
+  const path = `/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}`;
   const MAX_ATTEMPTS = 3;
   const RETRY_DELAY  = 600; // ms between retries — covers transient 500s
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      const r = await httpGet('quote-api.jup.ag', path);
+      const r = await httpGet(jupHost, path, jupHeaders);
       if (r.status === 200) return JSON.parse(r.body);
       const bodySnip = r.body ? String(r.body).slice(0, 300) : '(empty)';
       console.error(`[JUPITER] Quote HTTP ${r.status} (attempt ${attempt}/${MAX_ATTEMPTS}) | body: ${bodySnip}`);
@@ -1176,12 +1179,14 @@ async function jupiterGetSwapTx(quote, walletPublicKey) {
       wrapAndUnwrapSol: true,
       prioritizationFeeLamports: 5000, // ~0.000005 SOL tip for faster landing
     });
+    const swapHeaders = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
+    if (process.env.JUPITER_API_KEY) swapHeaders['x-api-key'] = process.env.JUPITER_API_KEY;
     const r = await new Promise((resolve) => {
       const req = https.request({
-        hostname: 'quote-api.jup.ag',
-        path: '/v6/swap',
+        hostname: 'api.jup.ag',
+        path: '/swap/v1/swap',
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        headers: swapHeaders,
         timeout: 15000,
       }, (res) => {
         let d = ''; res.on('data', c => d += c); res.on('end', () => resolve({ status: res.statusCode, body: d }));
