@@ -1924,6 +1924,34 @@ async function closePosition(id, data) {
   }
 }
 
+// Wraps closePosition for real-trade positions: executes the on-chain sell FIRST.
+// Returns true when the position was closed, false when the sell failed (stays open).
+// Callers must check the return value and skip stats/notifications on false.
+async function realClose(pos, exitPrice, exitReason, pnl, extraData = {}) {
+  if (pos.tradingMode === 'real' && pos.walletId) {
+    const wallets = await getWallets();
+    const wallet  = wallets.find(w => w.id === pos.walletId);
+    if (wallet) {
+      const exitResult = await executeRealExit(pos, wallet, exitPrice);
+      if (!exitResult || !exitResult.txHash) {
+        const reason = exitResult?.error || 'Unknown error';
+        console.error(`[REAL] ⛔ EXIT failed for ${pos.symbol} (${exitReason}): ${reason} — position NOT closed`);
+        await sendTelegram(
+          `⛔ *REAL EXIT FAILED — Position NOT Closed*\n\n` +
+          `*${pos.symbol}* — ${exitReason}\n` +
+          `Reason: ${reason}\n\n` +
+          `_Position is still open. Tokens are in your wallet. Bot will retry on next trigger._`
+        ).catch(() => {});
+        return false;
+      }
+      extraData.exitTxHash   = exitResult.txHash;
+      if (exitResult.exitImpactPct != null) extraData.exitImpactPct = exitResult.exitImpactPct;
+    }
+  }
+  await closePosition(pos.id, { exitPrice, exitReason, pnl, ...extraData });
+  return true;
+}
+
 async function getDailyStats() {
   const now = Date.now();
   if (_statsCache && now - _statsCacheAt < STATS_TTL) return _statsCache;
@@ -2848,7 +2876,8 @@ async function pollTelegramCommands() {
               const price   = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
               const exitPnl = (price - pos.entryPrice) / pos.entryPrice * (pos.size || POSITION_SIZE) * (pos.remaining || 1);
               const pnl     = (pos.pnl || 0) + exitPnl;
-              await closePosition(pos.id, { exitPrice: price, exitReason: 'MANUAL_CLEARALL', pnl });
+              const _closed = await realClose(pos, price, 'MANUAL_CLEARALL', pnl);
+              if (!_closed) continue;
               await updateDailyStats(exitPnl, exitPnl > 0, !!pos.isManual, 0);
               enteredToday.delete(pos.address);
               cleared++;
@@ -3823,7 +3852,8 @@ async function monitorPositions() {
       : price;
     const exitPnl  = (exitFillPriceManual - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
     const pnl      = (pos.pnl || 0) + exitPnl;
-    await closePosition(pos.id, { exitPrice: exitFillPriceManual, exitReason: 'MANUAL_CLOSE', pnl });
+    const _closedManual = await realClose(pos, exitFillPriceManual, 'MANUAL_CLOSE', pnl);
+    if (!_closedManual) continue;
     await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPriceManual, pos.remaining));
     enteredToday.delete(pos.address);
     await sendTelegram(
@@ -3850,7 +3880,8 @@ async function monitorPositions() {
           : price;
         const exitPnl       = (exitFillPrice - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
         const pnl           = (pos.pnl || 0) + exitPnl;
-        await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'DAILY_LIMIT', pnl });
+        const _closedDL = await realClose(pos, exitFillPrice, 'DAILY_LIMIT', pnl);
+        if (!_closedDL) continue;
         await updateDailyStats(exitPnl, exitPnl > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
         await sendTelegram(`🚨 *DAILY LOSS LIMIT*\n*${pos.symbol}* ${pos.strategyLabel}\n${fmtTradeResult(pos.size, pnl)}`);
       }
@@ -3884,7 +3915,8 @@ async function monitorPositions() {
         : price;
       const exitPnl = (exitFillPriceExp - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
       const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
-      await closePosition(pos.id, { exitPrice: exitFillPriceExp, exitReason: 'EXPIRED', pnl });
+      const _closedExp = await realClose(pos, exitFillPriceExp, 'EXPIRED', pnl);
+      if (!_closedExp) continue;
       await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPriceExp, pos.remaining));
       await sendTelegram(`⏰ *EXPIRED* — *${pos.symbol}* ${pos.strategyLabel}\n${fmtTradeResult(pos.size, pnl)}\n📥 Exit: $${fmtPrice(exitFillPriceExp)}\n🔗 [Chart](${pos.dexUrl})`);
       enteredToday.delete(pos.address);
@@ -3905,7 +3937,8 @@ async function monitorPositions() {
           : price;
         const exitPnL = (exitFillPrice - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
         const pnl     = (pos.pnl || 0) + exitPnL;
-        await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'LIQ_DRAINED', pnl });
+        const _closedLiq = await realClose(pos, exitFillPrice, 'LIQ_DRAINED', pnl);
+        if (!_closedLiq) continue;
         await updateDailyStats(exitPnL, exitPnL > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
         await sendTelegram(
           `⚠️ *LIQ DRAINED — EMERGENCY EXIT*\n\n` +
@@ -3968,7 +4001,8 @@ async function monitorPositions() {
                   : price;
                 const rugGain  = (rugFill - rugPos.entryPrice) / rugPos.entryPrice;
                 const rugPnL   = rugGain * rugPos.size * rugPos.remaining + (rugPos.pnl || 0);
-                await closePosition(rugPos.id, { exitPrice: rugFill, exitReason: 'RUG_EMERGENCY', pnl: rugPnL });
+                const _closedRug = await realClose(rugPos, rugFill, 'RUG_EMERGENCY', rugPnL);
+                if (!_closedRug) continue;
                 await updateDailyStats(rugPnL, false, rugPos.isManual || false,
                   calcExitFeeUsd(rugPos, price, rugFill, rugPos.remaining));
                 await sendTelegram(
@@ -4095,7 +4129,8 @@ async function monitorPositions() {
           try {
             const exitPnl = fillGain * pos.size * pos.remaining;
             const pnl     = (pos.pnl || 0) + exitPnl;
-            await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'SURGE_STALE_PROFIT', pnl });
+            const _closedSP = await realClose(pos, exitFillPrice, 'SURGE_STALE_PROFIT', pnl);
+            if (!_closedSP) continue;
             await updateDailyStats(exitPnl, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
             enteredToday.delete(pos.address);
             await sendTelegram(
@@ -4118,7 +4153,8 @@ async function monitorPositions() {
           try {
             const exitPnl = fillGain * pos.size * pos.remaining;
             const pnl     = (pos.pnl || 0) + exitPnl;
-            await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'SURGE_STALE_LOSS', pnl });
+            const _closedSL2 = await realClose(pos, exitFillPrice, 'SURGE_STALE_LOSS', pnl);
+            if (!_closedSL2) continue;
             await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
             // Loss exit — keep in enteredToday (blocked for the rest of the day)
             await sendTelegram(
@@ -4176,7 +4212,8 @@ async function monitorPositions() {
               try {
                 const exitPnl = fillGain * pos.size * pos.remaining;
                 const pnl     = (pos.pnl || 0) + exitPnl;
-                await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'RANGE_EXIT', pnl });
+                const _closedRE = await realClose(pos, exitFillPrice, 'RANGE_EXIT', pnl);
+                if (!_closedRE) continue;
                 await updateDailyStats(exitPnl, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
                 enteredToday.delete(pos.address);
                 rangeReentryWatchlist.set(pos.address, {
@@ -4224,7 +4261,8 @@ async function monitorPositions() {
       try {
         const exitPnl = fillGain * pos.size * pos.remaining;
         const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
-        await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'RUG_DETECTED', pnl });
+        const _closedRD = await realClose(pos, exitFillPrice, 'RUG_DETECTED', pnl);
+        if (!_closedRD) continue;
         await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
         recentSLCoins.set(pos.address, Date.now()); // block re-entry for 6h
         const dropPct = ((price / currentPeak - 1) * 100).toFixed(0);
@@ -4250,7 +4288,8 @@ async function monitorPositions() {
       try {
         const exitPnl = fillGain * pos.size * pos.remaining;
         const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial TP exits
-        await closePosition(pos.id, { exitPrice: exitFillPrice, exitReason: 'STOP_LOSS', pnl });
+        const _closedSLoss = await realClose(pos, exitFillPrice, 'STOP_LOSS', pnl);
+        if (!_closedSLoss) { closingNow.delete(pos.id); continue; }
         await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining));
         // Slippage check — lifted here so it's available for both loss and profit paths
         const slippagePct = pos.currentSL > 0
