@@ -5423,12 +5423,13 @@ async function scanForEntries() {
     if (slotCount[coin.strategy.id] >= coin.strategy.maxSlots) continue;
 
     // ── Tiered entry gate (age + transaction rate by position size) ───────────
-    // Uses the configured ceiling as the size proxy for the tier decision.
+    // Uses the actual dynamic size (liq × 1% × MC multiplier, capped at ceiling)
+    // so a $100 ceiling on a thin-liquidity coin isn't forced into the $50+ age tier.
     {
       const _age      = coin.ageMinutes || 0;
       const _buysMin  = (coin.m5Buys  || 0) / 5;  // buys per minute
       const _sellsMin = (coin.m5Sells || 0) / 5;  // sells per minute
-      const _sz       = _entryCeiling;
+      const _sz       = calcDynamicPositionSize(coin.liq || 0, coin.mcap || 0, _entryCeiling);
       let _tierBlock  = null;
 
       if (_sz < 5) {
@@ -5450,7 +5451,7 @@ async function scanForEntries() {
       }
 
       if (_tierBlock) {
-        console.log(`[TIER-GATE] BLOCKED ${coin.symbol} — ${_tierBlock} (ceiling=$${_sz})`);
+        console.log(`[TIER-GATE] BLOCKED ${coin.symbol} — ${_tierBlock} (dynSize=$${_sz.toFixed(2)} ceiling=$${_entryCeiling})`);
         usedThisScan.add(coin.addr);
         continue;
       }
