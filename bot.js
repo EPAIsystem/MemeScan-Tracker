@@ -3804,12 +3804,21 @@ async function filterByLpLock(matches) {
     if (!rc) {
       // RugCheck unavailable — apply liq+ratio only (no auto-reject, no auto-pass)
       lpPeriodStats.rcFail++;
-      const rcFailStrictLiq   = coin.strategy?.minLiq || Infinity;
+      // Trending coins earn a relaxed strict floor — their platform-vetting compensates
+      // for lower LP. 1 platform → minLiqLocked; 2+ platforms → minLiqLocked × 0.65.
+      const _rcBaseLiq    = coin.strategy?.minLiq || Infinity;
+      const _rcLockedLiq  = coin.strategy?.minLiqLocked || _rcBaseLiq;
+      const _rcTrendTier  = coin._trendingPlatforms || 0;
+      const rcFailStrictLiq = _rcTrendTier >= 2
+        ? Math.round(_rcLockedLiq * 0.65)
+        : _rcTrendTier === 1
+        ? _rcLockedLiq
+        : _rcBaseLiq;
       const rcFailStrictRatio = ANTI_MANIP_MC_LIQ_RATIO_MAX;
       const rcFailLiqOk       = coin.liq >= rcFailStrictLiq;
       const rcFailRatioOk     = (coin.mcLiqRatio || 999) <= rcFailStrictRatio;
       if (!rcFailLiqOk) {
-        console.log(`[RUGCHECK] ❌ ${coin.symbol} — rc-fail, liq $${coin.liq.toFixed(0)} < $${rcFailStrictLiq}, rejected`);
+        console.log(`[RUGCHECK] ❌ ${coin.symbol} — rc-fail, liq $${coin.liq.toFixed(0)} < $${rcFailStrictLiq}${_rcTrendTier > 0 ? ` (trending:${_rcTrendTier} relaxed)` : ''}, rejected`);
         lpPeriodStats.failLiq++;
         lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
       } else if (!rcFailRatioOk) {
@@ -3873,7 +3882,16 @@ async function filterByLpLock(matches) {
     // that clear risk (≤ 40) + liq + ratio floors pass directly — same logic as
     // gate 3.5 for PumpSwap but now extended to all DEXes.
     // Nov-14: rug risk ceiling restored at 80 — risk checked first, then liq+ratio
-    const strictLiq   = coin.strategy?.minLiq || Infinity;
+    // Nov-15: trending coins earn a relaxed strict floor — platform-vetting compensates
+    // for lower LP. 1 platform → minLiqLocked; 2+ platforms → minLiqLocked × 0.65.
+    const _baseLiq    = coin.strategy?.minLiq || Infinity;
+    const _lockedLiq  = coin.strategy?.minLiqLocked || _baseLiq;
+    const _trendTier  = coin._trendingPlatforms || 0;
+    const strictLiq   = _trendTier >= 2
+      ? Math.round(_lockedLiq * 0.65)
+      : _trendTier === 1
+      ? _lockedLiq
+      : _baseLiq;
     const strictRatio = ANTI_MANIP_MC_LIQ_RATIO_MAX; // 30×
     const riskOk      = rc.riskScore <= 80;
     const liqOk       = coin.liq >= strictLiq;
@@ -3884,7 +3902,7 @@ async function filterByLpLock(matches) {
       lpPeriodStats.failRisk++;
       lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
     } else if (!liqOk) {
-      console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked, liq $${coin.liq.toFixed(0)} < $${strictLiq} strict floor, rejected`);
+      console.log(`[RUGCHECK] ❌ ${coin.symbol} — LP unlocked, liq $${coin.liq.toFixed(0)} < $${strictLiq} strict floor${_trendTier > 0 ? ` (trending:${_trendTier} relaxed)` : ''}, rejected`);
       lpPeriodStats.failLiq++;
       lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
     } else if (!ratioOk) {
@@ -3892,7 +3910,7 @@ async function filterByLpLock(matches) {
       lpPeriodStats.failRatio++;
       lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
     } else {
-      console.log(`[RUGCHECK] ✅ ${coin.symbol} — LP unlocked, risk ${rc.riskScore}/100 ≤ 80, liq $${coin.liq.toFixed(0)}, PASSED`);
+      console.log(`[RUGCHECK] ✅ ${coin.symbol} — LP unlocked, risk ${rc.riskScore}/100 ≤ 80, liq $${coin.liq.toFixed(0)}${_trendTier > 0 ? ` [trending:${_trendTier} floor=$${strictLiq}]` : ''}, PASSED`);
       lpPeriodStats.passed++;
       lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
       passed.add(coin.addr);
