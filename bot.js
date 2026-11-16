@@ -37,6 +37,81 @@ const MIN_SCORE       = 45;  // Nov-11: lowered from 55; GeckoTerminal trending 
 let strategyFiltersActive = true;
 const DAILY_LOSS_LIMIT= -0.30;
 
+// ─── SESSION FILTERS ─────────────────────────────────────────────────────────
+// User-set restrictions on what coins the bot auto-enters this session.
+// All fields null = no restriction on that dimension.
+let sessionFilters = { minAgeDays: null, maxAgeDays: null, minMcap: null, maxMcap: null, minVol: null, maxVol: null };
+
+function parseFilterAmount(str) {
+  if (!str) return null;
+  str = str.toLowerCase().trim();
+  const num = parseFloat(str);
+  if (isNaN(num)) return null;
+  if (str.endsWith('b')) return num * 1e9;
+  if (str.endsWith('m')) return num * 1e6;
+  if (str.endsWith('k')) return num * 1e3;
+  return num;
+}
+function parseFilterDays(str) {
+  str = (str || '').toLowerCase().trim();
+  const num = parseFloat(str);
+  if (isNaN(num)) return null;
+  return str.endsWith('mo') ? num * 30 : str.endsWith('m') && !str.endsWith('min') ? num * 30 : num;
+}
+function parseFilterRange(str, isDays) {
+  if (!str || str === 'any' || str === '0') return { min: null, max: null };
+  str = str.toLowerCase().trim();
+  const parse = isDays ? parseFilterDays : parseFilterAmount;
+  if (str.includes('-')) {
+    const [a, b] = str.split('-');
+    return { min: parse(a), max: parse(b) };
+  }
+  if (str.endsWith('+')) return { min: parse(str.slice(0, -1)), max: null };
+  const v = parse(str);
+  return { min: v, max: v }; // exact value
+}
+function fmtSessionFilters() {
+  const f = sessionFilters;
+  const fmtAmt = v => v >= 1e9 ? `${(v/1e9).toFixed(1)}B` : v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1e3 ? `${(v/1e3).toFixed(0)}K` : `${v}`;
+  const fmtDay = v => v >= 30 ? `${(v/30).toFixed(1)}mo` : `${v}d`;
+  const lines = [];
+  if (f.minAgeDays !== null || f.maxAgeDays !== null) {
+    const lo = f.minAgeDays != null ? fmtDay(f.minAgeDays) : '0';
+    const hi = f.maxAgeDays != null ? fmtDay(f.maxAgeDays) : '∞';
+    lines.push(`📅 Age: ${lo} – ${hi}`);
+  }
+  if (f.minMcap !== null || f.maxMcap !== null) {
+    const lo = f.minMcap != null ? '$'+fmtAmt(f.minMcap) : '$0';
+    const hi = f.maxMcap != null ? '$'+fmtAmt(f.maxMcap) : '∞';
+    lines.push(`💰 MCap: ${lo} – ${hi}`);
+  }
+  if (f.minVol !== null || f.maxVol !== null) {
+    const lo = f.minVol != null ? '$'+fmtAmt(f.minVol) : '$0';
+    const hi = f.maxVol != null ? '$'+fmtAmt(f.maxVol) : '∞';
+    lines.push(`📊 Vol24h: ${lo} – ${hi}`);
+  }
+  return lines.length ? lines.join('\n') : 'None active';
+}
+function applySessionFilters(coins) {
+  const f = sessionFilters;
+  if (Object.values(f).every(v => v === null)) return coins;
+  return coins.filter(coin => {
+    if (f.minAgeDays !== null && (coin.ageDays || 0) < f.minAgeDays) return false;
+    if (f.maxAgeDays !== null && (coin.ageDays || 0) > f.maxAgeDays) return false;
+    if (f.minMcap    !== null && (coin.mcap    || 0) < f.minMcap)    return false;
+    if (f.maxMcap    !== null && (coin.mcap    || 0) > f.maxMcap)    return false;
+    if (f.minVol     !== null && (coin.vol24   || 0) < f.minVol)     return false;
+    if (f.maxVol     !== null && (coin.vol24   || 0) > f.maxVol)     return false;
+    return true;
+  });
+}
+async function saveSessionFilters() {
+  try {
+    _tradingCfg = null;
+    await db.collection('paper_config').doc('control').set({ sessionFilters }, { merge: true });
+  } catch(e) { console.warn('[BOT] Could not save session filters:', e.message); }
+}
+
 // ── BACKGROUND SLOT TIMING ────────────────────────────────────────────────────
 // AM / SC (fast-moving): background after 5h if gain < 25%
 // BB / OR (patient):     background after 24h if gain < 10%
@@ -1688,7 +1763,10 @@ async function enterPosition(coin, overrides = {}) {
   const ceiling      = overrides.size || parseFloat(cfg.positionSize) || POSITION_SIZE;
   // stratCeiling: strategy-level cap (if set); all strategies currently use the global ceiling
   const stratCeiling = s.maxPositionSize ? Math.min(s.maxPositionSize, ceiling) : ceiling;
-  const posSize      = calcDynamicPositionSize(coin.liq || 0, coin.mcap || 0, stratCeiling);
+  // sizeFixed: for /track command — dollar value = price × token_qty, bypass dynamic sizing
+  const posSize      = overrides.sizeFixed != null
+    ? overrides.sizeFixed
+    : calcDynamicPositionSize(coin.liq || 0, coin.mcap || 0, stratCeiling);
   const rawSize    = (coin.liq || 0) * 0.01;  // 1% of liq before MC multiplier & ceiling
   const posSizeNote = posSize >= ceiling
     ? `$${posSize.toFixed(2)} _(capped — liq 1% = $${rawSize.toFixed(0)})_`
@@ -1710,9 +1788,12 @@ async function enterPosition(coin, overrides = {}) {
   const coinChain  = normaliseChain(coin.chain);
   const wallet     = await selectWalletForChain(coinChain, cfg);
 
-  // Real mode: execute swap
+  // Real mode: execute swap (skipped for /track — user already holds the tokens)
   let realTx = null;
-  if (tradingMode === 'real' && wallet) {
+  if (tradingMode === 'real' && wallet && overrides.skipSwap) {
+    // Tracked position: user already holds tokens — record qty for exit, no buy tx
+    realTx = { txHash: 'tracked', tokenAmount: overrides.tokenAmount || null };
+  } else if (tradingMode === 'real' && wallet) {
     realTx = await executeRealEntry(coin, wallet, posSize);
     // If the on-chain tx failed (no hash), abort entirely — do NOT create a ghost position
     if (!realTx || !realTx.txHash) {
@@ -1772,11 +1853,12 @@ async function enterPosition(coin, overrides = {}) {
     entryPrice: effectiveEntry,
     rawEntryPrice,    // keep the raw price for reference/display
     liquidityAtEntry, // store so exit slippage cap can use it
-    tp1: effectiveEntry * s.tp1x,
-    tp2: effectiveEntry * s.tp2x,
-    tp3: effectiveEntry * s.tp3x,
-    sl:  initialSLPrice,
-    currentSL: initialSLPrice,
+    // TP/SL: use user-supplied % overrides from /track if present, else strategy defaults
+    tp1: overrides.tp1 != null ? effectiveEntry * (1 + overrides.tp1 / 100) : effectiveEntry * s.tp1x,
+    tp2: overrides.tp2 != null ? effectiveEntry * (1 + overrides.tp2 / 100) : effectiveEntry * s.tp2x,
+    tp3: overrides.tp3 != null ? effectiveEntry * (1 + overrides.tp3 / 100) : effectiveEntry * s.tp3x,
+    sl:  overrides.sl  != null ? effectiveEntry * (1 - overrides.sl  / 100) : initialSLPrice,
+    currentSL: overrides.sl != null ? effectiveEntry * (1 - overrides.sl / 100) : initialSLPrice,
     initialTrailPct: s.initialTrailPct,
     trailingActive: false,
     size: posSize,
@@ -1787,7 +1869,8 @@ async function enterPosition(coin, overrides = {}) {
     partialStage:    usePartial ? 0 : null,
     recoveredAmount: usePartial ? 0 : null,
     freeRide:        usePartial ? false : null,
-    isManual:        overrides.isManual || false,
+    isManual:        overrides.isManual  || false,
+    isTracked:       overrides.isTracked || false,
     advisoryNote:    advisoryNote,  // non-null = dashboard shows advisory toast on next refresh
     // Overhead resistance — 50% partial exit fires when price reaches this level
     resistancePrice: resistancePrice,
@@ -3117,6 +3200,145 @@ async function pollTelegramCommands() {
           _tradingCfg = null; // bust cache so new size is picked up immediately
           await sendTelegram(`✅ *Position size set to $${newSize.toFixed(2)}*\n_New trades will use this size. Existing positions are unchanged._`);
         }
+      }
+
+      // ── /filter — set session-scoped age/mcap/vol restrictions ─────────────────
+      if (text.startsWith('/filter')) {
+        const args = text.slice(7).trim();
+        if (!args || args === 'clear' || args === 'off') {
+          sessionFilters = { minAgeDays: null, maxAgeDays: null, minMcap: null, maxMcap: null, minVol: null, maxVol: null };
+          await saveSessionFilters();
+          await sendTelegram(`✅ *SESSION FILTERS CLEARED*\n\nBot will scan all coins matching its normal strategies.`);
+          continue;
+        }
+        if (args === 'status' || args === 'show') {
+          await sendTelegram(`🔍 *ACTIVE SESSION FILTERS*\n\n${fmtSessionFilters()}`);
+          continue;
+        }
+        const newFilters = { ...sessionFilters };
+        const errors = [];
+        for (const part of args.split(/\s+/)) {
+          const eqIdx = part.indexOf('=');
+          if (eqIdx < 0) { errors.push(`Invalid: ${part}`); continue; }
+          const k = part.slice(0, eqIdx).toLowerCase();
+          const v = part.slice(eqIdx + 1);
+          if (k === 'age') {
+            const r = parseFilterRange(v, true);
+            newFilters.minAgeDays = r.min; newFilters.maxAgeDays = r.max;
+          } else if (k === 'mcap') {
+            const r = parseFilterRange(v, false);
+            newFilters.minMcap = r.min; newFilters.maxMcap = r.max;
+          } else if (k === 'vol') {
+            const r = parseFilterRange(v, false);
+            newFilters.minVol = r.min; newFilters.maxVol = r.max;
+          } else {
+            errors.push(`Unknown filter: ${k} (use age, mcap, vol)`);
+          }
+        }
+        if (errors.length) {
+          await sendTelegram(
+            `⚠️ *FILTER ERROR*\n\n${errors.join('\n')}\n\n` +
+            `*Usage:* /filter age=1-15d mcap=500k-5m vol=50k+\n` +
+            `Examples:\n· /filter age=7d+ (coins 7+ days old)\n· /filter age=1-15d mcap=1m+ vol=50k+\n· /filter clear`
+          );
+          continue;
+        }
+        sessionFilters = newFilters;
+        await saveSessionFilters();
+        await sendTelegram(
+          `✅ *SESSION FILTERS SET*\n\n${fmtSessionFilters()}\n\n` +
+          `Bot will only auto-enter coins matching ALL active filters.\n` +
+          `_Send /filter clear to remove restrictions._`
+        );
+        continue;
+      }
+
+      // ── /track — register an already-held position for bot monitoring ────────────
+      // Usage: /track <address> <token_qty> [sl=10 tp1=25 tp2=75 tp3=200]
+      if (text.startsWith('/track ')) {
+        const parts = text.slice(7).trim().split(/\s+/);
+        const addr  = parts[0];
+        const qty   = parseFloat(parts[1]);
+        if (!addr || isNaN(qty) || qty <= 0) {
+          await sendTelegram(
+            `⚠️ *TRACK USAGE*\n\n` +
+            `/track <address> <token_qty>\n` +
+            `Optional: sl=10 tp1=25 tp2=75 tp3=200\n\n` +
+            `Example:\n/track 7xKX...abcd 1500000\n/track 7xKX...abcd 1500000 sl=12 tp1=30 tp2=80 tp3=250`
+          );
+          continue;
+        }
+        // Parse optional SL/TP overrides (percentages)
+        const optOverrides = {};
+        for (const p of parts.slice(2)) {
+          const [k, v] = p.split('=');
+          if (!k || !v) continue;
+          const pct = parseFloat(v);
+          if (isNaN(pct)) continue;
+          if (k === 'sl')  optOverrides.sl  = pct;
+          if (k === 'tp1') optOverrides.tp1 = pct;
+          if (k === 'tp2') optOverrides.tp2 = pct;
+          if (k === 'tp3') optOverrides.tp3 = pct;
+        }
+        await sendTelegram(`🔍 Fetching price for tracked position…`);
+        try {
+          const _trackR   = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${addr}`);
+          const _trackD   = JSON.parse(_trackR.body);
+          const _pairs    = (_trackD.pairs || []).sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+          const pairData  = _pairs[0] || null;
+          if (!pairData) {
+            await sendTelegram(`⚠️ Could not find pair data for that address. Check the contract address and try again.`);
+            continue;
+          }
+          const price = parseFloat(pairData.priceUsd || 0);
+          if (!price) {
+            await sendTelegram(`⚠️ Price not available for this token right now.`);
+            continue;
+          }
+          const posSize = price * qty;
+          const coin = {
+            symbol:   pairData.baseToken?.symbol || '?',
+            name:     pairData.baseToken?.name   || '',
+            addr,
+            chain:    pairData.chainId,
+            price,
+            liq:      pairData.liquidity?.usd || 0,
+            mcap:     pairData.fdv || pairData.marketCap || 0,
+            score:    100,
+            dexUrl:   `https://dexscreener.com/${pairData.chainId}/${pairData.pairAddress}`,
+            strategy: MANUAL_STRATEGY,
+            ageDays:  pairData.pairCreatedAt ? (Date.now() - pairData.pairCreatedAt) / 86400000 : 0,
+          };
+          const pos = await enterPosition(coin, {
+            sizeFixed:    posSize,       // lock dollar size = price × qty
+            tokenAmount:  qty,           // actual tokens held (for real-mode exit)
+            skipSwap:     true,          // already holding — no buy tx
+            isManual:     true,
+            isTracked:    true,
+            ...optOverrides,             // sl, tp1, tp2, tp3 as % overrides
+          });
+          if (!pos) {
+            await sendTelegram(`⚠️ Could not open tracked position (no wallet for chain ${coin.chain}?).`);
+            continue;
+          }
+          const slPct  = ((pos.sl  - pos.entryPrice) / pos.entryPrice * 100).toFixed(1);
+          const tp1Pct = ((pos.tp1 - pos.entryPrice) / pos.entryPrice * 100).toFixed(1);
+          const tp3Pct = ((pos.tp3 - pos.entryPrice) / pos.entryPrice * 100).toFixed(1);
+          await sendTelegram(
+            `📌 *POSITION TRACKED*\n\n` +
+            `*${coin.symbol}* @ ${fmtPrice(price)}\n` +
+            `Holdings: ${qty.toLocaleString()} tokens ≈ $${posSize.toFixed(2)}\n\n` +
+            `SL: ${fmtPrice(pos.sl)} (${slPct}%)\n` +
+            `TP1: ${fmtPrice(pos.tp1)} (+${tp1Pct}%)\n` +
+            `TP3: ${fmtPrice(pos.tp3)} (+${tp3Pct}%)\n\n` +
+            `_Bot will monitor and execute exits automatically._`
+          );
+          enteredToday.add(addr);
+        } catch(e) {
+          console.error('[TRACK]', e.message);
+          await sendTelegram(`⚠️ Track failed: ${e.message}`);
+        }
+        continue;
       }
 
       // ── /watching — show near-miss coins currently being monitored ──────────────
@@ -5547,7 +5769,13 @@ async function scanForEntries() {
   const _entryCfg = await getTradingConfig().catch(() => ({}));
   const _entryCeiling = parseFloat(_entryCfg.positionSize) || POSITION_SIZE;
 
-  for (const coin of qualityMatches) {
+  // Apply session filters (age/mcap/vol restrictions set by user via /filter)
+  const filteredMatches = applySessionFilters(qualityMatches);
+  if (filteredMatches.length < qualityMatches.length) {
+    console.log(`[SESSION-FILTER] ${qualityMatches.length - filteredMatches.length}/${qualityMatches.length} matches dropped by session filters (${fmtSessionFilters().replace(/\n/g,' | ')})`);
+  }
+
+  for (const coin of filteredMatches) {
     if (positions.length >= MAX_POSITIONS) break;
     if (usedThisScan.has(coin.addr)) continue;
     // Entry cooldown: only blocks when NOT paused (paused path uses its own cooldown)
@@ -5809,6 +6037,7 @@ async function main() {
   strategyFiltersActive = !startCfg.stratsSkipped; // inverted: true = filters on
   autoEntryPaused          = !!startCfg.autoEntryPaused;
   lastAnnouncedPeriodKey   = startCfg.currentPeriod?.key || null; // don't re-announce on restart
+  if (startCfg.sessionFilters) sessionFilters = { ...sessionFilters, ...startCfg.sessionFilters };
   if (globalGatesBypass || lpLockBypass || !strategyFiltersActive) {
     const active = [
       globalGatesBypass      ? '⚠️ Global gates: BYPASSED' : null,
