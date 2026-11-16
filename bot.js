@@ -53,16 +53,18 @@ function parseFilterAmount(str) {
   return num;
 }
 function parseFilterDays(str) {
-  // Supports: 2h / 12hr / 24hrs  →  hours (stored as fractional days)
-  //           1d / 7d / 15d       →  days
-  //           1m / 2mo / 3month   →  months (×30 days)
-  //           bare number         →  days (default)
+  // Supports: 30m / 45min / 90mins  →  minutes (stored as fractional days)
+  //           2h  / 12hr  / 24hrs   →  hours   (stored as fractional days)
+  //           1d  / 7d    / 15d     →  days
+  //           1mo / 2mo   / 3month  →  months  (×30 days)
+  //           bare number           →  days (default)
   str = (str || '').toLowerCase().trim();
   const num = parseFloat(str);
   if (isNaN(num)) return null;
-  if (str.match(/h(r?s?)?$/))                             return num / 24;      // hours → days
-  if (str.match(/mo(nth)?s?$/) || (str.endsWith('m') && !str.endsWith('mo')))
-                                                          return num * 30;       // months → days
+  if (str.match(/min(s?)?$/) || (str.endsWith('m') && !str.match(/mo(nth)?s?$/)))
+                                                          return num / 1440;    // minutes → days
+  if (str.match(/h(r?s?)?$/))                             return num / 24;     // hours → days
+  if (str.match(/mo(nth)?s?$/))                           return num * 30;     // months → days
   // 'd' or bare number → days
   return num;
 }
@@ -81,7 +83,7 @@ function parseFilterRange(str, isDays) {
 function fmtSessionFilters() {
   const f = sessionFilters;
   const fmtAmt = v => v >= 1e9 ? `${(v/1e9).toFixed(1)}B` : v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1e3 ? `${(v/1e3).toFixed(0)}K` : `${v}`;
-  const fmtDay = v => v >= 30 ? `${(v/30).toFixed(1)}mo` : v < 1 ? `${Math.round(v*24)}h` : `${v}d`;
+  const fmtDay = v => v >= 30 ? `${(v/30).toFixed(1)}mo` : v >= 1 ? `${v}d` : v >= 1/24 ? `${Math.round(v*24)}h` : `${Math.round(v*1440)}m`;
   const lines = [];
   if (f.minAgeDays !== null || f.maxAgeDays !== null) {
     const lo = f.minAgeDays != null ? fmtDay(f.minAgeDays) : '0';
