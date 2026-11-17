@@ -1848,13 +1848,17 @@ async function enterPosition(coin, overrides = {}) {
   const meaningfulR = resistanceCandidates.filter(r => r > effectiveEntry * (1 + RESISTANCE_MIN_GAP));
   const resistancePrice = meaningfulR.length > 0 ? Math.min(...meaningfulR) : null;
 
-  // ── INITIAL SL = 7% BELOW ENTRY (Phase 1 buffer) ───────────────────────────
-  // Gives the coin room to breathe after entry without triggering on normal pullbacks.
-  //   Phase 1: SL = entry × 0.93 (holds until +7% gain — cost = 7% + fees if hit)
-  //   Phase 2: SL = entry + 50% × ATH_gain (fires at gain ≥ 7%, applied in monitorPositions)
-  //   Phase 3: gap tightens 50→45→40→35%… per +20% ATH move (monitorPositions)
-  // Old fixed-% stop (s.slx) is no longer used.
-  const initialSLPrice = effectiveEntry * 0.93;
+  // ── INITIAL SL = PRE-ENTRY PRICE (Phase 1 — price-impact floor) ────────────
+  // SL is set at the market price just before our buy hit the pool.
+  // Our buy pushes price up ~2× (tradeSize / halfPool); pre-entry = entry / (1+impact).
+  // Capped at 10% max impact to avoid absurd SLs on very thin pools.
+  //   Phase 1: flat at preEntryPrice until ATH gain ≥ +10%
+  //   Phase 2: gap trail activates — 80% gap at +10%, tightens 5% per +10% ATH gain
+  //   Floor: 5% gap (SL = entry + 95% of gain — maximum protection)
+  const _impact      = posSize / Math.max((coin.liq || posSize * 100) / 2, posSize);
+  const _cappedImpact = Math.min(_impact, 0.10);
+  const preEntryPrice  = effectiveEntry / (1 + _cappedImpact);
+  const initialSLPrice = preEntryPrice;
 
   const pos = {
     symbol: coin.symbol, name: coin.name, address: coin.addr,
@@ -1869,6 +1873,7 @@ async function enterPosition(coin, overrides = {}) {
     tp3: overrides.tp3 != null ? effectiveEntry * (1 + overrides.tp3 / 100) : effectiveEntry * s.tp3x,
     sl:  overrides.sl  != null ? effectiveEntry * (1 - overrides.sl  / 100) : initialSLPrice,
     currentSL: overrides.sl != null ? effectiveEntry * (1 - overrides.sl / 100) : initialSLPrice,
+    preEntryPrice,          // market price before our buy hit the pool (Phase 1 SL floor)
     initialTrailPct: s.initialTrailPct,
     trailingActive: false,
     size: posSize,
@@ -2243,7 +2248,9 @@ async function getDailyStats() {
   return data;
 }
 
-async function updateDailyStats(pnl, isWin, isManual = false, exitFeeUsd = 0) {
+// strategyId: 0=BB, 1=AM, 2=SC, 3=OR, 4=PS  (null = unknown/legacy)
+const STRATEGY_KEYS = ['bb', 'am', 'sc', 'or', 'ps'];
+async function updateDailyStats(pnl, isWin, isManual = false, exitFeeUsd = 0, strategyId = null) {
   const today = new Date().toISOString().slice(0,10);
   const { stats } = await getCollections();
   const base = {
@@ -2263,6 +2270,14 @@ async function updateDailyStats(pnl, isWin, isManual = false, exitFeeUsd = 0) {
     base.autoPnL    = FieldValue.increment(pnl);
     base.autoTrades = FieldValue.increment(1);
     base.autoWins   = FieldValue.increment(isWin ? 1 : 0);
+  }
+  // Per-strategy breakdown: bb_pnl / bb_trades / bb_wins etc.
+  const sk = (strategyId != null && strategyId >= 0 && strategyId < STRATEGY_KEYS.length)
+    ? STRATEGY_KEYS[strategyId] : null;
+  if (sk) {
+    base[`${sk}_pnl`]    = FieldValue.increment(pnl);
+    base[`${sk}_trades`] = FieldValue.increment(1);
+    base[`${sk}_wins`]   = FieldValue.increment(isWin ? 1 : 0);
   }
   await db.collection(stats).doc(today).set(base, { merge: true });
   _statsCache = null; _statsCacheAt = 0; // bust cache so next read gets fresh P&L
@@ -3070,6 +3085,7 @@ async function pollTelegramCommands() {
         const netRevenue  = grossProfit - grossLoss;   // fees baked into fill-price PnL
         const capital     = stats.capitalDeployed || 0;
         const winRate     = stats.trades > 0 ? ((stats.wins/stats.trades)*100).toFixed(0) : '—';
+        const tierBreakdown = buildTierBreakdown(stats);
         await sendTelegram(
           `📈 *DAILY REVENUE REPORT*\n\n` +
           `✅ Gross profit:  +$${grossProfit.toFixed(2)}\n` +
@@ -3079,7 +3095,8 @@ async function pollTelegramCommands() {
           `💸 Fees (in P&L): $${fees.toFixed(2)}\n\n` +
           `💼 Capital deployed: $${capital.toFixed(2)}\n` +
           `📊 Trades: ${stats.trades} · Win rate: ${winRate}% (${stats.wins}W/${stats.losses}L)\n` +
-          `💰 Running P&L: ${stats.realizedPnL>=0?'+':''}$${stats.realizedPnL.toFixed(2)}`
+          `💰 Running P&L: ${stats.realizedPnL>=0?'+':''}$${stats.realizedPnL.toFixed(2)}\n\n` +
+          `*Tier P&L (best → worst):*\n${tierBreakdown}`
         );
       }
 
@@ -3162,7 +3179,7 @@ async function pollTelegramCommands() {
               const pnl     = (pos.pnl || 0) + exitPnl;
               const _result = await realClose(pos, price, 'MANUAL_CLEARALL', pnl);
               if (!_result?.ok) continue;
-              await updateDailyStats(exitPnl, exitPnl > 0, !!pos.isManual, 0);
+              await updateDailyStats(exitPnl, exitPnl > 0, !!pos.isManual, 0, pos.strategyId ?? null);
               enteredToday.delete(pos.address);
               cleared++;
             } catch(e) {
@@ -4297,7 +4314,7 @@ async function monitorPositions() {
     const pnl      = (pos.pnl || 0) + exitPnl;
     const _result = await realClose(pos, exitFillPriceManual, 'MANUAL_CLOSE', pnl);
     if (!_result?.ok) continue;
-    await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPriceManual, pos.remaining, _result.exitImpactPct));
+    await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPriceManual, pos.remaining, _result.exitImpactPct), pos.strategyId ?? null);
     enteredToday.delete(pos.address);
     await sendTelegram(
       `🚫 *MANUAL CLOSE*\n*${pos.symbol}* ${pos.strategyLabel}\n` +
@@ -4326,7 +4343,7 @@ async function monitorPositions() {
         const pnl           = (pos.pnl || 0) + exitPnl;
         const _result = await realClose(pos, exitFillPrice, 'DAILY_LIMIT', pnl);
         if (!_result?.ok) continue;
-        await updateDailyStats(exitPnl, exitPnl > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct));
+        await updateDailyStats(exitPnl, exitPnl > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct), pos.strategyId ?? null);
         await sendTelegram(`🚨 *DAILY LOSS LIMIT*\n*${pos.symbol}* ${pos.strategyLabel}\n${fmtTradeResult(pos.size, pnl)}` +
           `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`);
       }
@@ -4362,7 +4379,7 @@ async function monitorPositions() {
       const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
       const _result = await realClose(pos, exitFillPriceExp, 'EXPIRED', pnl);
       if (!_result?.ok) continue;
-      await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPriceExp, pos.remaining, _result.exitImpactPct));
+      await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPriceExp, pos.remaining, _result.exitImpactPct), pos.strategyId ?? null);
       await sendTelegram(`⏰ *EXPIRED* — *${pos.symbol}* ${pos.strategyLabel}\n${fmtTradeResult(pos.size, pnl)}\n📥 Exit: $${fmtPrice(exitFillPriceExp)}\n🔗 [Chart](${pos.dexUrl})` +
         `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`);
       enteredToday.delete(pos.address);
@@ -4385,7 +4402,7 @@ async function monitorPositions() {
         const pnl     = (pos.pnl || 0) + exitPnL;
         const _result = await realClose(pos, exitFillPrice, 'LIQ_DRAINED', pnl);
         if (!_result?.ok) continue;
-        await updateDailyStats(exitPnL, exitPnL > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct));
+        await updateDailyStats(exitPnL, exitPnL > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct), pos.strategyId ?? null);
         await sendTelegram(
           `⚠️ *LIQ DRAINED — EMERGENCY EXIT*\n\n` +
           `*${pos.symbol}* ${pos.strategyLabel}\n` +
@@ -4451,7 +4468,7 @@ async function monitorPositions() {
                 const _result = await realClose(rugPos, rugFill, 'RUG_EMERGENCY', rugPnL);
                 if (!_result?.ok) continue;
                 await updateDailyStats(rugPnL, false, rugPos.isManual || false,
-                  calcExitFeeUsd(rugPos, price, rugFill, rugPos.remaining, _result.exitImpactPct));
+                  calcExitFeeUsd(rugPos, price, rugFill, rugPos.remaining, _result.exitImpactPct), rugPos.strategyId ?? null);
                 await sendTelegram(
                   `🚨 *RUG EMERGENCY EXIT*\n\n` +
                   `*${rugPos.symbol}* ${rugPos.strategyLabel}\n` +
@@ -4489,7 +4506,7 @@ async function monitorPositions() {
                 capUpdates.pnl                  = (pos.pnl || 0) + partPnL;
                 capUpdates.tpDisabled           = true;
                 await updateDailyStats(partPnL, true, isManual,
-                  calcExitFeeUsd(pos, price, rugFill, capFrac));
+                  calcExitFeeUsd(pos, price, rugFill, capFrac), pos.strategyId ?? null);
               } else {
                 capUpdates.capitalWithdrawn     = true;
                 capUpdates.capitalWithdrawPrice = price;
@@ -4579,7 +4596,7 @@ async function monitorPositions() {
             const pnl     = (pos.pnl || 0) + exitPnl;
             const _result = await realClose(pos, exitFillPrice, 'SURGE_STALE_PROFIT', pnl);
             if (!_result?.ok) continue;
-            await updateDailyStats(exitPnl, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct));
+            await updateDailyStats(exitPnl, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct), pos.strategyId ?? null);
             enteredToday.delete(pos.address);
             await sendTelegram(
               `⏱ *SURGE FADED — QUICK EXIT*\n\n` +
@@ -4604,7 +4621,7 @@ async function monitorPositions() {
             const pnl     = (pos.pnl || 0) + exitPnl;
             const _result = await realClose(pos, exitFillPrice, 'SURGE_STALE_LOSS', pnl);
             if (!_result?.ok) continue;
-            await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct));
+            await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct), pos.strategyId ?? null);
             // Loss exit — keep in enteredToday (blocked for the rest of the day)
             await sendTelegram(
               `⏱ *SURGE STALE — EXIT WITH LOSS*\n\n` +
@@ -4664,7 +4681,7 @@ async function monitorPositions() {
                 const pnl     = (pos.pnl || 0) + exitPnl;
                 const _result = await realClose(pos, exitFillPrice, 'RANGE_EXIT', pnl);
                 if (!_result?.ok) continue;
-                await updateDailyStats(exitPnl, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct));
+                await updateDailyStats(exitPnl, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct), pos.strategyId ?? null);
                 enteredToday.delete(pos.address);
                 rangeReentryWatchlist.set(pos.address, {
                   symbol: pos.symbol, strategyId: pos.strategyId, strategyLabel: pos.strategyLabel,
@@ -4714,7 +4731,7 @@ async function monitorPositions() {
         const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial exits
         const _result = await realClose(pos, exitFillPrice, 'RUG_DETECTED', pnl);
         if (!_result?.ok) continue;
-        await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct));
+        await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct), pos.strategyId ?? null);
         recentSLCoins.set(pos.address, Date.now()); // block re-entry for 6h
         const dropPct = ((price / currentPeak - 1) * 100).toFixed(0);
         await sendTelegram(
@@ -4742,7 +4759,7 @@ async function monitorPositions() {
         const pnl     = (pos.pnl || 0) + exitPnl;  // total including any earlier partial TP exits
         const _result = await realClose(pos, exitFillPrice, 'STOP_LOSS', pnl);
         if (!_result?.ok) { closingNow.delete(pos.id); continue; }
-        await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct));
+        await updateDailyStats(exitPnl, false, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct), pos.strategyId ?? null);
         // Slippage check — lifted here so it's available for both loss and profit paths
         const slippagePct = pos.currentSL > 0
           ? (pos.currentSL - exitFillPrice) / pos.currentSL
@@ -4838,7 +4855,7 @@ async function monitorPositions() {
           const _cSell = await realPartialSell(pos, capitalFrac, exitFillPrice);
           if (_cSell.ok) {
             await updatePosition(pos.id, capUpdates);
-            await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, capitalFrac, _cSell.exitImpactPct));
+            await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, capitalFrac, _cSell.exitImpactPct), pos.strategyId ?? null);
             Object.assign(pos, capUpdates);
             alertMsg = `🛡️ *CAPITAL RECOVERED*\n\n` +
               `*${pos.symbol}* ${pos.strategyLabel}\n` +
@@ -4908,7 +4925,7 @@ async function monitorPositions() {
           const _wSell = await realPartialSell(pos, closeRatio, wFill);
           if (_wSell.ok) {
             await updatePosition(pos.id, wUpdates);
-            await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, wFill, closeRatio, _wSell.exitImpactPct));
+            await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, wFill, closeRatio, _wSell.exitImpactPct), pos.strategyId ?? null);
             Object.assign(pos, wUpdates);
             await sendTelegram(
               `💰 *PROFIT WITHDRAWAL ${newCount}/5*\n\n` +
@@ -4949,7 +4966,7 @@ async function monitorPositions() {
       const _hSell = await realPartialSell(pos, halveFrac, halveExit);
       if (_hSell.ok) {
         await updatePosition(pos.id, halvUpdates);
-        await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, halveExit, amountSold, _hSell.exitImpactPct));
+        await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, halveExit, amountSold, _hSell.exitImpactPct), pos.strategyId ?? null);
         Object.assign(pos, halvUpdates);
         await sendTelegram(
           `📤 *PROFIT HALVED — LOCKED*\n\n` +
@@ -4985,7 +5002,7 @@ async function monitorPositions() {
       const _reSell = await realPartialSell(pos, exitFrac, exitFillPrice);
       if (_reSell.ok) {
         await updatePosition(pos.id, resistUpdates);
-        await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, amountSold, _reSell.exitImpactPct));
+        await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, amountSold, _reSell.exitImpactPct), pos.strategyId ?? null);
         Object.assign(pos, resistUpdates);
         await sendTelegram(
           `🧱 *RESISTANCE — PARTIAL EXIT*\n\n` +
@@ -5007,63 +5024,51 @@ async function monitorPositions() {
     // Everything else rides via progressive trailing SL below.
     // ─────────────────────────────────────────────────────────────────────────
 
-    // ── PHASE 2 CAPITAL FLOOR — fires at gain ≥ 3% ──────────────────────────
-    // SL = entry + 50% × (ATH − entry). Covers gains 3–20%.
-    // Nov-13: lowered from 7% → 3% — coins were running 10%+ and crashing back
-    // through entry before protection locked in. Small profit > small loss.
-    // At first fire (+3% ATH): SL = entry × 1.015 — locks in half of any gain immediately.
-    // Phase 3 (progressive tightening) takes over above 20% — both run; Phase 3 wins.
-    if (!pos.isMoonBag && gain >= 0.03) {
-      const profitLockSL = pos.entryPrice + 0.50 * (currentPeak - pos.entryPrice);
-      if (profitLockSL > (updates.currentSL ?? pos.currentSL) * 1.005) {
-        updates.currentSL      = profitLockSL;
-        updates.trailingActive = true;
-      }
-    }
-
     // ══════════════════════════════════════════════════════════════════════
-    // ── PHASE 3 PROGRESSIVE TRAILING SL ──────────────────────────────────
-    // Activates at +20% gain (Phase 2 covers 0–20%; both run, Phase 3 wins).
-    //   stepsAbove20 = floor((ATHGain − 20%) / 20%)   → 0 at +20%, 1 at +40%…
-    //   gapPct       = max(10%, 50% − steps × 5%)      → 50%→45%→40%→…→10%
+    // ── UNIVERSAL GAP TRAIL — activates at ATH gain ≥ +10% ──────────────
+    // Phase 1 (0 → +10%): SL stays flat at preEntryPrice (set at entry).
+    // Phase 2 (+10% and above): gap trail kicks in.
+    //   stepsAbove10 = floor((ATHGainPct − 10) / 10)  → 0 at +10%, 1 at +20%…
+    //   gapPct       = max(5%, 80% − steps × 5%)       → 80%→75%→70%→…→5%
     //   SL           = entry + (1 − gapPct) × (ATH − entry)
-    //   SL never below entryPrice (zero-loss). Ratchet: only rises.
+    //   SL never below preEntryPrice. Ratchet: only rises.
     // Moon bag: flat 20% below ATH — SL = ATH × 0.80. Never comes down.
     // ══════════════════════════════════════════════════════════════════════
     if (gainPct > 0) {
       let newSL;
+      const preEntryPrice = pos.preEntryPrice || pos.entryPrice * 0.98;
 
       if (pos.isMoonBag) {
         // ── MOON BAG: flat 20% trailing from ATH ─────────────────────────
         // SL = ATH × 0.80 — rises with ATH, never comes down (ratchet).
         newSL = currentPeak * 0.80;
 
-      } else if (gainPct >= 20) {
-        // ── PHASE 3: progressive trail starting at +20% gain ─────────────
-        const ATH     = currentPeak;
-        const ATHGain = (ATH - pos.entryPrice) / pos.entryPrice; // e.g. 0.40 at +40%
-        const steps   = Math.max(0, Math.floor((ATHGain - 0.20) / 0.20)); // 0=at20%, 1=at40%…
-        const gapPct  = Math.max(0.10, 0.50 - steps * 0.05);              // 50%→45%→…→10%
+      } else if (gainPct >= 10) {
+        // ── PHASE 2: gap trail starting at +10% ATH gain ─────────────────
+        const ATH        = currentPeak;
+        const ATHGainPct = (ATH - pos.entryPrice) / pos.entryPrice * 100; // e.g. 40 at +40%
+        const steps      = Math.max(0, Math.floor((ATHGainPct - 10) / 10)); // 0=at+10%, 1=at+20%…
+        const gapPct     = Math.max(0.05, 0.80 - steps * 0.05);             // 80%→75%→…→5%
 
         // Persist gap state; notify when gap tightens
-        const prevGap = pos.trailPct != null ? pos.trailPct / 100 : 0.50;
+        const prevGap = pos.trailPct != null ? pos.trailPct / 100 : 0.80;
         if (gapPct !== prevGap) {
-          updates.trailPct    = gapPct * 100;   // stored as 50/45/40… for readability
+          updates.trailPct    = gapPct * 100;   // stored as 80/75/70… for readability
           updates.tightenBase = ATH;
           pos.trailPct        = gapPct * 100;
           pos.tightenBase     = ATH;
           if (gapPct < prevGap) {
             sendTelegram(
               `📐 *SL TIGHTENED — ${pos.symbol}*\n` +
-              `Gap: ${(prevGap*100).toFixed(0)}% → *${(gapPct*100).toFixed(0)}%* | Floor: 10%\n` +
+              `Gap: ${(prevGap*100).toFixed(0)}% → *${(gapPct*100).toFixed(0)}%* | Floor: 5%\n` +
               `ATH: $${fmtPrice(ATH)} | Gain: +${gainPct.toFixed(1)}%\n🔗 [Chart](${pos.dexUrl})`
             ).catch(() => {});
           }
         }
 
-        // SL = entry + (1 − gapPct) × (ATH − entry)
+        // SL = entry + (1 − gapPct) × (ATH − entry); never below preEntryPrice
         newSL = pos.entryPrice + (1 - gapPct) * (ATH - pos.entryPrice);
-        newSL = Math.max(pos.entryPrice, newSL); // zero-loss floor
+        newSL = Math.max(preEntryPrice, newSL);
       }
 
       if (newSL !== undefined) {
@@ -5966,6 +5971,36 @@ async function scanForEntries() {
 }
 
 // ─── HOURLY SUMMARY ───────────────────────────────────────────────────────────
+// Build a per-tier breakdown string from daily stats doc
+// Returns lines like: 🥇 BB  +$12.34  5T 80%W  or  🔴 SC  -$2.10  3T 33%W
+function buildTierBreakdown(stats) {
+  const tiers = [
+    { key: 'bb', label: 'Bottom Bounce' },
+    { key: 'am', label: 'Act. Momentum' },
+    { key: 'sc', label: 'Surge Catch'   },
+    { key: 'or', label: 'Open Range'    },
+    { key: 'ps', label: 'Pump Spec'     },
+  ];
+  const rows = tiers
+    .map(t => {
+      const pnl    = stats[`${t.key}_pnl`]    || 0;
+      const trades = stats[`${t.key}_trades`] || 0;
+      const wins   = stats[`${t.key}_wins`]   || 0;
+      return { label: t.label, pnl, trades, wins };
+    })
+    .filter(r => r.trades > 0)
+    .sort((a, b) => b.pnl - a.pnl);
+
+  if (rows.length === 0) return '  (no trades yet)';
+
+  return rows.map((r, i) => {
+    const wr   = r.trades > 0 ? Math.round(r.wins / r.trades * 100) : 0;
+    const sign = r.pnl >= 0 ? '+' : '';
+    const icon = i === 0 && r.pnl > 0 ? '🥇' : r.pnl >= 0 ? '✅' : '🔴';
+    return `  ${icon} ${r.label.padEnd(14)} ${sign}$${r.pnl.toFixed(2)}  ${r.trades}T  ${wr}%W`;
+  }).join('\n');
+}
+
 async function sendHourlySummary() {
   const stats     = await getDailyStats();
   const positions = await getOpenPositions();
@@ -5984,6 +6019,8 @@ async function sendHourlySummary() {
     `  ${s.label}: ${slotCount[s.id]}/${s.maxSlots}`
   ).join('\n');
 
+  const tierBreakdown = buildTierBreakdown(stats);
+
   await sendTelegram(
     `📊 *MEMESCAN — HOURLY*\n\n` +
     `✅ Gross profit:  +$${grossProfit.toFixed(2)}\n` +
@@ -5994,6 +6031,7 @@ async function sendHourlySummary() {
     `💼 Capital used:  $${capital.toFixed(2)}\n\n` +
     `📈 Win rate: ${winRate}% (${stats.wins}W/${stats.losses}L)\n` +
     `🔓 Positions: ${positions.length}/${MAX_POSITIONS}\n\n` +
+    `*Tier P&L (best → worst):*\n${tierBreakdown}\n\n` +
     `*Slots:*\n${slotLines}`
   );
 }
