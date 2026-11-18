@@ -1848,20 +1848,23 @@ async function enterPosition(coin, overrides = {}) {
   const meaningfulR = resistanceCandidates.filter(r => r > effectiveEntry * (1 + RESISTANCE_MIN_GAP));
   const resistancePrice = meaningfulR.length > 0 ? Math.min(...meaningfulR) : null;
 
-  // ── INITIAL SL — price-impact floor (all strategies) ───────────────────────
-  // preEntryPrice = market price before our buy hit the pool (~2% below entry).
-  // Capped at 10% max impact to avoid absurd SLs on very thin pools.
+  // ── INITIAL SL — per-strategy floor ─────────────────────────────────────────
+  // Two groups, each with its own SL floor and trail calibration:
   //
-  // AM (Active Momentum) uses a wider 3% flat SL below entry to tolerate the
-  // ~2% buy-slippage + normal AM volatility before the trail activates at +5%.
-  // All other strategies: SL flat at preEntryPrice until ATH gain ≥ +10%.
+  // Group A — AM / SC / PS (ids 1, 2, 4): fast momentum / pump plays
+  //   slFloor = entry × 0.97  (-3%) | trail at +5% | gap starts 60%
+  //   Wider initial room to absorb ~2% slippage + fast AM/SC/PS volatility.
   //
-  // slFloor: the absolute floor the gap trail never drops below (per strategy).
+  // Group B — BB / OR (ids 0, 3): recovery / range plays
+  //   slFloor = entry × 0.99  (-1%) | trail at +10% | gap starts 80%
+  //   Tight initial SL — these plays should not dip much before moving up.
+  //
+  // slFloor: absolute floor the gap trail never drops below (stored on pos).
   const _impact        = posSize / Math.max((coin.liq || posSize * 100) / 2, posSize);
   const _cappedImpact  = Math.min(_impact, 0.10);
   const preEntryPrice  = effectiveEntry / (1 + _cappedImpact);
-  const isAMStrategy   = s.id === 1;   // Active Momentum
-  const slFloor        = isAMStrategy ? effectiveEntry * 0.97 : preEntryPrice;
+  const isGroupA       = [1, 2, 4].includes(s.id);   // AM, SC, PS
+  const slFloor        = isGroupA ? effectiveEntry * 0.97 : effectiveEntry * 0.99;
   const initialSLPrice = slFloor;
 
   const pos = {
@@ -5034,12 +5037,12 @@ async function monitorPositions() {
     // Phase 1: SL stays flat at slFloor (set at entry).
     // Phase 2: gap trail activates when ATH gain reaches trailThreshold.
     //
-    // AM (Active Momentum) — id=1:
-    //   slFloor = entry×0.97 | trailThreshold = +5% | gapStart = 60%
+    // Group A — AM/SC/PS (ids 1,2,4): fast momentum / pump plays
+    //   slFloor = entry×0.97 (-3%) | trailThreshold = +5% | gapStart = 60%
     //   gap tightens: 60%→55%→50%→…→5% (every +10% above +5%)
     //
-    // All others (BB/SC/OR/PS):
-    //   slFloor = preEntryPrice (~-2%) | trailThreshold = +10% | gapStart = 80%
+    // Group B — BB/OR (ids 0,3): recovery / range plays
+    //   slFloor = entry×0.99 (-1%) | trailThreshold = +10% | gapStart = 80%
     //   gap tightens: 80%→75%→70%→…→5% (every +10% above +10%)
     //
     //   SL = entry + (1 − gapPct) × (ATH − entry); never below slFloor.
@@ -5048,9 +5051,9 @@ async function monitorPositions() {
     if (gainPct > 0) {
       let newSL;
       const slFloor        = pos.slFloor || pos.preEntryPrice || pos.entryPrice * 0.97;
-      const isAM           = pos.strategyId === 1;
-      const trailThreshold = isAM ? 5  : 10;   // +5% for AM, +10% for others
-      const gapStart       = isAM ? 0.60 : 0.80; // 60% for AM, 80% for others
+      const isGroupA       = [1, 2, 4].includes(pos.strategyId); // AM, SC, PS
+      const trailThreshold = isGroupA ? 5  : 10;   // +5% for AM/SC/PS, +10% for BB/OR
+      const gapStart       = isGroupA ? 0.60 : 0.80; // 60% for AM/SC/PS, 80% for BB/OR
 
       if (pos.isMoonBag) {
         // ── MOON BAG: flat 20% trailing from ATH ─────────────────────────
