@@ -379,6 +379,7 @@ const STRATEGIES = [
     label: '📉 BOTTOM BOUNCE',
     maxSlots: 20, // unlimited — competes openly for global slots with id 1 and id 3
     desc: '1h+ old token caught at the bottom going up',
+    disabled: true, // Nov-18: disabled — diagnostic data shows 60min+ coins avg -4% return; re-enable after further testing
     // ── Entry criteria ──
     minAgeDays: 0.042,  // Nov-12: ≥ 1 hour — anything under 1h is PS territory, not BB
     maxCh24: -5,        // Nov-11: -20→-5 — open to any meaningful pullback, not just big crashes
@@ -412,6 +413,7 @@ const STRATEGIES = [
     minBuyPct: 52,       // Nov-11: 58→52 — marginal buyer edge is enough with RugCheck backing it
     minCh1: -2,          // Nov-11: 0→-2 — allow slight h1 dip as long as m5 is positive
     maxCh1: 35,          // Nov-18: cap — coin already up 35%+ in 1h has exhausted its move; we'd be buying the top
+    maxMcap: 500000,     // Nov-18: diagnostic data shows $500k+ mcap coins avg -14.5%; cap at $500k
     minLiq: 18000,       // Nov-13: 12k→18k — tighter LP liq floor; compensates for looser rug risk
     minLiqLocked: 12000, // Nov-13: 8k→12k — higher bar for LP-locked coins
     // ── TP / SL (partial profit — sell in bits) ──
@@ -433,6 +435,7 @@ const STRATEGIES = [
     minM5Txns: 10,       // Nov-11: 20→10 — allow thinner activity in pump ecosystem
     minCh1: 0,           // h1 not negative (newly graduated coins may lack h1 history)
     minBuyPct: 55,       // Nov-11: 62→55 — align with pump.fun ecosystem reality
+    maxMcap: 500000,     // Nov-18: diagnostic data shows $500k+ mcap coins avg -14.5%; cap at $500k
     minLiq: 12000,       // Nov-13: 8k→12k — tighter LP liq floor; compensates for looser rug risk
     minLiqLocked: 8000,  // Nov-13: 5k→8k — higher bar for LP-locked coins
     maxAgeDays: 1,       // Nov-9: SC is for young graduated coins only; AM handles 1–3 days
@@ -447,6 +450,7 @@ const STRATEGIES = [
     label: '📈 OLD RECOVERY',
     maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 1
     desc: '1 day+ established coin recovering steadily',
+    disabled: true, // Nov-18: disabled — diagnostic data shows old high-mcap coins cause heavy losses (SL+rug); re-enable after tuning
     // ── Entry criteria ──
     minAgeDays: 1,       // Nov-12: 3→1 — any coin ≥ 1 day old qualifies as "old recovery"
     minCh24: 0.5,        // Nov-13: 2→0.5 — catch early recovery before 24h fully green
@@ -467,7 +471,8 @@ const STRATEGIES = [
     maxSlots: 20, // Nov-11: removed per-strategy cap — all strategies compete freely for the global 20 slots
     desc: 'pump.fun / PumpSwap < 1 hour old — speculative pullback entry',
     // ── Entry criteria ──
-    maxAgeDays: 0.042,  // Nov-12: < 1 hour — strictly new coins; anything older routes to BB/SC/AM/OR
+    maxAgeDays: 0.042,  // Nov-12: < 1 hour — strictly new coins; anything older routes to SC/AM
+    minAgeMinutes: 5,    // Nov-18: skip coins under 5 min old — rug-at-birth profile (avg 2min, $23k mcap in losses)
     minLiq: 8000,        // Nov-13: 6k→8k — tighter LP liq floor; compensates for looser rug risk
     minLiqLocked: 6000,  // Nov-13: 5k→6k — higher bar for LP-locked
     minH1Ch: 2,          // Nov-11: 5→2 — h1 just needs to show positive trend, not strongly up
@@ -804,6 +809,7 @@ function detectStrategy(pair, openStrategies) {
   const matches = [];
 
   for (const s of openStrategies) {
+    if (s.disabled) continue; // Nov-18: skip strategies disabled in STRATEGIES definition
     let score = 50;
     let match = true;
 
@@ -849,6 +855,7 @@ function detectStrategy(pair, openStrategies) {
       if (strategyFiltersActive) {
         if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // 2h+ only — SC covers 0–24h
         if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // age upper cap (AM has none — applies to any age)
+        if (s.maxMcap    != null && mcap > s.maxMcap)       { match = false; } // Nov-18: $500k+ mcap avg -14.5%; cut it
         if (m5Txns < s.minM5Txns)  { match = false; }
         if (m5Ch < s.minM5Ch)      { match = false; } // POSITIVE direction required (was abs)
         if (ch1 < s.minCh1)        { match = false; }
@@ -887,7 +894,8 @@ function detectStrategy(pair, openStrategies) {
       // Age gate: 0–24 hours (recently graduated coins surge post-migration)
       if (strategyFiltersActive) {
         if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // ≥ 1h — PS takes the sub-1h coins
-        if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // over 24h → AM/BB/OR
+        if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // over 24h → AM
+        if (s.maxMcap    != null && mcap > s.maxMcap)       { match = false; } // Nov-18: $500k+ mcap avg -14.5%; cut it
         if (m5Ch < s.minM5Ch)      { match = false; } // must be moving in last 5 min
         if (m5Txns < s.minM5Txns)  { match = false; } // must be very active
         if (ch1 < s.minCh1)        { match = false; } // h1 confirms uptrend
@@ -960,8 +968,10 @@ function detectStrategy(pair, openStrategies) {
       if (!isPumpFun && !isPumpSwap) {
         match = false;
       } else if (strategyFiltersActive) {
-        // < 1 hour only — older coins route to BB/SC/AM/OR
-        if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; }
+        // < 1 hour only — older coins route to SC/AM
+        if (s.maxAgeDays    != null && ageDays    > s.maxAgeDays)    { match = false; }
+        // Nov-18: skip coins under 5 min — rug-at-birth profile in diagnostic data
+        if (s.minAgeMinutes != null && ageMinutes < s.minAgeMinutes) { match = false; }
         // h1 must be strongly up — confirms an uptrend is running
         if (ch1 === null || ch1 < s.minH1Ch)              { match = false; }
         // m5 in pullback zone — not at the peak, not in freefall
