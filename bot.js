@@ -2414,17 +2414,58 @@ async function logDiagnosticTrade(pos, exitPrice, exitReason, pnl) {
 
 async function generateDiagnosticReport() {
   try {
+    // ── 1. Closed trades from Firestore ──────────────────────────────────────
     const snap   = await db.collection('diagnostic_trades').get();
-    const trades = snap.docs.map(d => d.data());
-    const total  = trades.length;
+    const closed = snap.docs.map(d => d.data());
+
+    // ── 2. Still-open diagnostic positions (unrealized) ──────────────────────
+    let openDiag = [];
+    try {
+      const allOpen = await getOpenPositions();
+      const diagOpen = allOpen.filter(p => p.isDiagnostic);
+      openDiag = diagOpen.map(pos => {
+        const currentPrice = pos.currentPrice || pos.peakPrice || pos.entryPrice;
+        const gainPct      = (currentPrice - pos.entryPrice) / pos.entryPrice * 100;
+        const de           = pos.diagEntry || {};
+        return {
+          symbol:        pos.symbol        || '',
+          address:       pos.address       || '',
+          exitReason:    'open_at_analysis',
+          entryPrice:    pos.entryPrice,
+          exitPrice:     currentPrice,
+          gainPct:       +gainPct.toFixed(2),
+          pnl:           0,                                      // unrealized — no realized P&L yet
+          outcome:       getOutcomeBucket(gainPct),
+          liqBucket:     getLiqBucket(de.liq        || 0),
+          mcapBucket:    getMcapBucket(de.mcap       || 0),
+          activityLevel: getActivityBucket(de.ageMinutes || 0),
+          liqAtEntry:    de.liq        ?? null,
+          mcapAtEntry:   de.mcap       ?? null,
+          ageMinutes:    de.ageMinutes ?? null,
+          strategyId:    de.strategyId ?? pos.strategyId ?? null,
+          score:         de.score      ?? pos.score      ?? null,
+          isOpen:        true,
+        };
+      });
+    } catch(openErr) {
+      console.warn('[DIAG] could not fetch open positions for report:', openErr.message);
+    }
+
+    // ── 3. Merge ──────────────────────────────────────────────────────────────
+    const trades      = [...closed, ...openDiag];
+    const totalClosed = closed.length;
+    const totalOpen   = openDiag.length;
+    const total       = trades.length;
+
     if (total === 0) {
       await sendTelegram('📊 *Diagnostic Report* — no trades recorded yet.');
       return;
     }
+
     const pct = (n, d) => d ? `${(n / d * 100).toFixed(1)}%` : '0%';
     const avg = arr => arr.length ? (arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(1) : 'N/A';
 
-    // Outcome breakdown
+    // ── 4. Outcome breakdown (closed + unrealized combined) ───────────────────
     const ob = { most_profitable:[], good_profit:[], moderate_profit:[], neutral:[], moderate_loss:[], heavy_loss:[], worthless:[] };
     trades.forEach(t => { if (ob[t.outcome]) ob[t.outcome].push(t.gainPct); });
     const profitableTotal = (ob.most_profitable.length + ob.good_profit.length + ob.moderate_profit.length);
@@ -2438,7 +2479,7 @@ async function generateDiagnosticReport() {
       `💀 Worthless (<-50%): *${ob.worthless.length}* (${pct(ob.worthless.length,total)})`,
     ].join('\n');
 
-    // Liq bucket analysis
+    // ── 5. Liq bucket analysis ────────────────────────────────────────────────
     const liqG   = {};
     trades.forEach(t => { const b = t.liqBucket || 'unknown'; (liqG[b] = liqG[b] || []).push(t.gainPct); });
     const liqOrder = ['5k–10k','10k–25k','25k–50k','50k–100k','100k–250k','250k+'];
@@ -2446,7 +2487,7 @@ async function generateDiagnosticReport() {
       .map(b => `  ${b}: ${liqG[b].length} trades | ${pct(liqG[b].filter(g=>g>5).length,liqG[b].length)} profit | avg ${avg(liqG[b])}%`)
       .join('\n') || '  no data';
 
-    // Mcap bucket analysis
+    // ── 6. Mcap bucket analysis ───────────────────────────────────────────────
     const mcG    = {};
     trades.forEach(t => { const b = t.mcapBucket || 'unknown'; (mcG[b] = mcG[b] || []).push(t.gainPct); });
     const mcapOrder = ['<100k','100k–500k','500k–1M','1M–5M','5M–20M','20M+'];
@@ -2454,7 +2495,7 @@ async function generateDiagnosticReport() {
       .map(b => `  ${b}: ${mcG[b].length} trades | ${pct(mcG[b].filter(g=>g>5).length,mcG[b].length)} profit | avg ${avg(mcG[b])}%`)
       .join('\n') || '  no data';
 
-    // Activity level analysis
+    // ── 7. Activity level analysis ────────────────────────────────────────────
     const actG   = {};
     trades.forEach(t => { const b = t.activityLevel || 'unknown'; (actG[b] = actG[b] || []).push(t.gainPct); });
     const actOrder = [['per_minute','<15min'],['per_5min','15–60min'],['per_15min','60min+']];
@@ -2462,13 +2503,31 @@ async function generateDiagnosticReport() {
       .map(([b, lbl]) => `  ${lbl}: ${actG[b].length} trades | ${pct(actG[b].filter(g=>g>5).length,actG[b].length)} profit | avg ${avg(actG[b])}%`)
       .join('\n') || '  no data';
 
+    // ── 8. Open-position snapshot section (unrealized breakdown) ─────────────
+    let openSection = '';
+    if (totalOpen > 0) {
+      const openGains   = openDiag.map(t => t.gainPct);
+      const openPosGain = openGains.filter(g => g > 0).length;
+      openSection = [
+        ``,
+        `🔓 *Open Positions at Analysis (${totalOpen} unrealized)*`,
+        `  Currently positive: ${openPosGain} / ${totalOpen} | Avg unrealized: ${avg(openGains)}%`,
+        `  _(These are still running — outcomes may improve or worsen)_`,
+      ].join('\n');
+    }
+
     const allGains = trades.map(t => t.gainPct);
+    const headerLine = totalOpen > 0
+      ? `📊 *DIAGNOSTIC REPORT — ${total} Total* _(${totalClosed} closed + ${totalOpen} open/unrealized)_`
+      : `📊 *DIAGNOSTIC REPORT — ${total} Trades*`;
+
     const msg = [
-      `📊 *DIAGNOSTIC REPORT — ${total} Trades*`,
+      headerLine,
       `Win Rate (>+5%): *${pct(profitableTotal,total)}* | Avg Gain: *${avg(allGains)}%*`,
       ``,
       `📌 *Outcome Breakdown*`,
       outcomeSection,
+      openSection,
       ``,
       `💧 *Liquidity Range Performance*`,
       liqLines,
