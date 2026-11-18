@@ -1848,17 +1848,21 @@ async function enterPosition(coin, overrides = {}) {
   const meaningfulR = resistanceCandidates.filter(r => r > effectiveEntry * (1 + RESISTANCE_MIN_GAP));
   const resistancePrice = meaningfulR.length > 0 ? Math.min(...meaningfulR) : null;
 
-  // ── INITIAL SL = PRE-ENTRY PRICE (Phase 1 — price-impact floor) ────────────
-  // SL is set at the market price just before our buy hit the pool.
-  // Our buy pushes price up ~2× (tradeSize / halfPool); pre-entry = entry / (1+impact).
+  // ── INITIAL SL — price-impact floor (all strategies) ───────────────────────
+  // preEntryPrice = market price before our buy hit the pool (~2% below entry).
   // Capped at 10% max impact to avoid absurd SLs on very thin pools.
-  //   Phase 1: flat at preEntryPrice until ATH gain ≥ +10%
-  //   Phase 2: gap trail activates — 80% gap at +10%, tightens 5% per +10% ATH gain
-  //   Floor: 5% gap (SL = entry + 95% of gain — maximum protection)
-  const _impact      = posSize / Math.max((coin.liq || posSize * 100) / 2, posSize);
-  const _cappedImpact = Math.min(_impact, 0.10);
+  //
+  // AM (Active Momentum) uses a wider 3% flat SL below entry to tolerate the
+  // ~2% buy-slippage + normal AM volatility before the trail activates at +5%.
+  // All other strategies: SL flat at preEntryPrice until ATH gain ≥ +10%.
+  //
+  // slFloor: the absolute floor the gap trail never drops below (per strategy).
+  const _impact        = posSize / Math.max((coin.liq || posSize * 100) / 2, posSize);
+  const _cappedImpact  = Math.min(_impact, 0.10);
   const preEntryPrice  = effectiveEntry / (1 + _cappedImpact);
-  const initialSLPrice = preEntryPrice;
+  const isAMStrategy   = s.id === 1;   // Active Momentum
+  const slFloor        = isAMStrategy ? effectiveEntry * 0.97 : preEntryPrice;
+  const initialSLPrice = slFloor;
 
   const pos = {
     symbol: coin.symbol, name: coin.name, address: coin.addr,
@@ -1873,7 +1877,8 @@ async function enterPosition(coin, overrides = {}) {
     tp3: overrides.tp3 != null ? effectiveEntry * (1 + overrides.tp3 / 100) : effectiveEntry * s.tp3x,
     sl:  overrides.sl  != null ? effectiveEntry * (1 - overrides.sl  / 100) : initialSLPrice,
     currentSL: overrides.sl != null ? effectiveEntry * (1 - overrides.sl / 100) : initialSLPrice,
-    preEntryPrice,          // market price before our buy hit the pool (Phase 1 SL floor)
+    preEntryPrice,          // market price before our buy hit the pool
+    slFloor,                // absolute SL floor: entry×0.97 for AM, preEntryPrice for others
     initialTrailPct: s.initialTrailPct,
     trailingActive: false,
     size: posSize,
@@ -5025,35 +5030,44 @@ async function monitorPositions() {
     // ─────────────────────────────────────────────────────────────────────────
 
     // ══════════════════════════════════════════════════════════════════════
-    // ── UNIVERSAL GAP TRAIL — activates at ATH gain ≥ +10% ──────────────
-    // Phase 1 (0 → +10%): SL stays flat at preEntryPrice (set at entry).
-    // Phase 2 (+10% and above): gap trail kicks in.
-    //   stepsAbove10 = floor((ATHGainPct − 10) / 10)  → 0 at +10%, 1 at +20%…
-    //   gapPct       = max(5%, 80% − steps × 5%)       → 80%→75%→70%→…→5%
-    //   SL           = entry + (1 − gapPct) × (ATH − entry)
-    //   SL never below preEntryPrice. Ratchet: only rises.
+    // ── GAP TRAIL — per-strategy thresholds ──────────────────────────────
+    // Phase 1: SL stays flat at slFloor (set at entry).
+    // Phase 2: gap trail activates when ATH gain reaches trailThreshold.
+    //
+    // AM (Active Momentum) — id=1:
+    //   slFloor = entry×0.97 | trailThreshold = +5% | gapStart = 60%
+    //   gap tightens: 60%→55%→50%→…→5% (every +10% above +5%)
+    //
+    // All others (BB/SC/OR/PS):
+    //   slFloor = preEntryPrice (~-2%) | trailThreshold = +10% | gapStart = 80%
+    //   gap tightens: 80%→75%→70%→…→5% (every +10% above +10%)
+    //
+    //   SL = entry + (1 − gapPct) × (ATH − entry); never below slFloor.
     // Moon bag: flat 20% below ATH — SL = ATH × 0.80. Never comes down.
     // ══════════════════════════════════════════════════════════════════════
     if (gainPct > 0) {
       let newSL;
-      const preEntryPrice = pos.preEntryPrice || pos.entryPrice * 0.98;
+      const slFloor        = pos.slFloor || pos.preEntryPrice || pos.entryPrice * 0.97;
+      const isAM           = pos.strategyId === 1;
+      const trailThreshold = isAM ? 5  : 10;   // +5% for AM, +10% for others
+      const gapStart       = isAM ? 0.60 : 0.80; // 60% for AM, 80% for others
 
       if (pos.isMoonBag) {
         // ── MOON BAG: flat 20% trailing from ATH ─────────────────────────
         // SL = ATH × 0.80 — rises with ATH, never comes down (ratchet).
         newSL = currentPeak * 0.80;
 
-      } else if (gainPct >= 10) {
-        // ── PHASE 2: gap trail starting at +10% ATH gain ─────────────────
+      } else if (gainPct >= trailThreshold) {
+        // ── PHASE 2: gap trail starting at trailThreshold ────────────────
         const ATH        = currentPeak;
-        const ATHGainPct = (ATH - pos.entryPrice) / pos.entryPrice * 100; // e.g. 40 at +40%
-        const steps      = Math.max(0, Math.floor((ATHGainPct - 10) / 10)); // 0=at+10%, 1=at+20%…
-        const gapPct     = Math.max(0.05, 0.80 - steps * 0.05);             // 80%→75%→…→5%
+        const ATHGainPct = (ATH - pos.entryPrice) / pos.entryPrice * 100;
+        const steps      = Math.max(0, Math.floor((ATHGainPct - trailThreshold) / 10));
+        const gapPct     = Math.max(0.05, gapStart - steps * 0.05);
 
         // Persist gap state; notify when gap tightens
-        const prevGap = pos.trailPct != null ? pos.trailPct / 100 : 0.80;
+        const prevGap = pos.trailPct != null ? pos.trailPct / 100 : gapStart;
         if (gapPct !== prevGap) {
-          updates.trailPct    = gapPct * 100;   // stored as 80/75/70… for readability
+          updates.trailPct    = gapPct * 100;
           updates.tightenBase = ATH;
           pos.trailPct        = gapPct * 100;
           pos.tightenBase     = ATH;
@@ -5066,9 +5080,9 @@ async function monitorPositions() {
           }
         }
 
-        // SL = entry + (1 − gapPct) × (ATH − entry); never below preEntryPrice
+        // SL = entry + (1 − gapPct) × (ATH − entry); never below slFloor
         newSL = pos.entryPrice + (1 - gapPct) * (ATH - pos.entryPrice);
-        newSL = Math.max(preEntryPrice, newSL);
+        newSL = Math.max(slFloor, newSL);
       }
 
       if (newSL !== undefined) {
