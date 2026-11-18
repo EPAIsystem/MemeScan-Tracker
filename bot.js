@@ -2530,6 +2530,72 @@ async function generateDiagnosticReport() {
       ].join('\n');
     }
 
+    // ── 9. Exit reason analysis ───────────────────────────────────────────────
+    // Only closed trades have meaningful exit reasons (open ones are 'open_at_analysis')
+    const closedOnly = trades.filter(t => !t.isOpen);
+    const exitReasonG = {};
+    closedOnly.forEach(t => {
+      const r = t.exitReason || 'unknown';
+      if (!exitReasonG[r]) exitReasonG[r] = [];
+      exitReasonG[r].push(t.gainPct);
+    });
+    const exitReasonLines = Object.entries(exitReasonG)
+      .sort((a, b) => b[1].length - a[1].length)
+      .map(([reason, gains]) => {
+        const wins  = gains.filter(g => g > 5).length;
+        const label = reason.replace(/_/g, ' ');
+        return `  ${label}: *${gains.length}* trades | ${pct(wins, gains.length)} profit | avg ${avg(gains)}%`;
+      })
+      .join('\n') || '  no data';
+
+    // ── 10. Loss cause analysis — heavy + worthless only ─────────────────────
+    // "What caused the worst losses, and what were those coins like at entry?"
+    const bigLosses   = closedOnly.filter(t => t.gainPct < -20);  // heavy + worthless
+    const modLosses   = closedOnly.filter(t => t.gainPct < -5 && t.gainPct >= -20); // moderate loss only
+
+    function lossProfile(lossSet, label) {
+      if (!lossSet.length) return `  ${label}: none`;
+      // Exit reason breakdown
+      const byReason = {};
+      lossSet.forEach(t => {
+        const r = t.exitReason || 'unknown';
+        (byReason[r] = byReason[r] || []).push(t);
+      });
+      const reasonSummary = Object.entries(byReason)
+        .sort((a, b) => b[1].length - a[1].length)
+        .map(([r, trades]) => {
+          const avgLiq  = trades.map(t => t.liqAtEntry).filter(v => v != null);
+          const avgMcap = trades.map(t => t.mcapAtEntry).filter(v => v != null);
+          const avgAge  = trades.map(t => t.ageMinutes).filter(v => v != null);
+          const fmtAvg  = arr => arr.length ? Math.round(arr.reduce((a,b)=>a+b,0)/arr.length).toLocaleString() : '?';
+          const lbl     = r.replace(/_/g, ' ');
+          return `    • ${lbl}: ${trades.length} trades | avg liq $${fmtAvg(avgLiq)} | avg mcap $${fmtAvg(avgMcap)} | avg age ${fmtAvg(avgAge)}min`;
+        })
+        .join('\n');
+      // Entry bucket breakdown
+      const byLiq = {}; lossSet.forEach(t => { const b = t.liqBucket||'?'; (byLiq[b]=byLiq[b]||[]).push(1); });
+      const byAge = {}; lossSet.forEach(t => { const b = t.activityLevel||'?'; (byAge[b]=byAge[b]||[]).push(1); });
+      const liqSummary = liqOrder.filter(b => byLiq[b]?.length)
+        .map(b => `${b}:${byLiq[b].length}`).join(' · ') || '?';
+      const ageMap = {'per_minute':'<15min','per_5min':'15–60min','per_15min':'60min+'};
+      const ageSummary = ['per_minute','per_5min','per_15min'].filter(b => byAge[b]?.length)
+        .map(b => `${ageMap[b]}:${byAge[b].length}`).join(' · ') || '?';
+      return [
+        `  ${label} — *${lossSet.length}* trades | avg ${avg(lossSet.map(t=>t.gainPct))}%`,
+        reasonSummary,
+        `    Entry liq: ${liqSummary}`,
+        `    Entry age: ${ageSummary}`,
+      ].join('\n');
+    }
+
+    const lossSection = [
+      ``,
+      `🩸 *Loss Cause Analysis*`,
+      lossProfile(bigLosses,  '🔻 Heavy+Worthless (<-20%)'),
+      ``,
+      lossProfile(modLosses,  '📉 Moderate Loss (-5–20%)'),
+    ].join('\n');
+
     const allGains = trades.map(t => t.gainPct);
     const headerLine = totalOpen > 0
       ? `📊 *DIAGNOSTIC REPORT — ${total} Total* _(${totalClosed} closed + ${totalOpen} open/unrealized)_`
@@ -2551,6 +2617,10 @@ async function generateDiagnosticReport() {
       ``,
       `⚡ *Activity Level Performance*`,
       actLines,
+      ``,
+      `🚪 *Exit Reason Breakdown*`,
+      exitReasonLines,
+      lossSection,
       ``,
       `_Diagnostic mode is now OFF. Review data to refine strategy filters._`,
     ].join('\n');
