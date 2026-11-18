@@ -37,6 +37,17 @@ const MIN_SCORE       = 45;  // Nov-11: lowered from 55; GeckoTerminal trending 
 let strategyFiltersActive = true;
 const DAILY_LOSS_LIMIT= -0.30;
 
+// ─── DIAGNOSTIC MODE ──────────────────────────────────────────────────────────
+// When on: bypasses all filters (except DIAG_MIN_LIQ), raises slot cap to 100,
+// uses 50%-from-ATH SL trail (Phase 2 jumps to 60% gap at +30% ATH gain), and
+// logs every closed trade to Firestore 'diagnostic_trades'. Auto-disables +
+// sends full analysis report after DIAGNOSTIC_TARGET trades.
+let diagnosticMode       = false;
+let diagnosticTradeCount = 0;
+const DIAGNOSTIC_TARGET  = 1000;
+const DIAG_MIN_LIQ       = 8000;
+const DIAG_MAX_POSITIONS = 100;
+
 // ─── SESSION FILTERS ─────────────────────────────────────────────────────────
 // User-set restrictions on what coins the bot auto-enters this session.
 // All fields null = no restriction on that dimension.
@@ -635,6 +646,7 @@ function detectStrategy(pair, openStrategies) {
   if (!globalGatesBypass) {
     if (liq < 3000) return rej('liqFloor'); // $3,000 absolute floor — below this, any position faces severe slippage (restored Nov-14)
   }
+  if (diagnosticMode && liq < DIAG_MIN_LIQ) return rej('liqFloor'); // diagnostic mode: $8k floor only — all other gates bypassed
   if (price <= 0)  return rej('price');  // always keep — zero price breaks arithmetic
   if (!globalGatesBypass) {
     if (sells24 === 0 && buys24 > 10) return rej('honey'); // honeypot guard
@@ -1165,6 +1177,8 @@ async function saveBypassFlags() {
       lpOpen:           lpLockBypass,
       stratsSkipped:    !strategyFiltersActive,
       autoEntryPaused:  autoEntryPaused,
+      diagnosticMode:   diagnosticMode,
+      diagTradeCount:   diagnosticTradeCount,
     }, { merge: true });
   } catch(e) {
     console.warn('[BOT] Could not persist bypass flags:', e.message);
@@ -1952,9 +1966,15 @@ async function enterPosition(coin, overrides = {}) {
   const isGroupA       = [1, 2, 4].includes(s.id);   // AM, SC, PS
   const fixedFloor     = isGroupA ? effectiveEntry * 0.97 : effectiveEntry * 0.99;
 
-  const { swingSL, skipEntry } = overrides.sl == null
-    ? await analyzeSwingData(coin.pairAddress, coin.ageMinutes, effectiveEntry, isGroupA)
-    : { swingSL: null, skipEntry: false };  // skip API call when user set an explicit SL
+  let swingSL = null, skipEntry = false;
+  if (diagnosticMode) {
+    // Diagnostic mode: 50% SL floor from entry — allows coin to drop up to 50% before cutting
+    swingSL = effectiveEntry * 0.50;
+  } else if (overrides.sl == null) {
+    const swingResult = await analyzeSwingData(coin.pairAddress, coin.ageMinutes, effectiveEntry, isGroupA);
+    swingSL   = swingResult.swingSL;
+    skipEntry = swingResult.skipEntry;
+  }
 
   if (skipEntry) {
     console.log(`[SKIP-ENTRY] ${coin.symbol} (${s.label}) — price at top of recent range, not entering`);
@@ -2035,6 +2055,20 @@ async function enterPosition(coin, overrides = {}) {
     entryFeeUsd:     tradingMode === 'paper'
       ? (effectiveEntry - rawEntryPrice) / rawEntryPrice * posSize
       : (realTx?.jitoTipUsd || 0) + ((realTx?.entryImpactPct || 0) / 100 * posSize),
+    // Diagnostic mode fields — entry signals stored for post-trade analysis
+    isDiagnostic: diagnosticMode || false,
+    diagEntry: diagnosticMode ? {
+      m5Ch:       coin.m5Ch       ?? null,
+      ch1:        coin.ch1        ?? null,
+      ch24:       coin.ch24       ?? null,
+      buyPct:     coin.buyPct     ?? null,
+      m5Txns:     coin.m5Txns     ?? null,
+      ageMinutes: coin.ageMinutes ?? null,
+      liq:        coin.liq        ?? null,
+      mcap:       coin.mcap       ?? null,
+      score:      coin.score      ?? null,
+      strategyId: s.id,
+    } : null,
   };
   await ref.set(pos);
   // Accumulate capital deployed + entry fee into daily stats (fire-and-forget)
@@ -2292,7 +2326,166 @@ async function realClose(pos, exitPrice, exitReason, pnl, extraData = {}) {
     }
   }
   await closePosition(pos.id, { exitPrice, exitReason, pnl, ...extraData });
+  if (pos.isDiagnostic) {
+    logDiagnosticTrade(pos, exitPrice, exitReason, pnl).catch(e => console.warn('[DIAG] log error:', e.message));
+  }
   return { ok: true, txHash, exitImpactPct };
+}
+
+// ─── DIAGNOSTIC MODE HELPERS ─────────────────────────────────────────────────
+function getLiqBucket(liq) {
+  if (!liq || liq <= 0)  return 'unknown';
+  if (liq < 10000)       return '5k–10k';
+  if (liq < 25000)       return '10k–25k';
+  if (liq < 50000)       return '25k–50k';
+  if (liq < 100000)      return '50k–100k';
+  if (liq < 250000)      return '100k–250k';
+  return '250k+';
+}
+function getMcapBucket(mcap) {
+  if (!mcap || mcap <= 0) return 'unknown';
+  if (mcap < 100000)      return '<100k';
+  if (mcap < 500000)      return '100k–500k';
+  if (mcap < 1000000)     return '500k–1M';
+  if (mcap < 5000000)     return '1M–5M';
+  if (mcap < 20000000)    return '5M–20M';
+  return '20M+';
+}
+function getActivityBucket(ageMinutes) {
+  if (!ageMinutes || ageMinutes < 15) return 'per_minute';   // coin <15min — activity per minute
+  if (ageMinutes < 60)                 return 'per_5min';    // 15–60min — activity per 5min
+  return 'per_15min';                                        // 60min+ — activity per 15min
+}
+function getOutcomeBucket(gainPct) {
+  if (gainPct > 50)   return 'most_profitable';   // >+50%
+  if (gainPct > 20)   return 'good_profit';        // +20–50%
+  if (gainPct > 5)    return 'moderate_profit';    // +5–20%
+  if (gainPct >= -5)  return 'neutral';            // ±5%
+  if (gainPct >= -20) return 'moderate_loss';      // -5 to -20%
+  if (gainPct >= -50) return 'heavy_loss';         // -20 to -50%
+  return 'worthless';                              // <-50%
+}
+
+async function logDiagnosticTrade(pos, exitPrice, exitReason, pnl) {
+  try {
+    const gainPct = (exitPrice - pos.entryPrice) / pos.entryPrice * 100;
+    const de      = pos.diagEntry || {};
+    const record  = {
+      symbol:       pos.symbol || '',
+      address:      pos.address || '',
+      exitReason:   exitReason || '',
+      entryPrice:   pos.entryPrice,
+      exitPrice,
+      gainPct:      +gainPct.toFixed(2),
+      pnl:          +(pnl || 0).toFixed(4),
+      outcome:      getOutcomeBucket(gainPct),
+      // Entry signals
+      m5Ch:         de.m5Ch     ?? null,
+      ch1:          de.ch1      ?? null,
+      ch24:         de.ch24     ?? null,
+      buyPct:       de.buyPct   ?? null,
+      m5Txns:       de.m5Txns   ?? null,
+      score:        de.score    ?? pos.score ?? null,
+      strategyId:   de.strategyId ?? pos.strategyId ?? null,
+      // Bucket classification for range analysis
+      liqBucket:     getLiqBucket(de.liq || 0),
+      mcapBucket:    getMcapBucket(de.mcap || 0),
+      activityLevel: getActivityBucket(de.ageMinutes || 0),
+      // Raw values
+      liqAtEntry:   de.liq        ?? null,
+      mcapAtEntry:  de.mcap       ?? null,
+      ageMinutes:   de.ageMinutes ?? null,
+      enteredAt:    pos.enteredAt || Date.now(),
+      closedAt:     Date.now(),
+    };
+    await db.collection('diagnostic_trades').add(record);
+    diagnosticTradeCount++;
+    console.log(`[DIAG] Trade #${diagnosticTradeCount}/${DIAGNOSTIC_TARGET}: ${pos.symbol} ${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(1)}% → ${record.outcome}`);
+    if (diagnosticTradeCount >= DIAGNOSTIC_TARGET) {
+      console.log('[DIAG] Target reached — generating report and disabling diagnostic mode');
+      diagnosticMode = false;
+      await saveBypassFlags().catch(() => {});
+      await generateDiagnosticReport();
+    }
+  } catch(e) {
+    console.warn('[DIAG] logDiagnosticTrade error:', e.message);
+  }
+}
+
+async function generateDiagnosticReport() {
+  try {
+    const snap   = await db.collection('diagnostic_trades').get();
+    const trades = snap.docs.map(d => d.data());
+    const total  = trades.length;
+    if (total === 0) {
+      await sendTelegram('📊 *Diagnostic Report* — no trades recorded yet.');
+      return;
+    }
+    const pct = (n, d) => d ? `${(n / d * 100).toFixed(1)}%` : '0%';
+    const avg = arr => arr.length ? (arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(1) : 'N/A';
+
+    // Outcome breakdown
+    const ob = { most_profitable:[], good_profit:[], moderate_profit:[], neutral:[], moderate_loss:[], heavy_loss:[], worthless:[] };
+    trades.forEach(t => { if (ob[t.outcome]) ob[t.outcome].push(t.gainPct); });
+    const profitableTotal = (ob.most_profitable.length + ob.good_profit.length + ob.moderate_profit.length);
+    const outcomeSection = [
+      `🏆 Most Profitable (>+50%): *${ob.most_profitable.length}* (${pct(ob.most_profitable.length,total)}) avg ${avg(ob.most_profitable)}%`,
+      `✅ Good Profit (+20–50%): *${ob.good_profit.length}* (${pct(ob.good_profit.length,total)})`,
+      `📈 Moderate Profit (+5–20%): *${ob.moderate_profit.length}* (${pct(ob.moderate_profit.length,total)})`,
+      `➡️ Neutral (±5%): *${ob.neutral.length}* (${pct(ob.neutral.length,total)})`,
+      `📉 Moderate Loss (-5–20%): *${ob.moderate_loss.length}* (${pct(ob.moderate_loss.length,total)})`,
+      `🔻 Heavy Loss (-20–50%): *${ob.heavy_loss.length}* (${pct(ob.heavy_loss.length,total)})`,
+      `💀 Worthless (<-50%): *${ob.worthless.length}* (${pct(ob.worthless.length,total)})`,
+    ].join('\n');
+
+    // Liq bucket analysis
+    const liqG   = {};
+    trades.forEach(t => { const b = t.liqBucket || 'unknown'; (liqG[b] = liqG[b] || []).push(t.gainPct); });
+    const liqOrder = ['5k–10k','10k–25k','25k–50k','50k–100k','100k–250k','250k+'];
+    const liqLines = liqOrder.filter(b => liqG[b]?.length)
+      .map(b => `  ${b}: ${liqG[b].length} trades | ${pct(liqG[b].filter(g=>g>5).length,liqG[b].length)} profit | avg ${avg(liqG[b])}%`)
+      .join('\n') || '  no data';
+
+    // Mcap bucket analysis
+    const mcG    = {};
+    trades.forEach(t => { const b = t.mcapBucket || 'unknown'; (mcG[b] = mcG[b] || []).push(t.gainPct); });
+    const mcapOrder = ['<100k','100k–500k','500k–1M','1M–5M','5M–20M','20M+'];
+    const mcapLines = mcapOrder.filter(b => mcG[b]?.length)
+      .map(b => `  ${b}: ${mcG[b].length} trades | ${pct(mcG[b].filter(g=>g>5).length,mcG[b].length)} profit | avg ${avg(mcG[b])}%`)
+      .join('\n') || '  no data';
+
+    // Activity level analysis
+    const actG   = {};
+    trades.forEach(t => { const b = t.activityLevel || 'unknown'; (actG[b] = actG[b] || []).push(t.gainPct); });
+    const actOrder = [['per_minute','<15min'],['per_5min','15–60min'],['per_15min','60min+']];
+    const actLines = actOrder.filter(([b]) => actG[b]?.length)
+      .map(([b, lbl]) => `  ${lbl}: ${actG[b].length} trades | ${pct(actG[b].filter(g=>g>5).length,actG[b].length)} profit | avg ${avg(actG[b])}%`)
+      .join('\n') || '  no data';
+
+    const allGains = trades.map(t => t.gainPct);
+    const msg = [
+      `📊 *DIAGNOSTIC REPORT — ${total} Trades*`,
+      `Win Rate (>+5%): *${pct(profitableTotal,total)}* | Avg Gain: *${avg(allGains)}%*`,
+      ``,
+      `📌 *Outcome Breakdown*`,
+      outcomeSection,
+      ``,
+      `💧 *Liquidity Range Performance*`,
+      liqLines,
+      ``,
+      `📦 *Market Cap Range Performance*`,
+      mcapLines,
+      ``,
+      `⚡ *Activity Level Performance*`,
+      actLines,
+      ``,
+      `_Diagnostic mode is now OFF. Review data to refine strategy filters._`,
+    ].join('\n');
+    await sendTelegram(msg);
+  } catch(e) {
+    console.error('[DIAG] generateDiagnosticReport error:', e.message);
+    await sendTelegram(`❌ *Diagnostic Report Failed*\n\`${e.message}\``).catch(() => {});
+  }
 }
 
 // Convenience wrapper for partial exits: executes real on-chain sell of `sellFrac`
@@ -3653,6 +3846,65 @@ async function pollTelegramCommands() {
         continue;
       }
 
+      // ── /diagnostic on|off|status — research data-collection mode ───────────────
+      // Bypasses ALL filters (keeps liq ≥ $8k), raises slot cap to 100,
+      // uses 50%-from-ATH SL trail, logs every trade to Firestore 'diagnostic_trades'.
+      // Auto-disables + sends full report after 1,000 trades.
+      if (text === '/diagnostic on' || text === '/diagnostic off' ||
+          text === '/diagnostic status' || text === '/diagnostic') {
+        if (text === '/diagnostic status' || text === '/diagnostic') {
+          const statusLine = diagnosticMode
+            ? `🔬 *DIAGNOSTIC MODE — ACTIVE*\n\n` +
+              `Trades logged: *${diagnosticTradeCount}/${DIAGNOSTIC_TARGET}*\n` +
+              `All filters bypassed (liq ≥ $${(DIAG_MIN_LIQ/1000).toFixed(0)}k only)\n` +
+              `Slot cap: ${DIAG_MAX_POSITIONS} · SL: 50% from ATH\n\n` +
+              `Send /diagnostic off to stop, /diagreport for current analysis.`
+            : `🔬 *DIAGNOSTIC MODE — OFF*\n\n` +
+              `Trades logged so far: *${diagnosticTradeCount}/${DIAGNOSTIC_TARGET}*\n\n` +
+              `Send /diagnostic on to start data collection.`;
+          await sendTelegram(statusLine);
+        } else if (text === '/diagnostic on') {
+          diagnosticMode       = true;
+          globalGatesBypass    = true;
+          lpLockBypass         = true;
+          strategyFiltersActive = false;
+          await saveBypassFlags();
+          await sendTelegram(
+            `🔬 *DIAGNOSTIC MODE — ON*\n\n` +
+            `The bot is now in research/data-collection mode.\n\n` +
+            `✅ All filters bypassed\n` +
+            `✅ Liq gate: ≥ $${(DIAG_MIN_LIQ/1000).toFixed(0)}k only\n` +
+            `✅ Slot cap: ${DIAG_MAX_POSITIONS} positions\n` +
+            `✅ SL: 50% from any ATH (Phase 2: 60% tightening at +30%)\n` +
+            `✅ Every closed trade logged to Firestore\n\n` +
+            `Auto-disables + sends report after ${DIAGNOSTIC_TARGET} trades.\n` +
+            `Trades logged so far: *${diagnosticTradeCount}/${DIAGNOSTIC_TARGET}*\n\n` +
+            `⚠️ _Paper mode data collection — no real capital at risk._\n` +
+            `Send /diagnostic off to stop. Send /diagreport at any time for a snapshot.`
+          );
+        } else {
+          diagnosticMode        = false;
+          globalGatesBypass     = false;
+          lpLockBypass          = false;
+          strategyFiltersActive = true;
+          await saveBypassFlags();
+          await sendTelegram(
+            `🔬 *DIAGNOSTIC MODE — OFF*\n\n` +
+            `All filters restored to normal.\n` +
+            `Trades logged: *${diagnosticTradeCount}/${DIAGNOSTIC_TARGET}*\n\n` +
+            `Send /diagreport to view the data collected so far.`
+          );
+        }
+        continue;
+      }
+
+      // ── /diagreport — generate diagnostic analysis report ───────────────────────
+      if (text === '/diagreport') {
+        await sendTelegram(`📊 Generating diagnostic report... (querying ${diagnosticTradeCount} trades)`);
+        await generateDiagnosticReport();
+        continue;
+      }
+
       // ── /manual | /auto | /pauseentry [on|off] — toggle manual-only mode ───────
       // Manual-only: bot fires alerts but skips enterPosition; manual queue still works.
       // /manual = manual-only on; /auto = back to full auto. Persists across restarts.
@@ -3723,6 +3975,9 @@ async function pollTelegramCommands() {
           `/clearreal — delete ghost real-mode positions\n` +
           `/restart — reset daily loss counter\n` +
           `/queue <CA> — evaluate a contract address now\n\n` +
+          `🔬 *Research Mode*\n` +
+          `/diagnostic on|off|status — bypass filters, log 1k trades for analysis\n` +
+          `/diagreport — generate trade analysis report now\n\n` +
           `🔓 *Filter Controls* _(saved — survive restarts)_\n` +
           `/openmode — open ALL filters at once (master toggle)\n` +
           `/pauseentry — pause auto-entry (signals still alert; enter manually)\n` +
@@ -5147,7 +5402,22 @@ async function monitorPositions() {
       const trailThreshold = 5;     // all strategies: trail activates at +5% ATH gain
       const gapStart       = 0.60;  // all strategies: gap starts at 60%
 
-      if (pos.isMoonBag) {
+      if (pos.isDiagnostic) {
+        // ── DIAGNOSTIC TRAIL ─────────────────────────────────────────────
+        // Phase 1 (ATHGain < 30%): SL = ATH × 0.50 — allows 50% drop from any ATH
+        // Phase 2 (ATHGain ≥ 30%): jump to standard 60% tightening trail
+        const ATHd        = currentPeak;
+        const ATHGainPctD = (ATHd - pos.entryPrice) / pos.entryPrice * 100;
+        if (ATHGainPctD >= 30) {
+          const stepsD  = Math.max(0, Math.floor((ATHGainPctD - 5) / 10));
+          const gapPctD = Math.max(0.05, gapStart - stepsD * 0.05);
+          newSL = pos.entryPrice + (1 - gapPctD) * (ATHd - pos.entryPrice);
+        } else {
+          newSL = ATHd * 0.50;
+        }
+        newSL = Math.max(slFloor, newSL);
+
+      } else if (pos.isMoonBag) {
         // ── MOON BAG: flat 20% trailing from ATH ─────────────────────────
         // SL = ATH × 0.80 — rises with ATH, never comes down (ratchet).
         newSL = currentPeak * 0.80;
@@ -5619,9 +5889,10 @@ async function scanForEntries() {
   }
   await checkTradingPeriod();
   const positions = await getVisiblePositions();
-  if (positions.length >= MAX_POSITIONS) return;
+  const _maxPos = diagnosticMode ? DIAG_MAX_POSITIONS : MAX_POSITIONS;
+  if (positions.length >= _maxPos) return;
 
-  const vacantSlots = MAX_POSITIONS - positions.length;
+  const vacantSlots = _maxPos - positions.length;
 
   // Count open slots per strategy
   const slotCount = {};
@@ -5692,7 +5963,7 @@ async function scanForEntries() {
         }
       }
 
-      if (result.score >= effectiveThreshold) {
+      if (result.score >= effectiveThreshold || diagnosticMode) {
         if (trendCount > 0) result._trendingPlatforms = trendCount; // attach badge for Telegram
         // Record price snapshot for trend/rebound tracking (also store volume/buys for TA indicators)
         const price = parseFloat(pair.priceUsd || 0);
@@ -5769,7 +6040,7 @@ async function scanForEntries() {
   // (all last 3 price points dropping). Trending, rebounding, stable, or new coins
   // all pass. High-confidence signals (score ≥ 85) always pass regardless.
   const qualityMatches = lockedMatches.filter(coin => {
-    if (coin.score >= 85) return true; // always trust high-confidence signals
+    if (coin.score >= 85 || diagnosticMode) return true; // always pass high-confidence / diagnostic
     if (isDeclining(coin.addr)) {
       console.log(`[QUALITY] ❌ ${coin.symbol} — ${priceQualityLabel(coin.addr)}, skipped`);
       return false;
@@ -5839,7 +6110,7 @@ async function scanForEntries() {
 
     await sendTelegram(
       `🔍 *Scan #${scanCount}*${paused}${halted}\n` +
-      `Mode: *${mode}* · Open: ${openPositions.length}/${MAX_POSITIONS}\n` +
+      `Mode: *${mode}${diagnosticMode ? ' 🔬DIAG' : ''}* · Open: ${openPositions.length}/${diagnosticMode ? DIAG_MAX_POSITIONS : MAX_POSITIONS}${diagnosticMode ? ` (${diagnosticTradeCount}/${DIAGNOSTIC_TARGET} logged)` : ''}\n` +
       `${candidates.length} cands→${matches.length} scored→${lockedMatches.length} LP OK→${qualityMatches.length} quality\n` +
       `${nearMissCount} near-misses (score ${MIN_SCORE - 8}-${scoreThreshold - 1})` +
       gateSection +
@@ -5894,13 +6165,13 @@ async function scanForEntries() {
   const _entryCeiling = parseFloat(_entryCfg.positionSize) || POSITION_SIZE;
 
   // Apply session filters (age/mcap/vol restrictions set by user via /filter)
-  const filteredMatches = applySessionFilters(qualityMatches);
-  if (filteredMatches.length < qualityMatches.length) {
+  const filteredMatches = diagnosticMode ? qualityMatches : applySessionFilters(qualityMatches);
+  if (!diagnosticMode && filteredMatches.length < qualityMatches.length) {
     console.log(`[SESSION-FILTER] ${qualityMatches.length - filteredMatches.length}/${qualityMatches.length} matches dropped by session filters (${fmtSessionFilters().replace(/\n/g,' | ')})`);
   }
 
   for (const coin of filteredMatches) {
-    if (positions.length >= MAX_POSITIONS) break;
+    if (positions.length >= _maxPos) break;
     if (usedThisScan.has(coin.addr)) continue;
     // Entry cooldown: only blocks when NOT paused (paused path uses its own cooldown)
     const last = alertCooldown.get(coin.addr) || 0;
@@ -5908,8 +6179,8 @@ async function scanForEntries() {
     // Pause-alert cooldown: suppress repeat signals while paused (separate from entry cooldown)
     const lastPaused = pausedAlertCooldown.get(coin.addr) || 0;
     if (autoEntryPaused && Date.now() - lastPaused < 30 * 60 * 1000) continue;
-    // Check slot still available (may have been filled earlier in this loop)
-    if (slotCount[coin.strategy.id] >= coin.strategy.maxSlots) continue;
+    // Check slot still available (may have been filled earlier in this loop) — bypassed in diagnostic mode
+    if (!diagnosticMode && slotCount[coin.strategy.id] >= coin.strategy.maxSlots) continue;
 
     // ── Tiered entry gate (age + transaction rate by position size) ───────────
     // Uses the actual dynamic size (liq × 1% × MC multiplier, capped at ceiling)
@@ -5939,7 +6210,7 @@ async function scanForEntries() {
         if (_age < 20) _tierBlock = `age ${_age.toFixed(1)}min < 20 (tier $50+)`;
       }
 
-      if (_tierBlock) {
+      if (_tierBlock && !diagnosticMode) {
         console.log(`[TIER-GATE] BLOCKED ${coin.symbol} — ${_tierBlock} (dynSize=$${_sz.toFixed(2)} ceiling=$${_entryCeiling})`);
         usedThisScan.add(coin.addr);
         continue;
@@ -5959,7 +6230,7 @@ async function scanForEntries() {
         const rangeSize = maxP - minP;
         if (rangeSize > minP * 0.08) { // meaningful oscillation (>8% swing observed)
           const posInRange = (coin.price - minP) / rangeSize;
-          if (posInRange > 0.80) {
+          if (posInRange > 0.80 && !diagnosticMode) {
             console.log(`[RANGE-TOP] ${coin.symbol} — price in top ${(posInRange*100).toFixed(0)}% of range ($${fmtPrice(minP)}–$${fmtPrice(maxP)}) — skipping range-top entry`);
             usedThisScan.add(coin.addr);
             continue;
@@ -6193,6 +6464,8 @@ async function main() {
   lpLockBypass          = !!startCfg.lpOpen;
   strategyFiltersActive = !startCfg.stratsSkipped; // inverted: true = filters on
   autoEntryPaused          = !!startCfg.autoEntryPaused;
+  diagnosticMode           = !!startCfg.diagnosticMode;
+  diagnosticTradeCount     = startCfg.diagTradeCount || 0;
   lastAnnouncedPeriodKey   = startCfg.currentPeriod?.key || null; // don't re-announce on restart
   if (startCfg.sessionFilters) sessionFilters = { ...sessionFilters, ...startCfg.sessionFilters };
   if (globalGatesBypass || lpLockBypass || !strategyFiltersActive) {
