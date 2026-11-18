@@ -812,22 +812,20 @@ function detectStrategy(pair, openStrategies) {
       // Nov-11: pump.fun/PumpSwap coins now allowed — all strategies compete freely.
       // BB is ONLY for genuine oversold recovery: coin crashed 20–85%,
       // h1 turning up, m5 actively bouncing NOW with strong buyer conviction.
-      if (!strategyFiltersActive) {
-        match = true;
-      } else {
-
-      if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // ≥ 1h — PS takes the sub-1h coins
-
-      if (match) match = ch24 <= s.maxCh24           // genuinely crashed (ch24 ≤ –20%)
-           && ch24 >= s.minCh24           // not a dead coin (≥ –85%)
-           && ch1 >= s.minCh1             // h1 turning — not in freefall
-           && ch1 <= s.maxCh1             // h1 not already mooned
-           && (s.minCh6 == null || ch6 >= s.minCh6)
-           && m5Ch >= s.minM5Ch           // ACTIVELY bouncing in last 5 min (≥+1.5%)
-           && buyPct >= s.minBuyPct       // strong buyer dominance (≥65%)
-           && liq >= s.minLiqLocked       // relaxed floor — filterByLpLock enforces strict floor for unlocked LP
-           && m5Txns >= s.minM5Txns;
-
+      if (strategyFiltersActive) {
+        if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // ≥ 1h — PS takes the sub-1h coins
+        if (match) match = ch24 <= s.maxCh24           // genuinely crashed (ch24 ≤ –20%)
+             && ch24 >= s.minCh24           // not a dead coin (≥ –85%)
+             && ch1 >= s.minCh1             // h1 turning — not in freefall
+             && ch1 <= s.maxCh1             // h1 not already mooned
+             && (s.minCh6 == null || ch6 >= s.minCh6)
+             && m5Ch >= s.minM5Ch           // ACTIVELY bouncing in last 5 min (≥+1.5%)
+             && buyPct >= s.minBuyPct       // strong buyer dominance (≥65%)
+             && liq >= s.minLiqLocked       // relaxed floor — filterByLpLock enforces strict floor for unlocked LP
+             && m5Txns >= s.minM5Txns;
+      }
+      // Nov-18: scoring runs regardless of strategyFiltersActive (matches AM/SC/OR pattern)
+      // so BB competes fairly in diagnostic mode instead of always scoring 0
       if (match) {
         // Classic oversold: score on depth of drop + reversal strength
         score += Math.min(20, Math.abs(ch24) / 4);
@@ -843,7 +841,6 @@ function detectStrategy(pair, openStrategies) {
           else if (avgTrade < 30) score -= 10;
         }
       }
-      } // end strategyFiltersActive else
     }
 
     else if (s.id === 1) {
