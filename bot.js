@@ -1762,6 +1762,71 @@ function calcExitFeeUsd(pos, rawPrice, fillPrice, fraction, realImpactPct) {
   return pos.size * frac * Math.max(0, 1 - fillPrice / rawPrice);
 }
 
+// ─── DYNAMIC SWING-BASED SL ───────────────────────────────────────────────────
+// Fetches recent OHLCV candles from GeckoTerminal and derives a data-driven SL
+// based on the coin's actual swing range.
+//
+// Formula:  SL = swing_low − 0.25 × (swing_high − swing_low)
+//   • Gives an extra 25% of the swing window as a buffer below support.
+//
+// Lookback window is proportional to coin age:
+//   window = min(30, max(1, floor(ageMinutes × 0.15)))   minutes
+//   e.g. 3-min coin → 1 min | 20-min coin → 3 min | 2h coin → 18 min
+//
+// Safeguards (applied in order):
+//   1. If API error / bad data → return null (fall back to fixed slFloor)
+//   2. candidateSL must be ≤ entry × 0.95  (never wider than -5%)
+//   3. candidateSL must be ≥ groupFloor    (never tighter than fixed floor)
+//      Group A (AM/SC/PS): groupFloor = entry × 0.97
+//      Group B (BB/OR):    groupFloor = entry × 0.99
+async function fetchSwingSL(pairAddress, ageMinutes, entryPrice, isGroupA) {
+  try {
+    if (!pairAddress) return null;
+    const windowMinutes = Math.min(30, Math.max(1, Math.floor(ageMinutes * 0.15)));
+    const limit = Math.max(2, windowMinutes);
+
+    const result = await new Promise((resolve) => {
+      const req = https.request({
+        hostname: 'api.geckoterminal.com',
+        path: `/api/v2/networks/solana/pools/${pairAddress}/ohlcv/minute?aggregate=1&limit=${limit}&token=base&currency=usd`,
+        method: 'GET',
+        headers: { 'Accept': 'application/json' },
+        timeout: 5000,
+      }, (res) => {
+        let d = ''; res.on('data', c => d += c);
+        res.on('end', () => resolve({ status: res.statusCode, body: d }));
+      });
+      req.on('error',   () => resolve({ status: 500, body: '{}' }));
+      req.on('timeout', () => { req.destroy(); resolve({ status: 504, body: '{}' }); });
+      req.end();
+    });
+
+    if (result.status !== 200) return null;
+    const data = JSON.parse(result.body);
+    const candles = data?.data?.attributes?.ohlcv_list;
+    if (!Array.isArray(candles) || candles.length < 2) return null;
+
+    // ohlcv_list format: [timestamp, open, high, low, close, volume]
+    const swingHigh  = Math.max(...candles.map(c => c[2]));
+    const swingLow   = Math.min(...candles.map(c => c[3]));
+    const swingRange = swingHigh - swingLow;
+    if (swingRange <= 0 || swingLow <= 0) return null;
+
+    const candidateSL   = swingLow - 0.25 * swingRange;
+    const groupFloor    = entryPrice * (isGroupA ? 0.97 : 0.99);  // tightest allowed
+    const maxWidthSL    = entryPrice * 0.95;                       // widest allowed (-5%)
+
+    // Clamp: must sit between maxWidthSL and groupFloor
+    if (candidateSL < maxWidthSL) return null;          // too wide — fall back to fixed
+    const finalSL = Math.max(groupFloor, candidateSL);  // never tighter than group floor
+
+    console.log(`[SWING-SL] ${pairAddress.slice(0,8)}… window=${limit}min | low=${swingLow.toExponential(3)} high=${swingHigh.toExponential(3)} range=${swingRange.toExponential(3)} | candidateSL=${candidateSL.toExponential(3)} finalSL=${finalSL.toExponential(3)}`);
+    return finalSL;
+  } catch (e) {
+    return null; // any error → fall back to fixed slFloor
+  }
+}
+
 async function enterPosition(coin, overrides = {}) {
   const { positions } = await getCollections();
   const ref  = db.collection(positions).doc();
@@ -1848,22 +1913,31 @@ async function enterPosition(coin, overrides = {}) {
   const meaningfulR = resistanceCandidates.filter(r => r > effectiveEntry * (1 + RESISTANCE_MIN_GAP));
   const resistancePrice = meaningfulR.length > 0 ? Math.min(...meaningfulR) : null;
 
-  // ── INITIAL SL — per-strategy floor ─────────────────────────────────────────
-  // All strategies share the same trail: activates at +5%, gap starts 60%.
-  // The only difference is the Phase 1 flat SL floor:
+  // ── INITIAL SL — dynamic swing + per-strategy floor ─────────────────────────
+  // Phase 1 SL is derived from the coin's real swing data when available,
+  // with a fixed per-strategy floor as fallback and hard floor.
   //
-  //   AM / SC / PS (ids 1, 2, 4): slFloor = entry × 0.97  (-3%)
-  //     Absorbs ~2% buy-slippage + momentary dips on fast momentum coins.
+  //   fetchSwingSL():
+  //     • Pulls 1-min OHLCV from GeckoTerminal (window ∝ coin age)
+  //     • SL = swing_low − 25% of swing range
+  //     • Clamped between entry×0.95 (widest) and group floor (tightest)
+  //     • Returns null on error → fallback to fixed group floor below
   //
-  //   BB / OR      (ids 0, 3):   slFloor = entry × 0.99  (-1%)
-  //     Minimal breathing room — recovery/range plays should hold entry.
+  //   Fixed group floors (also the trail's absolute floor):
+  //     AM / SC / PS (ids 1, 2, 4): entry × 0.97  (-3%)
+  //     BB / OR      (ids 0, 3):    entry × 0.99  (-1%)
   //
-  // slFloor: absolute floor the gap trail never drops below (stored on pos).
+  // slFloor stored on pos = whichever value was used, so the gap trail
+  // never ratchets below it even after the coin runs up.
   const _impact        = posSize / Math.max((coin.liq || posSize * 100) / 2, posSize);
   const _cappedImpact  = Math.min(_impact, 0.10);
   const preEntryPrice  = effectiveEntry / (1 + _cappedImpact);
   const isGroupA       = [1, 2, 4].includes(s.id);   // AM, SC, PS
-  const slFloor        = isGroupA ? effectiveEntry * 0.97 : effectiveEntry * 0.99;
+  const fixedFloor     = isGroupA ? effectiveEntry * 0.97 : effectiveEntry * 0.99;
+  const swingSL        = overrides.sl == null
+    ? await fetchSwingSL(coin.pairAddress, coin.ageMinutes, effectiveEntry, isGroupA)
+    : null;  // skip API call when user set an explicit SL override
+  const slFloor        = swingSL ?? fixedFloor;
   const initialSLPrice = slFloor;
 
   const pos = {
