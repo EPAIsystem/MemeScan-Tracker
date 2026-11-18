@@ -1849,15 +1849,14 @@ async function enterPosition(coin, overrides = {}) {
   const resistancePrice = meaningfulR.length > 0 ? Math.min(...meaningfulR) : null;
 
   // ── INITIAL SL — per-strategy floor ─────────────────────────────────────────
-  // Two groups, each with its own SL floor and trail calibration:
+  // All strategies share the same trail: activates at +5%, gap starts 60%.
+  // The only difference is the Phase 1 flat SL floor:
   //
-  // Group A — AM / SC / PS (ids 1, 2, 4): fast momentum / pump plays
-  //   slFloor = entry × 0.97  (-3%) | trail at +5% | gap starts 60%
-  //   Wider initial room to absorb ~2% slippage + fast AM/SC/PS volatility.
+  //   AM / SC / PS (ids 1, 2, 4): slFloor = entry × 0.97  (-3%)
+  //     Absorbs ~2% buy-slippage + momentary dips on fast momentum coins.
   //
-  // Group B — BB / OR (ids 0, 3): recovery / range plays
-  //   slFloor = entry × 0.99  (-1%) | trail at +10% | gap starts 80%
-  //   Tight initial SL — these plays should not dip much before moving up.
+  //   BB / OR      (ids 0, 3):   slFloor = entry × 0.99  (-1%)
+  //     Minimal breathing room — recovery/range plays should hold entry.
   //
   // slFloor: absolute floor the gap trail never drops below (stored on pos).
   const _impact        = posSize / Math.max((coin.liq || posSize * 100) / 2, posSize);
@@ -5033,17 +5032,13 @@ async function monitorPositions() {
     // ─────────────────────────────────────────────────────────────────────────
 
     // ══════════════════════════════════════════════════════════════════════
-    // ── GAP TRAIL — per-strategy thresholds ──────────────────────────────
-    // Phase 1: SL stays flat at slFloor (set at entry).
-    // Phase 2: gap trail activates when ATH gain reaches trailThreshold.
-    //
-    // Group A — AM/SC/PS (ids 1,2,4): fast momentum / pump plays
-    //   slFloor = entry×0.97 (-3%) | trailThreshold = +5% | gapStart = 60%
-    //   gap tightens: 60%→55%→50%→…→5% (every +10% above +5%)
-    //
-    // Group B — BB/OR (ids 0,3): recovery / range plays
-    //   slFloor = entry×0.99 (-1%) | trailThreshold = +10% | gapStart = 80%
-    //   gap tightens: 80%→75%→70%→…→5% (every +10% above +10%)
+    // ── GAP TRAIL — universal thresholds, per-strategy floor ────────────
+    // Phase 1: SL stays flat at slFloor (set at entry, varies by strategy):
+    //   AM/SC/PS (ids 1,2,4): slFloor = entry×0.97  (-3%)
+    //   BB/OR    (ids 0,3):   slFloor = entry×0.99  (-1%)
+    // Phase 2 (all strategies): gap trail activates at +5% ATH gain.
+    //   gap starts 60%, tightens 5% per +10% further gain, floor 5%
+    //   SL = entry + (1 − gapPct) × (ATH − entry); never below slFloor.
     //
     //   SL = entry + (1 − gapPct) × (ATH − entry); never below slFloor.
     // Moon bag: flat 20% below ATH — SL = ATH × 0.80. Never comes down.
@@ -5051,9 +5046,8 @@ async function monitorPositions() {
     if (gainPct > 0) {
       let newSL;
       const slFloor        = pos.slFloor || pos.preEntryPrice || pos.entryPrice * 0.97;
-      const isGroupA       = [1, 2, 4].includes(pos.strategyId); // AM, SC, PS
-      const trailThreshold = isGroupA ? 5  : 10;   // +5% for AM/SC/PS, +10% for BB/OR
-      const gapStart       = isGroupA ? 0.60 : 0.80; // 60% for AM/SC/PS, 80% for BB/OR
+      const trailThreshold = 5;     // all strategies: trail activates at +5% ATH gain
+      const gapStart       = 0.60;  // all strategies: gap starts at 60%
 
       if (pos.isMoonBag) {
         // ── MOON BAG: flat 20% trailing from ATH ─────────────────────────
