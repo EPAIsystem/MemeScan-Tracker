@@ -389,6 +389,7 @@ const STRATEGIES = [
     minM5Txns: 8,        // Nov-11: 15→8 — pump.fun coins have thinner activity
     minBuyPct: 52,       // Nov-11: 58→52 — marginal buyer edge is enough with RugCheck backing it
     minCh1: -2,          // Nov-11: 0→-2 — allow slight h1 dip as long as m5 is positive
+    maxCh1: 35,          // Nov-18: cap — coin already up 35%+ in 1h has exhausted its move; we'd be buying the top
     minLiq: 18000,       // Nov-13: 12k→18k — tighter LP liq floor; compensates for looser rug risk
     minLiqLocked: 12000, // Nov-13: 8k→12k — higher bar for LP-locked coins
     // ── TP / SL (partial profit — sell in bits) ──
@@ -831,6 +832,7 @@ function detectStrategy(pair, openStrategies) {
         if (m5Txns < s.minM5Txns)  { match = false; }
         if (m5Ch < s.minM5Ch)      { match = false; } // POSITIVE direction required (was abs)
         if (ch1 < s.minCh1)        { match = false; }
+        if (s.maxCh1 != null && ch1 > s.maxCh1) { match = false; } // already ran too hard — buying the top
         if (buyPct < s.minBuyPct)  { match = false; }
         if (liq < s.minLiqLocked)  { match = false; } // relaxed floor — strict floor enforced in filterByLpLock for unlocked LP
         // Anti-manipulation: require meaningful avg trade size (from strategy definition)
@@ -840,12 +842,16 @@ function detectStrategy(pair, openStrategies) {
         score += Math.min(20, m5Txns / 2);         // very active = more confidence
         if (m5Ch > 5)  score += 15; else if (m5Ch > 2) score += 8;
         if (buyPct > 65) score += 15; else if (buyPct > 58) score += 8;
-        if (ch1 > 20)  score += 12; else if (ch1 > 8) score += 6;
+        // Nov-18: ch1 scoring flipped — reward EARLY moves, penalise LATE ones.
+        // A coin up 5–15% in the last hour is just starting; up 25%+ has likely peaked.
+        if      (ch1 > 25) score -= 8;   // near exhaustion — penalise even though maxCh1=35 still allows it
+        else if (ch1 > 15) score += 5;   // mid-move: moderate reward
+        else if (ch1 >  5) score += 12;  // sweet spot — move just breaking out
+        else if (ch1 >  2) score += 4;   // early stir
+        // (ch1 ≤ 2 or negative: no bonus — wait for momentum confirmation)
         if (liq > 30000) score += 8; else if (liq > 15000) score += 4;
         if (volMcap > 1) score += 10; else if (volMcap > 0.4) score += 5;
         // MC sweet spot + avg trade quality
-        // NOTE: Range-spike guard removed — with graduated-only gate, high ch1 / modest ch24
-        // is EXPECTED for a recently migrated Raydium coin and must not be penalised.
         if (mcSweetSpot) score += 10;
         if (avgTrade !== null) {
           if (avgTrade > 80) score += 5;
@@ -1762,26 +1768,31 @@ function calcExitFeeUsd(pos, rawPrice, fillPrice, fraction, realImpactPct) {
   return pos.size * frac * Math.max(0, 1 - fillPrice / rawPrice);
 }
 
-// ─── DYNAMIC SWING-BASED SL ───────────────────────────────────────────────────
-// Fetches recent OHLCV candles from GeckoTerminal and derives a data-driven SL
-// based on the coin's actual swing range.
+// ─── SWING DATA ANALYSIS (entry gate + SL) ────────────────────────────────────
+// Single GeckoTerminal OHLCV call that serves two purposes:
 //
-// Formula:  SL = swing_low − 0.25 × (swing_high − swing_low)
-//   • Gives an extra 25% of the swing window as a buffer below support.
+// 1. RANGE-POSITION ENTRY GATE
+//    Computes where the current price sits in the recent swing range:
+//      rangePosition = (entryPrice − swingLow) / (swingHigh − swingLow)
+//    If rangePosition > 0.70 → price is in the top 30% of its recent range
+//    → we're likely buying near the peak → skipEntry = true → enterPosition returns null.
 //
-// Lookback window is proportional to coin age:
-//   window = min(30, max(1, floor(ageMinutes × 0.15)))   minutes
-//   e.g. 3-min coin → 1 min | 20-min coin → 3 min | 2h coin → 18 min
+// 2. DYNAMIC SWING SL (when entry is allowed)
+//    SL = swing_low − 0.25 × (swing_high − swing_low)
+//    Gives 25% of the swing window as a buffer below support.
+//    Clamped between entry×0.95 (widest −5%) and group floor (tightest).
 //
-// Safeguards (applied in order):
-//   1. If API error / bad data → return null (fall back to fixed slFloor)
-//   2. candidateSL must be ≤ entry × 0.95  (never wider than -5%)
-//   3. candidateSL must be ≥ groupFloor    (never tighter than fixed floor)
-//      Group A (AM/SC/PS): groupFloor = entry × 0.97
-//      Group B (BB/OR):    groupFloor = entry × 0.99
-async function fetchSwingSL(pairAddress, ageMinutes, entryPrice, isGroupA) {
+// Lookback window ∝ coin age:
+//   window = min(30, max(1, floor(ageMinutes × 0.15))) minutes
+//
+// Returns { swingSL, skipEntry }:
+//   swingSL   — data-driven SL price, or null → use fixed group floor
+//   skipEntry — true → abort entry (price at top of range)
+//
+// On any error → { swingSL: null, skipEntry: false } — fail open (use fixed SL, allow entry)
+async function analyzeSwingData(pairAddress, ageMinutes, entryPrice, isGroupA) {
   try {
-    if (!pairAddress) return null;
+    if (!pairAddress) return { swingSL: null, skipEntry: false };
     const windowMinutes = Math.min(30, Math.max(1, Math.floor(ageMinutes * 0.15)));
     const limit = Math.max(2, windowMinutes);
 
@@ -1801,29 +1812,39 @@ async function fetchSwingSL(pairAddress, ageMinutes, entryPrice, isGroupA) {
       req.end();
     });
 
-    if (result.status !== 200) return null;
+    if (result.status !== 200) return { swingSL: null, skipEntry: false };
     const data = JSON.parse(result.body);
     const candles = data?.data?.attributes?.ohlcv_list;
-    if (!Array.isArray(candles) || candles.length < 2) return null;
+    if (!Array.isArray(candles) || candles.length < 2) return { swingSL: null, skipEntry: false };
 
     // ohlcv_list format: [timestamp, open, high, low, close, volume]
     const swingHigh  = Math.max(...candles.map(c => c[2]));
     const swingLow   = Math.min(...candles.map(c => c[3]));
     const swingRange = swingHigh - swingLow;
-    if (swingRange <= 0 || swingLow <= 0) return null;
+    if (swingRange <= 0 || swingLow <= 0) return { swingSL: null, skipEntry: false };
 
-    const candidateSL   = swingLow - 0.25 * swingRange;
-    const groupFloor    = entryPrice * (isGroupA ? 0.97 : 0.99);  // tightest allowed
-    const maxWidthSL    = entryPrice * 0.95;                       // widest allowed (-5%)
+    // ── Gate 1: Range position — skip entry if price is in top 30% of range ──
+    const rangePosition = (entryPrice - swingLow) / swingRange;
+    if (rangePosition > 0.70) {
+      console.log(`[RANGE-GATE] ${pairAddress.slice(0,8)}… rangePos=${(rangePosition*100).toFixed(0)}% (top 30%) — skip entry | window=${limit}min low=${swingLow.toExponential(3)} high=${swingHigh.toExponential(3)}`);
+      return { swingSL: null, skipEntry: true };
+    }
 
-    // Clamp: must sit between maxWidthSL and groupFloor
-    if (candidateSL < maxWidthSL) return null;          // too wide — fall back to fixed
+    // ── Gate 2: Swing SL — data-driven floor ──────────────────────────────────
+    const candidateSL = swingLow - 0.25 * swingRange;
+    const groupFloor  = entryPrice * (isGroupA ? 0.97 : 0.99);  // tightest allowed
+    const maxWidthSL  = entryPrice * 0.95;                       // widest allowed (−5%)
+
+    if (candidateSL < maxWidthSL) {
+      // Swing is too wide to use — fall back to fixed floor
+      console.log(`[SWING-SL] ${pairAddress.slice(0,8)}… rangePos=${(rangePosition*100).toFixed(0)}% | swing too wide (${((1-candidateSL/entryPrice)*100).toFixed(1)}%) — using fixed floor`);
+      return { swingSL: null, skipEntry: false };
+    }
     const finalSL = Math.max(groupFloor, candidateSL);  // never tighter than group floor
-
-    console.log(`[SWING-SL] ${pairAddress.slice(0,8)}… window=${limit}min | low=${swingLow.toExponential(3)} high=${swingHigh.toExponential(3)} range=${swingRange.toExponential(3)} | candidateSL=${candidateSL.toExponential(3)} finalSL=${finalSL.toExponential(3)}`);
-    return finalSL;
+    console.log(`[SWING-SL] ${pairAddress.slice(0,8)}… rangePos=${(rangePosition*100).toFixed(0)}% window=${limit}min | low=${swingLow.toExponential(3)} high=${swingHigh.toExponential(3)} | finalSL=${finalSL.toExponential(3)}`);
+    return { swingSL: finalSL, skipEntry: false };
   } catch (e) {
-    return null; // any error → fall back to fixed slFloor
+    return { swingSL: null, skipEntry: false }; // any error → fail open
   }
 }
 
@@ -1913,19 +1934,15 @@ async function enterPosition(coin, overrides = {}) {
   const meaningfulR = resistanceCandidates.filter(r => r > effectiveEntry * (1 + RESISTANCE_MIN_GAP));
   const resistancePrice = meaningfulR.length > 0 ? Math.min(...meaningfulR) : null;
 
-  // ── INITIAL SL — dynamic swing + per-strategy floor ─────────────────────────
-  // Phase 1 SL is derived from the coin's real swing data when available,
-  // with a fixed per-strategy floor as fallback and hard floor.
-  //
-  //   fetchSwingSL():
-  //     • Pulls 1-min OHLCV from GeckoTerminal (window ∝ coin age)
-  //     • SL = swing_low − 25% of swing range
-  //     • Clamped between entry×0.95 (widest) and group floor (tightest)
-  //     • Returns null on error → fallback to fixed group floor below
+  // ── SWING DATA: entry range gate + dynamic SL ────────────────────────────────
+  // analyzeSwingData() makes one GeckoTerminal OHLCV call and returns two things:
+  //   skipEntry — true if current price is in the top 30% of the recent range
+  //               (we'd be buying near the peak — abort this entry)
+  //   swingSL   — data-driven SL from swing_low − 25% of swing range, or null
   //
   //   Fixed group floors (also the trail's absolute floor):
-  //     AM / SC / PS (ids 1, 2, 4): entry × 0.97  (-3%)
-  //     BB / OR      (ids 0, 3):    entry × 0.99  (-1%)
+  //     AM / SC / PS (ids 1, 2, 4): entry × 0.97  (−3%)
+  //     BB / OR      (ids 0, 3):    entry × 0.99  (−1%)
   //
   // slFloor stored on pos = whichever value was used, so the gap trail
   // never ratchets below it even after the coin runs up.
@@ -1934,9 +1951,16 @@ async function enterPosition(coin, overrides = {}) {
   const preEntryPrice  = effectiveEntry / (1 + _cappedImpact);
   const isGroupA       = [1, 2, 4].includes(s.id);   // AM, SC, PS
   const fixedFloor     = isGroupA ? effectiveEntry * 0.97 : effectiveEntry * 0.99;
-  const swingSL        = overrides.sl == null
-    ? await fetchSwingSL(coin.pairAddress, coin.ageMinutes, effectiveEntry, isGroupA)
-    : null;  // skip API call when user set an explicit SL override
+
+  const { swingSL, skipEntry } = overrides.sl == null
+    ? await analyzeSwingData(coin.pairAddress, coin.ageMinutes, effectiveEntry, isGroupA)
+    : { swingSL: null, skipEntry: false };  // skip API call when user set an explicit SL
+
+  if (skipEntry) {
+    console.log(`[SKIP-ENTRY] ${coin.symbol} (${s.label}) — price at top of recent range, not entering`);
+    return null;
+  }
+
   const slFloor        = swingSL ?? fixedFloor;
   const initialSLPrice = slFloor;
 
