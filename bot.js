@@ -37,6 +37,12 @@ const MIN_SCORE       = 45;  // Nov-11: lowered from 55; GeckoTerminal trending 
 let strategyFiltersActive = true;
 const DAILY_LOSS_LIMIT= -0.30;
 
+// ── GRADUATION GRACE ──────────────────────────────────────────────────────────
+// PumpSwap coins may migrate to Raydium after entry (secondary graduation), causing
+// a temporary liq collapse that is NOT a rug. These Maps track the grace state.
+const graduationGrace = new Map(); // pos.id → grace-expires timestamp (ms)
+const posLastLiq      = new Map(); // pos.id → liquidity seen on the previous monitor tick
+
 // ─── DIAGNOSTIC MODE ──────────────────────────────────────────────────────────
 // When on: bypasses all filters (except DIAG_MIN_LIQ), raises slot cap to 100,
 // uses 50%-from-ATH SL trail (Phase 2 jumps to 60% gap at +30% ATH gain), and
@@ -260,6 +266,11 @@ const ALLOWED_DEXES = new Set([
   'meteora',
   'orca',          // Solana AMM — confirmed blocked in logs (should be allowed)
 ]);
+// PumpSwap variants — coins on these may still migrate to Raydium (secondary graduation),
+// causing a temporary liq collapse that is NOT a rug. Positions entered via PumpSwap
+// receive a 4-min grace window on sudden liq collapse before emergency exit fires.
+// Raydium, Meteora, Orca: fully settled — no migration risk — exit immediately on liq drain.
+const PUMPSWAP_DEXES = new Set(['pumpswap','pump_amm','pump-amm','pump_swap','pump-swap']);
 // ─── DIAGNOSTIC GATE COUNTERS ────────────────────────────────────────────────
 // gateStats: per-scan (console only); gatePeriodStats: 20-scan window (sent to Telegram on heartbeat)
 const gateStats       = { total:0, chain:0, liqFloor:0, price:0, honey:0, txns:0, avgT:0, ratio:0, young:0, dead:0, noAct:0, dex:0, age:0, mom:0, live:0, noMatch:0 };
@@ -2055,6 +2066,9 @@ async function enterPosition(coin, overrides = {}) {
     entryFeeUsd:     tradingMode === 'paper'
       ? (effectiveEntry - rawEntryPrice) / rawEntryPrice * posSize
       : (realTx?.jitoTipUsd || 0) + ((realTx?.entryImpactPct || 0) / 100 * posSize),
+    // Graduation-aware rug protection: PumpSwap coins may still migrate to Raydium.
+    // Those positions get a 4-min grace window on liq collapse; all others exit immediately.
+    isUngraduated: PUMPSWAP_DEXES.has(coin.dexId || ''),
     // Diagnostic mode fields — entry signals stored for post-trade analysis
     isDiagnostic: diagnosticMode || false,
     diagEntry: diagnosticMode ? {
@@ -2329,6 +2343,9 @@ async function realClose(pos, exitPrice, exitReason, pnl, extraData = {}) {
   if (pos.isDiagnostic) {
     logDiagnosticTrade(pos, exitPrice, exitReason, pnl).catch(e => console.warn('[DIAG] log error:', e.message));
   }
+  // Clean up graduation grace state for this position
+  graduationGrace.delete(pos.id);
+  posLastLiq.delete(pos.id);
   return { ok: true, txHash, exitImpactPct };
 }
 
@@ -4810,34 +4827,92 @@ async function monitorPositions() {
 
     // ── LIQUIDITY DRAIN EXIT ──────────────────────────────────────────────────
     // If pool liquidity drops below $2,500 we can no longer exit at any real price.
-    // Close immediately — before all other checks — to protect remaining capital.
+    // PumpSwap coins get a 4-min grace window (secondary Raydium migration may cause
+    // a temporary collapse that is NOT a rug). All other DEXes exit immediately.
     if (currentLiq !== null && currentLiq < 2500 && !closingNow.has(pos.id)) {
-      closingNow.add(pos.id);
-      try {
-        const exitFillPrice = pos.tradingMode === 'paper'
-          ? simulateFillPrice(price, pos.size * pos.remaining, currentLiq, false)
-          : price;
-        const exitPnL = (exitFillPrice - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
-        const pnl     = (pos.pnl || 0) + exitPnL;
-        const _result = await realClose(pos, exitFillPrice, 'LIQ_DRAINED', pnl);
-        if (!_result?.ok) continue;
-        await updateDailyStats(exitPnL, exitPnL > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct), pos.strategyId ?? null);
-        await sendTelegram(
-          `⚠️ *LIQ DRAINED — EMERGENCY EXIT*\n\n` +
-          `*${pos.symbol}* ${pos.strategyLabel}\n` +
-          `💧 Liquidity collapsed to $${currentLiq < 1 ? '<1' : currentLiq.toFixed(0)} — rug pull risk\n` +
-          `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
-          `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})` +
-          `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
-        );
-        enteredToday.delete(pos.address);
-        console.log(`[BOT] LIQ_DRAINED ${pos.symbol}: liq=$${currentLiq?.toFixed(0)}`);
-      } catch(e) {
-        console.error(`[BOT] LIQ_DRAINED close failed for ${pos.symbol}:`, e);
-        closingNow.delete(pos.id);
+      if (pos.isUngraduated) {
+        // ── PumpSwap: apply graduation grace window ──────────────────────────
+        const _now     = Date.now();
+        const _prevLiq = posLastLiq.get(pos.id) ?? currentLiq;
+        if (!graduationGrace.has(pos.id) && _prevLiq >= 2500) {
+          // Sudden drop from healthy liq — may be a graduation migration, not a rug
+          const _expiresAt = _now + 4 * 60 * 1000;
+          graduationGrace.set(pos.id, _expiresAt);
+          console.log(`[GRAD] ${pos.symbol}: liq collapsed $${_prevLiq.toFixed(0)}→$${currentLiq < 1 ? '<1' : currentLiq.toFixed(0)} — 4-min grace started`);
+          await sendTelegram(
+            `⏳ *GRADUATION SUSPECTED — ${pos.symbol}*\n\n` +
+            `💧 Liq collapsed to $${currentLiq < 1 ? '<1' : currentLiq.toFixed(0)} — PumpSwap→Raydium migration possible\n` +
+            `⏱️ Holding 4-min grace window before emergency exit\n` +
+            `🔗 [Chart](${pos.dexUrl})`
+          ).catch(() => {});
+          // Fall through — normal SL/TP processing continues during grace
+        } else if (graduationGrace.has(pos.id) && _now < graduationGrace.get(pos.id)) {
+          // Grace active, not expired — keep watching; fall through to normal processing
+        } else {
+          // Grace expired and liq still < $2,500 — real rug confirmed, exit now
+          graduationGrace.delete(pos.id);
+          closingNow.add(pos.id);
+          try {
+            const exitFillPrice = pos.tradingMode === 'paper'
+              ? simulateFillPrice(price, pos.size * pos.remaining, currentLiq, false)
+              : price;
+            const exitPnL = (exitFillPrice - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+            const pnl     = (pos.pnl || 0) + exitPnL;
+            const _result = await realClose(pos, exitFillPrice, 'LIQ_DRAINED', pnl);
+            if (!_result?.ok) continue;
+            await updateDailyStats(exitPnL, exitPnL > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct), pos.strategyId ?? null);
+            await sendTelegram(
+              `⚠️ *LIQ DRAINED — EMERGENCY EXIT*\n\n` +
+              `*${pos.symbol}* ${pos.strategyLabel}\n` +
+              `💧 Liquidity collapsed to $${currentLiq < 1 ? '<1' : currentLiq.toFixed(0)} — rug pull confirmed\n` +
+              `⏱️ 4-min grace window expired — not a graduation\n` +
+              `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
+              `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})` +
+              `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
+            );
+            enteredToday.delete(pos.address);
+            console.log(`[BOT] LIQ_DRAINED(post-grace) ${pos.symbol}: liq=$${currentLiq?.toFixed(0)}`);
+          } catch(e) {
+            console.error(`[BOT] LIQ_DRAINED close failed for ${pos.symbol}:`, e);
+            closingNow.delete(pos.id);
+          }
+          continue;
+        }
+      } else {
+        // ── Raydium / Meteora / Orca: fully settled — exit immediately ───────
+        closingNow.add(pos.id);
+        try {
+          const exitFillPrice = pos.tradingMode === 'paper'
+            ? simulateFillPrice(price, pos.size * pos.remaining, currentLiq, false)
+            : price;
+          const exitPnL = (exitFillPrice - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+          const pnl     = (pos.pnl || 0) + exitPnL;
+          const _result = await realClose(pos, exitFillPrice, 'LIQ_DRAINED', pnl);
+          if (!_result?.ok) continue;
+          await updateDailyStats(exitPnL, exitPnL > 0, !!pos.isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct), pos.strategyId ?? null);
+          await sendTelegram(
+            `⚠️ *LIQ DRAINED — EMERGENCY EXIT*\n\n` +
+            `*${pos.symbol}* ${pos.strategyLabel}\n` +
+            `💧 Liquidity collapsed to $${currentLiq < 1 ? '<1' : currentLiq.toFixed(0)} — rug pull risk\n` +
+            `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
+            `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})` +
+            `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
+          );
+          enteredToday.delete(pos.address);
+          console.log(`[BOT] LIQ_DRAINED ${pos.symbol}: liq=$${currentLiq?.toFixed(0)}`);
+        } catch(e) {
+          console.error(`[BOT] LIQ_DRAINED close failed for ${pos.symbol}:`, e);
+          closingNow.delete(pos.id);
+        }
+        continue;
       }
-      continue;
     }
+    // Clear graduation grace if liq has recovered; track liq for next tick's grace check
+    if (graduationGrace.has(pos.id) && currentLiq !== null && currentLiq >= 2500) {
+      graduationGrace.delete(pos.id);
+      console.log(`[GRAD] ${pos.symbol}: liq recovered to $${currentLiq.toFixed(0)} — migration complete, grace cleared`);
+    }
+    if (currentLiq !== null) posLastLiq.set(pos.id, currentLiq);
 
     // ── SC RUG DETECTION ──────────────────────────────────────────────────────
     // Surge Catch only: young coins can rug in seconds — monitor a 15s price window.
