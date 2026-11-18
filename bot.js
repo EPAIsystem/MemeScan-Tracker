@@ -3940,21 +3940,43 @@ async function pollTelegramCommands() {
               `Send /diagnostic on to start data collection.`;
           await sendTelegram(statusLine);
         } else if (text === '/diagnostic on') {
-          diagnosticMode       = true;
-          globalGatesBypass    = true;
-          lpLockBypass         = true;
+          diagnosticMode        = true;
+          globalGatesBypass     = true;
+          lpLockBypass          = true;
           strategyFiltersActive = false;
+          autoEntryPaused       = false;  // override any manual-only mode
+          dayHaltedToday        = false;  // clear any daily-loss halt
+          diagnosticTradeCount  = 0;      // fresh start every time /diagnostic on is used
+          // Clear all previous diagnostic_trades — old data may have been skewed by
+          // filters that were still active; wipe and start clean.
+          let _clearedCount = 0;
+          try {
+            const _oldSnap = await db.collection('diagnostic_trades').get();
+            if (!_oldSnap.empty) {
+              const _delBatch = db.batch();
+              _oldSnap.docs.forEach(d => _delBatch.delete(d.ref));
+              await _delBatch.commit();
+              _clearedCount = _oldSnap.size;
+              console.log(`[DIAG] Cleared ${_clearedCount} old diagnostic_trades documents — fresh start`);
+            }
+          } catch(_e) {
+            console.warn('[DIAG] Could not clear diagnostic_trades:', _e.message);
+          }
           await saveBypassFlags();
           await sendTelegram(
-            `🔬 *DIAGNOSTIC MODE — ON*\n\n` +
-            `The bot is now in research/data-collection mode.\n\n` +
+            `🔬 *DIAGNOSTIC MODE — ON (FRESH START)*\n\n` +
+            `The bot is now in research/data-collection mode.\n` +
+            (_clearedCount > 0 ? `🗑 Previous data cleared (${_clearedCount} trades wiped — fresh baseline)\n\n` : `\n`) +
             `✅ All filters bypassed\n` +
             `✅ Liq gate: ≥ $${(DIAG_MIN_LIQ/1000).toFixed(0)}k only\n` +
+            `✅ Daily loss limit: *bypassed*\n` +
+            `✅ Daily halt: *bypassed*\n` +
+            `✅ Manual-only mode: *cleared*\n` +
             `✅ Slot cap: ${DIAG_MAX_POSITIONS} positions\n` +
             `✅ SL: 50% from any ATH (Phase 2: 60% tightening at +30%)\n` +
             `✅ Every closed trade logged to Firestore\n\n` +
             `Auto-disables + sends report after ${DIAGNOSTIC_TARGET} trades.\n` +
-            `Trades logged so far: *${diagnosticTradeCount}/${DIAGNOSTIC_TARGET}*\n\n` +
+            `Trade count: *0/${DIAGNOSTIC_TARGET}* — starting fresh\n\n` +
             `⚠️ _Paper mode data collection — no real capital at risk._\n` +
             `Send /diagnostic off to stop. Send /diagreport at any time for a snapshot.`
           );
@@ -4765,7 +4787,9 @@ async function monitorPositions() {
   if (!remaining_positions.length) return;
 
   const stats = await getDailyStats();
-  if (stats.realizedPnL / stats.startBalance <= DAILY_LOSS_LIMIT) {
+  // Diagnostic mode runs outside the daily loss limit — bypassed entirely so the
+  // 1,000-trade research trial is not interrupted by normal daily P&L boundaries.
+  if (!diagnosticMode && stats.realizedPnL / stats.startBalance <= DAILY_LOSS_LIMIT) {
     if (!dayHaltedToday) {
       // First time crossing the limit this session — close all and notify
       console.log('[BOT] Daily loss limit hit — closing all positions');
@@ -6017,7 +6041,8 @@ async function refreshCandidatePool() {
 async function scanForEntries() {
   if (!(await isBotRunning())) return;
   // Fast in-memory check — no Firestore read needed when already halted
-  if (dayHaltedToday) {
+  // Diagnostic mode bypasses the daily halt — research trial must not be gated by daily P&L.
+  if (dayHaltedToday && !diagnosticMode) {
     await checkDayRestart(); // check if user sent /restart
     return;
   }
@@ -6408,7 +6433,8 @@ async function scanForEntries() {
       : '';
 
     // ── If auto-entry is paused: send full signal alert but skip entering ─────────
-    if (autoEntryPaused) {
+    // Diagnostic mode bypasses the pause — research trial must enter positions freely.
+    if (autoEntryPaused && !diagnosticMode) {
       pausedAlertCooldown.set(coin.addr, Date.now()); // pause-only cooldown — never touches entry cooldown
       usedThisScan.add(coin.addr);
       await sendTelegram(
