@@ -414,6 +414,7 @@ const STRATEGIES = [
     minCh1: -2,          // Nov-11: 0→-2 — allow slight h1 dip as long as m5 is positive
     maxCh1: 35,          // Nov-18: cap — coin already up 35%+ in 1h has exhausted its move; we'd be buying the top
     maxMcap: 500000,     // Nov-18: diagnostic data shows $500k+ mcap coins avg -14.5%; cap at $500k
+    minAgeMinutes: 5,    // Nov-18: same rug-at-birth floor as PS — no entries on coins under 5 min old
     minLiq: 18000,       // Nov-13: 12k→18k — tighter LP liq floor; compensates for looser rug risk
     minLiqLocked: 12000, // Nov-13: 8k→12k — higher bar for LP-locked coins
     // ── TP / SL (partial profit — sell in bits) ──
@@ -853,9 +854,10 @@ function detectStrategy(pair, openStrategies) {
       // ── ACTIVE MOMENTUM ────────────────────────────────────────────────────
       // Nov-11: pump.fun/PumpSwap coins now allowed — all strategies compete freely.
       if (strategyFiltersActive) {
-        if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // 2h+ only — SC covers 0–24h
-        if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // age upper cap (AM has none — applies to any age)
-        if (s.maxMcap    != null && mcap > s.maxMcap)       { match = false; } // Nov-18: $500k+ mcap avg -14.5%; cut it
+        if (s.minAgeDays    != null && ageDays    < s.minAgeDays)    { match = false; } // 2h+ only — SC covers 0–24h
+        if (s.maxAgeDays    != null && ageDays    > s.maxAgeDays)    { match = false; } // age upper cap (AM has none — applies to any age)
+        if (s.minAgeMinutes != null && ageMinutes < s.minAgeMinutes) { match = false; } // Nov-18: 5-min rug-at-birth floor
+        if (s.maxMcap       != null && mcap       > s.maxMcap)       { match = false; } // Nov-18: $500k+ mcap avg -14.5%; cut it
         if (m5Txns < s.minM5Txns)  { match = false; }
         if (m5Ch < s.minM5Ch)      { match = false; } // POSITIVE direction required (was abs)
         if (ch1 < s.minCh1)        { match = false; }
