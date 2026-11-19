@@ -6440,8 +6440,8 @@ async function scanForEntries() {
       let _tierBlock  = null;
 
       if (_sz < 5) {
-        // $1–$4: any age, but need ≥3 buys/min + ≥1 sell/min — liquidity drain protection
-        if (_buysMin  < 3) _tierBlock = `buys/min ${_buysMin.toFixed(1)} < 3 (tier $1–$4)`;
+        // $1–$4: need ≥1 buy/min + ≥1 sell/min — confirms 2-sided trading (Nov-19: lowered from 3 buys/min)
+        if (_buysMin  < 1) _tierBlock = `buys/min ${_buysMin.toFixed(1)} < 1 (tier $1–$4)`;
         else if (_sellsMin < 1) _tierBlock = `sells/min ${_sellsMin.toFixed(1)} < 1 (tier $1–$4)`;
       } else if (_sz < 10) {
         // $5–$9: coin must be ≥5 min old (no txn minimum)
