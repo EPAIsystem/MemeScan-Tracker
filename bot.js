@@ -415,8 +415,8 @@ const STRATEGIES = [
     maxCh1: 35,          // Nov-18: cap — coin already up 35%+ in 1h has exhausted its move; we'd be buying the top
     maxMcap: 500000,     // Nov-18: diagnostic data shows $500k+ mcap coins avg -14.5%; cap at $500k
     minAgeMinutes: 5,    // Nov-18: same rug-at-birth floor as PS — no entries on coins under 5 min old
-    minLiq: 18000,       // Nov-13: 12k→18k — tighter LP liq floor; compensates for looser rug risk
-    minLiqLocked: 12000, // Nov-13: 8k→12k — higher bar for LP-locked coins
+    minLiq: 8000,        // Nov-19: lowered to match $8k absolute floor (gates bypassed; liq is the only entry gate)
+    minLiqLocked: 8000,  // Nov-19: same — LP filter uses minLiq as strict floor for unlocked LP
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.28, tp2x: 1.70, tp3x: 3.00,  // Nov-9: TP1 at +28% — captures the common 20–40% pop
     slx: 0.86,           // Nov-9: –14% SL (was –20% — the single biggest loss driver)
@@ -437,8 +437,8 @@ const STRATEGIES = [
     minCh1: 0,           // h1 not negative (newly graduated coins may lack h1 history)
     minBuyPct: 55,       // Nov-11: 62→55 — align with pump.fun ecosystem reality
     maxMcap: 500000,     // Nov-18: diagnostic data shows $500k+ mcap coins avg -14.5%; cap at $500k
-    minLiq: 12000,       // Nov-13: 8k→12k — tighter LP liq floor; compensates for looser rug risk
-    minLiqLocked: 8000,  // Nov-13: 5k→8k — higher bar for LP-locked coins
+    minLiq: 8000,        // Nov-19: lowered to match $8k absolute floor
+    minLiqLocked: 8000,  // Nov-19: same — LP filter strict floor for unlocked LP
     maxAgeDays: 1,       // Nov-9: SC is for young graduated coins only; AM handles 1–3 days
     // ── TP / SL (quick first profit, trail the rest) ──
     tp1x: 1.30, tp2x: 2.00, tp3x: 4.00,  // Nov-9: genuine surges can run far
@@ -853,11 +853,12 @@ function detectStrategy(pair, openStrategies) {
     else if (s.id === 1) {
       // ── ACTIVE MOMENTUM ────────────────────────────────────────────────────
       // Nov-11: pump.fun/PumpSwap coins now allowed — all strategies compete freely.
+      // Nov-19: always-on guards — apply even when strategy filters bypassed
+      if (s.minAgeMinutes != null && ageMinutes < s.minAgeMinutes) { match = false; } // 5-min rug-at-birth floor
+      if (s.maxMcap       != null && mcap       > s.maxMcap)       { match = false; } // $500k mcap cap
       if (strategyFiltersActive) {
         if (s.minAgeDays    != null && ageDays    < s.minAgeDays)    { match = false; } // 2h+ only — SC covers 0–24h
-        if (s.maxAgeDays    != null && ageDays    > s.maxAgeDays)    { match = false; } // age upper cap (AM has none — applies to any age)
-        if (s.minAgeMinutes != null && ageMinutes < s.minAgeMinutes) { match = false; } // Nov-18: 5-min rug-at-birth floor
-        if (s.maxMcap       != null && mcap       > s.maxMcap)       { match = false; } // Nov-18: $500k+ mcap avg -14.5%; cut it
+        if (s.maxAgeDays    != null && ageDays    > s.maxAgeDays)    { match = false; } // age upper cap (AM has none)
         if (m5Txns < s.minM5Txns)  { match = false; }
         if (m5Ch < s.minM5Ch)      { match = false; } // POSITIVE direction required (was abs)
         if (ch1 < s.minCh1)        { match = false; }
@@ -893,11 +894,11 @@ function detectStrategy(pair, openStrategies) {
       // ── SURGE CATCH ────────────────────────────────────────────────────────
       // Nov-11: pump.fun/PumpSwap coins now allowed — all strategies compete freely.
       // Primary signal: m5 activity — catch it WHILE it's happening
-      // Age gate: 0–24 hours (recently graduated coins surge post-migration)
+      // Nov-19: always-on guard — apply even when strategy filters bypassed
+      if (s.maxMcap != null && mcap > s.maxMcap) { match = false; } // $500k mcap cap
       if (strategyFiltersActive) {
         if (s.minAgeDays != null && ageDays < s.minAgeDays) { match = false; } // ≥ 1h — PS takes the sub-1h coins
         if (s.maxAgeDays != null && ageDays > s.maxAgeDays) { match = false; } // over 24h → AM
-        if (s.maxMcap    != null && mcap > s.maxMcap)       { match = false; } // Nov-18: $500k+ mcap avg -14.5%; cut it
         if (m5Ch < s.minM5Ch)      { match = false; } // must be moving in last 5 min
         if (m5Txns < s.minM5Txns)  { match = false; } // must be very active
         if (ch1 < s.minCh1)        { match = false; } // h1 confirms uptrend
@@ -969,22 +970,24 @@ function detectStrategy(pair, openStrategies) {
       const isPumpSwap = ['pumpswap','pump_amm','pump-amm','pump_swap','pump-swap'].includes(dexId);
       if (!isPumpFun && !isPumpSwap) {
         match = false;
-      } else if (strategyFiltersActive) {
-        // < 1 hour only — older coins route to SC/AM
-        if (s.maxAgeDays    != null && ageDays    > s.maxAgeDays)    { match = false; }
-        // Nov-18: skip coins under 5 min — rug-at-birth profile in diagnostic data
-        if (s.minAgeMinutes != null && ageMinutes < s.minAgeMinutes) { match = false; }
-        // h1 must be strongly up — confirms an uptrend is running
-        if (ch1 === null || ch1 < s.minH1Ch)              { match = false; }
-        // m5 in pullback zone — not at the peak, not in freefall
-        if (m5Ch < s.minM5Ch || m5Ch > s.maxM5Ch)         { match = false; }
-        // at least one sell — confirms real 2-sided trading (not 100% buy-only pump)
-        if (m5Sells < (s.minM5Sells || 1))                 { match = false; }
-        if (buyPct < s.minBuyPct)                          { match = false; }
-        if (m5Txns < s.minM5Txns)                          { match = false; }
-        if (liq < s.minLiq)                                { match = false; }
-        if (mcLiqRatio > s.maxMcLiqRatio)                  { match = false; }
-      }
+      } else {
+        // Nov-19: always-on guard — apply even when strategy filters bypassed
+        if (s.minAgeMinutes != null && ageMinutes < s.minAgeMinutes) { match = false; } // 5-min rug-at-birth floor
+        if (strategyFiltersActive) {
+          // < 1 hour only — older coins route to SC/AM
+          if (s.maxAgeDays    != null && ageDays    > s.maxAgeDays)    { match = false; }
+          // h1 must be strongly up — confirms an uptrend is running
+          if (ch1 === null || ch1 < s.minH1Ch)              { match = false; }
+          // m5 in pullback zone — not at the peak, not in freefall
+          if (m5Ch < s.minM5Ch || m5Ch > s.maxM5Ch)         { match = false; }
+          // at least one sell — confirms real 2-sided trading (not 100% buy-only pump)
+          if (m5Sells < (s.minM5Sells || 1))                 { match = false; }
+          if (buyPct < s.minBuyPct)                          { match = false; }
+          if (m5Txns < s.minM5Txns)                          { match = false; }
+          if (liq < s.minLiq)                                { match = false; }
+          if (mcLiqRatio > s.maxMcLiqRatio)                  { match = false; }
+        }
+      } // end else (isPumpFun || isPumpSwap)
 
       if (match) {
         score += Math.min(20, m5Txns * 2);           // activity confidence
@@ -6707,7 +6710,7 @@ async function main() {
   // Flags are now saved to Firestore so they survive restarts.
   globalGatesBypass     = startCfg.gatesOpen ?? true;  // Nov-19: default open — diagnostic-style run
   lpLockBypass          = !!startCfg.lpOpen;
-  strategyFiltersActive = !startCfg.stratsSkipped; // inverted: true = filters on
+  strategyFiltersActive = !(startCfg.stratsSkipped ?? true); // Nov-19: default OFF — only age/mcap guards active
   autoEntryPaused          = !!startCfg.autoEntryPaused;
   diagnosticMode           = !!startCfg.diagnosticMode;
   diagnosticTradeCount     = startCfg.diagTradeCount || 0;
