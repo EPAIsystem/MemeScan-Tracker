@@ -5668,17 +5668,25 @@ async function monitorPositions() {
         // Phase 1 (before capital recovery): SL = ATH × 0.50 flat trail
         // Phase 3 (after capital recovery):  tighten 5% per +20% ATH gain, floor 5%
         //   +50%→50%, +70%→45%, +90%→40%, +110%→35% … +230%→5%
+        // Nov-19 fix: Phase 3 activates by ATH PRICE LEVEL (≥+50%), not sell success.
+        // Nov-19 fix: Rising break-even floor — once ATH ≥ +20%, SL never drops below entry.
         const ATH        = currentPeak;
         const ATHGainPct = (ATH - pos.entryPrice) / pos.entryPrice * 100;
         let trailPct;
-        if (pos.capitalWithdrawn) {
+        // Phase 3 triggers at ATH ≥ +50% regardless of whether capital sell succeeded
+        const capitalPhase = pos.capitalWithdrawn || ATHGainPct >= 50;
+        if (capitalPhase) {
           const steps = Math.max(0, Math.floor((ATHGainPct - 50) / 20));
           trailPct = Math.max(0.05, 0.50 - steps * 0.05);
         } else {
           trailPct = 0.50;
         }
         newSL = ATH * (1 - trailPct);
-        newSL = Math.max(slFloor, newSL);
+        // Rising floor: once ATH confirms a real move (≥+20%), SL can never go below entry
+        const risingFloor = ATHGainPct >= 20
+          ? Math.max(slFloor, pos.entryPrice)
+          : slFloor;
+        newSL = Math.max(risingFloor, newSL);
 
         // Persist trail state; notify on tighten
         const prevGap = pos.trailPct != null ? pos.trailPct / 100 : 0.50;
