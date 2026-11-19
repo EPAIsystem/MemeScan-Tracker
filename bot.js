@@ -2301,21 +2301,24 @@ async function closePosition(id, data) {
   await db.collection(positions).doc(id).update(closeData);
   // Write history entry — wrapped so a failure doesn't revert the close.
   // Nov-12: added retry + Telegram alert so silent failures are visible.
-  let histOk = false;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const snap = await db.collection(positions).doc(id).get();
-      await db.collection(history).add({ ...snap.data(), ...closeData });
-      histOk = true;
-      break;
-    } catch(e) {
-      console.warn(`[BOT] History write attempt ${attempt}/2 failed for ${id}:`, e.message);
-      if (attempt < 2) await sleep(1500);
+  // Nov-19: skip in diagnostic mode — full exit data is in diagnostic_trades; no history duplication needed.
+  if (!diagnosticMode) {
+    let histOk = false;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const snap = await db.collection(positions).doc(id).get();
+        await db.collection(history).add({ ...snap.data(), ...closeData });
+        histOk = true;
+        break;
+      } catch(e) {
+        console.warn(`[BOT] History write attempt ${attempt}/2 failed for ${id}:`, e.message);
+        if (attempt < 2) await sleep(1500);
+      }
     }
-  }
-  if (!histOk) {
-    console.error(`[BOT] ⚠️ History write FAILED for ${id} — position is closed in paper_positions but NOT in paper_history`);
-    sendTelegram(`⚠️ *History write failed* — position closed in DB but history record missing. Check Firestore.`).catch(() => {});
+    if (!histOk) {
+      console.error(`[BOT] ⚠️ History write FAILED for ${id} — position is closed in paper_positions but NOT in paper_history`);
+      sendTelegram(`⚠️ *History write failed* — position closed in DB but history record missing. Check Firestore.`).catch(() => {});
+    }
   }
 }
 
@@ -2704,6 +2707,7 @@ async function getDailyStats() {
 // strategyId: 0=BB, 1=AM, 2=SC, 3=OR, 4=PS  (null = unknown/legacy)
 const STRATEGY_KEYS = ['bb', 'am', 'sc', 'or', 'ps'];
 async function updateDailyStats(pnl, isWin, isManual = false, exitFeeUsd = 0, strategyId = null) {
+  if (diagnosticMode) return; // Nov-19: diag results go to diagnostic_trades only — skip daily stats writes
   const today = new Date().toISOString().slice(0,10);
   const { stats } = await getCollections();
   const base = {
@@ -2737,6 +2741,7 @@ async function updateDailyStats(pnl, isWin, isManual = false, exitFeeUsd = 0, st
 }
 
 async function updateDailyStatsEntry(posSize, entryFeeUsd) {
+  if (diagnosticMode) return; // Nov-19: skip stats entry write in diag mode
   const today = new Date().toISOString().slice(0,10);
   const { stats } = await getCollections();
   await db.collection(stats).doc(today).set({
@@ -5136,8 +5141,9 @@ async function monitorPositions() {
 
     // Store currentPrice in Firestore so dashboard doesn't depend on browser-side DexScreener fetch.
     // Only write when price moved ≥ 0.5% to limit Firestore writes.
+    // Nov-19: skip in diagnostic mode — no dashboard watching, and 100 slots × every scan burns quota fast.
     const lastStored = pos.currentPrice || 0;
-    if (!lastStored || Math.abs(price - lastStored) / lastStored > 0.005) {
+    if (!diagnosticMode && (!lastStored || Math.abs(price - lastStored) / lastStored > 0.005)) {
       pos.currentPrice = price; // patch cache immediately
       await updatePosition(pos.id, { currentPrice: price, priceUpdatedAt: Date.now() });
     }
