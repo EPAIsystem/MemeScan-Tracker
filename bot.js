@@ -663,7 +663,7 @@ function detectStrategy(pair, openStrategies) {
   if (!globalGatesBypass) {
     if (liq < 3000) return rej('liqFloor'); // $3,000 absolute floor — below this, any position faces severe slippage (restored Nov-14)
   }
-  if (diagnosticMode && liq < DIAG_MIN_LIQ) return rej('liqFloor'); // diagnostic mode: $8k floor only — all other gates bypassed
+  if ((diagnosticMode || globalGatesBypass) && liq < DIAG_MIN_LIQ) return rej('liqFloor'); // Nov-19: when gates bypassed, still enforce $8k floor
   if (price <= 0)  return rej('price');  // always keep — zero price breaks arithmetic
   if (!globalGatesBypass) {
     if (sells24 === 0 && buys24 > 10) return rej('honey'); // honeypot guard
@@ -1992,8 +1992,8 @@ async function enterPosition(coin, overrides = {}) {
     swingSL = effectiveEntry * 0.50;
   } else if (overrides.sl == null) {
     const swingResult = await analyzeSwingData(coin.pairAddress, coin.ageMinutes, effectiveEntry, isGroupA);
-    swingSL   = swingResult.swingSL;
-    skipEntry = swingResult.skipEntry;
+    skipEntry = swingResult.skipEntry;                   // Nov-19: keep range gate — skip if at top of range
+    swingSL   = effectiveEntry * 0.50;                  // Nov-19: 3-phase SL — 50% trail from entry for all modes
   }
 
   if (skipEntry) {
@@ -2876,7 +2876,7 @@ async function processPullbackWatchlist(positions, slotCount, usedThisScan) {
           ? `🎯 TP1: $${fmtPrice(coin.price * s.tp1x)} (+${((s.tp1x-1)*100).toFixed(0)}%) → 50%\n` +
             `🎯 TP2: $${fmtPrice(coin.price * s.tp2x)} (+${((s.tp2x-1)*100).toFixed(0)}%) → 30%\n` +
             `🎯 TP3: $${fmtPrice(coin.price * s.tp3x)} (+${((s.tp3x-1)*100).toFixed(0)}%) → 20%\n`
-          : `🎯 TP: Dynamic (capital recovery → profit trail → 4× halving)\n`;
+          : `🎯 SL: 50% trail · capital out +50% · tightens 5%/+20% → 5% floor\n`;
       const modeHeader = pos.tradingMode === 'real'
         ? `💰 *BOT ENTERED — REAL TRADE*`
         : `✅ *BOT ENTERED — PAPER TRADE*`;
@@ -5464,7 +5464,7 @@ async function monitorPositions() {
               `*${pos.symbol}* ${pos.strategyLabel}\n` +
               `📥 Entry: $${fmtPrice(pos.entryPrice)} | Trigger: +50% (house money)\n` +
               `💰 Sold ${(capitalFrac * 100).toFixed(1)}% → recovered $${newRecovered.toFixed(2)}\n` +
-              `🎯 ${(newRemaining * 100).toFixed(1)}% remains — 5× $${((pos.originalPositionSize || pos.size) * 0.20).toFixed(0)} profit withdrawals ahead\n` +
+              `🎯 ${(newRemaining * 100).toFixed(1)}% remains — SL tightens 5%/+20% → 5% floor\n` +
               `🔗 [Chart](${pos.dexUrl})` +
               `${_cSell.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_cSell.txHash})` : ''}`;
           }
@@ -5490,8 +5490,7 @@ async function monitorPositions() {
     // After 5 withdrawals (5×20% = 100% of original position in profit): moon bag.
     // Each sells just enough of remaining to realize 20% of original position size.
     // ══════════════════════════════════════════════════════════════════════
-    if (pos.capitalWithdrawn && !pos.isMoonBag && (pos.withdrawalCount || 0) < 5
-        && pos.remaining > 0.01 && !closingNow.has(pos.id)) {
+    if (false) { // Nov-19: replaced by SL tightening in 3-phase system (was progressive withdrawals)
       const wCount        = pos.withdrawalCount || 0;
       const originalSize  = pos.originalPositionSize || pos.size;
       const withdrawGoal  = originalSize * 0.20; // $20 per trigger on $100 position
@@ -5551,8 +5550,7 @@ async function monitorPositions() {
     // profit while letting the other 50% ride the -10% floor trail to max upside.
     // Fires once (s5ProfitHalved flag prevents repeat).
     // ══════════════════════════════════════════════════════════════════════
-    if (pos.strategyId === 4 && pos.capitalWithdrawn && !pos.s5ProfitHalved
-        && gain >= 3.0 && pos.remaining > 0.01 && !closingNow.has(pos.id)) {
+    if (false) { // Nov-19: replaced by SL tightening in 3-phase system (was S5 profit halving)
       const halveFrac    = 0.50;
       const amountSold   = halveFrac * pos.remaining;
       const halveExit    = pos.tradingMode === 'paper'
@@ -5587,8 +5585,7 @@ async function monitorPositions() {
     // ── RESISTANCE EXIT — 50% partial at estimated overhead resistance ─────────
     // Computed at entry from h1/h6/h24 DexScreener data. Fires once per position.
     // Takes 50% — locks profit at the first overhead wall, lets rest ride with SL/trail.
-    if (pos.resistancePrice && !pos.resistanceHit && price >= pos.resistancePrice
-        && !closingNow.has(pos.id) && pos.remaining > 0.05) {
+    if (false) { // Nov-19: exits only via SL tightening (was resistance partial exit)
       // exitFrac = fraction of *remaining* to sell (0.50 = sell half of what's left)
       const exitFrac      = Math.min(RESISTANCE_EXIT_FRAC, 1 - 0.01 / pos.remaining);
       const amountSold    = exitFrac * pos.remaining;          // as fraction of original position
@@ -5628,15 +5625,13 @@ async function monitorPositions() {
     // ─────────────────────────────────────────────────────────────────────────
 
     // ══════════════════════════════════════════════════════════════════════
-    // ── GAP TRAIL — universal thresholds, per-strategy floor ────────────
-    // Phase 1: SL stays flat at slFloor (set at entry, varies by strategy):
-    //   AM/SC/PS (ids 1,2,4): slFloor = entry×0.97  (-3%)
-    //   BB/OR    (ids 0,3):   slFloor = entry×0.99  (-1%)
-    // Phase 2 (all strategies): gap trail activates at +5% ATH gain.
-    //   gap starts 60%, tightens 5% per +10% further gain, floor 5%
-    //   SL = entry + (1 − gapPct) × (ATH − entry); never below slFloor.
-    //
-    //   SL = entry + (1 − gapPct) × (ATH − entry); never below slFloor.
+    // ── SL TRAIL — 3-phase system (Nov-19) ───────────────────────────────
+    // Phase 1 (before capital recovery):   SL = ATH × 0.50 flat trail
+    // Phase 2 (at +50% gain):              capital recovered, flag set
+    // Phase 3 (after capital recovery):    SL = ATH × (1 − trailPct)
+    //   trailPct starts 50%, tightens 5% per +20% ATH gain, floor 5%
+    //   +50%→50%, +70%→45%, +90%→40%, +110%→35% … +230%→5%
+    // Diagnostic: Phase 1 (ATHGain<30%) = ATH×0.50; Phase 2 = 60% gap trail
     // Moon bag: flat 20% below ATH — SL = ATH × 0.80. Never comes down.
     // ══════════════════════════════════════════════════════════════════════
     if (gainPct > 0) {
@@ -5665,32 +5660,37 @@ async function monitorPositions() {
         // SL = ATH × 0.80 — rises with ATH, never comes down (ratchet).
         newSL = currentPeak * 0.80;
 
-      } else if (gainPct >= trailThreshold) {
-        // ── PHASE 2: gap trail starting at trailThreshold ────────────────
+      } else {
+        // ── 3-PHASE SL SYSTEM (Nov-19) ────────────────────────────────────
+        // Phase 1 (before capital recovery): SL = ATH × 0.50 flat trail
+        // Phase 3 (after capital recovery):  tighten 5% per +20% ATH gain, floor 5%
+        //   +50%→50%, +70%→45%, +90%→40%, +110%→35% … +230%→5%
         const ATH        = currentPeak;
         const ATHGainPct = (ATH - pos.entryPrice) / pos.entryPrice * 100;
-        const steps      = Math.max(0, Math.floor((ATHGainPct - trailThreshold) / 10));
-        const gapPct     = Math.max(0.05, gapStart - steps * 0.05);
+        let trailPct;
+        if (pos.capitalWithdrawn) {
+          const steps = Math.max(0, Math.floor((ATHGainPct - 50) / 20));
+          trailPct = Math.max(0.05, 0.50 - steps * 0.05);
+        } else {
+          trailPct = 0.50;
+        }
+        newSL = ATH * (1 - trailPct);
+        newSL = Math.max(slFloor, newSL);
 
-        // Persist gap state; notify when gap tightens
-        const prevGap = pos.trailPct != null ? pos.trailPct / 100 : gapStart;
-        if (gapPct !== prevGap) {
-          updates.trailPct    = gapPct * 100;
+        // Persist trail state; notify on tighten
+        const prevGap = pos.trailPct != null ? pos.trailPct / 100 : 0.50;
+        if (trailPct !== prevGap) {
+          updates.trailPct    = trailPct * 100;
           updates.tightenBase = ATH;
-          pos.trailPct        = gapPct * 100;
+          pos.trailPct        = trailPct * 100;
           pos.tightenBase     = ATH;
-          if (gapPct < prevGap) {
-            sendTelegram(
-              `📐 *SL TIGHTENED — ${pos.symbol}*\n` +
-              `Gap: ${(prevGap*100).toFixed(0)}% → *${(gapPct*100).toFixed(0)}%* | Floor: 5%\n` +
-              `ATH: $${fmtPrice(ATH)} | Gain: +${gainPct.toFixed(1)}%\n🔗 [Chart](${pos.dexUrl})`
+          if (trailPct < prevGap) {
+            sendTelegram(`📐 *SL TIGHTENED — ${pos.symbol}*\n` +
+              `Gap: ${(prevGap*100).toFixed(0)}% → *${(trailPct*100).toFixed(0)}%* | Floor: 5%\n` +
+              `ATH: $${fmtPrice(ATH)} | Gain: +${ATHGainPct.toFixed(1)}%\n🔗 [Chart](${pos.dexUrl})`
             ).catch(() => {});
           }
         }
-
-        // SL = entry + (1 − gapPct) × (ATH − entry); never below slFloor
-        newSL = pos.entryPrice + (1 - gapPct) * (ATH - pos.entryPrice);
-        newSL = Math.max(slFloor, newSL);
       }
 
       if (newSL !== undefined) {
@@ -6499,7 +6499,7 @@ async function scanForEntries() {
           ? `🎯 TP1: $${fmtPrice(coin.price * s.tp1x)} (+${((s.tp1x-1)*100).toFixed(0)}%) → 50%\n` +
             `🎯 TP2: $${fmtPrice(coin.price * s.tp2x)} (+${((s.tp2x-1)*100).toFixed(0)}%) → 30%\n` +
             `🎯 TP3: $${fmtPrice(coin.price * s.tp3x)} (+${((s.tp3x-1)*100).toFixed(0)}%) → 20%\n`
-          : `🎯 TP: Dynamic (capital recovery → profit trail → 4× halving)\n`;
+          : `🎯 SL: 50% trail · capital out +50% · tightens 5%/+20% → 5% floor\n`;
     const pumpBadge     = coin.isPumpFun ? `🎪 Pump.fun${isYoung?' · YOUNG COIN':''}\n` : '';
     const trendBadge    = coin._trendingPlatforms
       ? `🔥 Trending on ${coin._trendingPlatforms} platform${coin._trendingPlatforms > 1 ? 's' : ''} (score threshold lowered)\n`
@@ -6705,7 +6705,7 @@ async function main() {
 
   // ── Restore persisted bypass flags (Nov-12) ────────────────────────────────
   // Flags are now saved to Firestore so they survive restarts.
-  globalGatesBypass     = !!startCfg.gatesOpen;
+  globalGatesBypass     = startCfg.gatesOpen ?? true;  // Nov-19: default open — diagnostic-style run
   lpLockBypass          = !!startCfg.lpOpen;
   strategyFiltersActive = !startCfg.stratsSkipped; // inverted: true = filters on
   autoEntryPaused          = !!startCfg.autoEntryPaused;
