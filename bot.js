@@ -4178,7 +4178,7 @@ async function pollTelegramCommands() {
           await sendTelegram(
             `❌ Usage: \`/queue <contract_address>\`\n` +
             `Example: \`/queue CvRJ8MrnBpump\`\n` +
-            `_Bot will evaluate with its own scoring (needs ≥ ${MIN_SCORE})_`
+            `_Manual entries bypass bot filters and go straight in_`
           );
         } else {
           // Manual command — goes straight in, no filter checks (human override)
