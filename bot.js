@@ -6457,7 +6457,7 @@ async function scanForEntries() {
         if (_age < 20) _tierBlock = `age ${_age.toFixed(1)}min < 20 (tier $50+)`;
       }
 
-      if (_tierBlock && !diagnosticMode) {
+      if (_tierBlock && !diagnosticMode && !globalGatesBypass) { // Nov-19: bypassed when gates open
         console.log(`[TIER-GATE] BLOCKED ${coin.symbol} — ${_tierBlock} (dynSize=$${_sz.toFixed(2)} ceiling=$${_entryCeiling})`);
         usedThisScan.add(coin.addr);
         continue;
