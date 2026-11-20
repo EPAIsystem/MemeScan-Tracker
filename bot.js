@@ -2096,7 +2096,40 @@ async function enterPosition(coin, overrides = {}) {
       strategyId: s.id,
     } : null,
   };
-  await ref.set(pos);
+  // Nov-20 safety: wrap Firestore write — if it fails after a real swap, sell
+  // back immediately to prevent an orphan token with no monitoring record.
+  try {
+    await ref.set(pos);
+  } catch (fsWriteErr) {
+    console.error(`[ENTRY] ⚠️ FIRESTORE WRITE FAILED after swap for ${coin.symbol}: ${fsWriteErr.message}`);
+    if (tradingMode === 'real' && realTx?.txHash && realTx.txHash !== 'tracked') {
+      await sendTelegram(
+        `🚨 *ENTRY RECORD FAILED — SELLING BACK*\n\n` +
+        `*${coin.symbol}* — on-chain swap succeeded but position could not be saved to Firestore.\n\n` +
+        `Selling tokens back now to protect funds.\n` +
+        `Error: ${fsWriteErr.message}`
+      ).catch(() => {});
+      // Build minimal pos object for executeRealSell
+      const tempPos = { ...pos, id: ref.id };
+      try {
+        const sellWallet = await selectWalletForChain('solana', cfg);
+        await executeRealSell(tempPos, sellWallet, 1.0, coin.price);
+        await sendTelegram(
+          `✅ *Sell-back completed* — ${coin.symbol} tokens returned to SOL.\n` +
+          `No position was opened. Capital is safe.`
+        ).catch(() => {});
+      } catch (sellBackErr) {
+        console.error(`[ENTRY] ⚠️ SELL-BACK FAILED for ${coin.symbol}: ${sellBackErr.message}`);
+        await sendTelegram(
+          `🚨 *SELL-BACK FAILED — MANUAL ACTION NEEDED*\n\n` +
+          `*${coin.symbol}* — could not sell back after record failure.\n` +
+          `Check your wallet and sell manually!\n` +
+          `Sell-back error: ${sellBackErr.message}`
+        ).catch(() => {});
+      }
+    }
+    return null; // abort — no position record was created
+  }
   // Accumulate capital deployed + entry fee into daily stats (fire-and-forget)
   updateDailyStatsEntry(posSize, pos.entryFeeUsd).catch(e => console.warn('[FEE]', e.message));
   const newPos = { id: ref.id, ...pos };
@@ -3559,6 +3592,22 @@ async function pollTelegramCommands() {
         );
       }
 
+      // ── /recover — manually trigger orphan token scan ───────────────────────
+      if (text === '/recover') {
+        const rcfg = await getTradingConfig();
+        if ((rcfg.tradingMode || 'paper') !== 'real') {
+          await sendTelegram('⚠️ /recover only works in REAL mode. Currently in paper mode.');
+          continue;
+        }
+        await sendTelegram('🔍 Scanning wallet for untracked tokens...');
+        const rCount = await detectAndRecoverOrphans(true); // force = bypass rate limit
+        if (rCount === 0) {
+          await sendTelegram('✅ No orphan tokens found — all wallet tokens are tracked.');
+        }
+        // Individual alerts sent inside detectAndRecoverOrphans for each found token
+        continue;
+      }
+
       if (text === '/stats') {
         const stats       = await getDailyStats();
         const grossProfit = stats.grossProfit    || 0;
@@ -4853,6 +4902,175 @@ async function filterByLpLock(matches) {
   return matches.filter(c => passed.has(c.addr));
 }
 
+// ─── ORPHAN TOKEN RECOVERY ────────────────────────────────────────────────────
+// Finds wallet tokens with no open real_positions record and creates monitoring
+// positions for them. Runs every 60s automatically + instantly on /recover.
+// Covers: bot-entered tokens whose Firestore write silently failed, and tokens
+// the trader bought manually outside the bot.
+const TOKEN_PROGRAM_ID_STR  = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const TOKEN_2022_ID_STR     = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+const ORPHAN_MIN_USD        = 0.50;  // ignore dust below this USD value
+let lastOrphanScan = 0;
+const ORPHAN_SCAN_INTERVAL  = 60000; // at most once per minute (auto mode)
+
+async function detectAndRecoverOrphans(force = false) {
+  const cfg = await getTradingConfig();
+  if ((cfg.tradingMode || 'paper') !== 'real') return 0; // real mode only
+
+  const now = Date.now();
+  if (!force && now - lastOrphanScan < ORPHAN_SCAN_INTERVAL) return 0;
+  lastOrphanScan = now;
+
+  try {
+    const { Connection, PublicKey } = SolanaWeb3;
+
+    // Get active Solana wallet
+    const wallet = await selectWalletForChain('solana', cfg);
+    if (!wallet) return 0;
+    const pk = process.env[wallet.envKey + '_PRIVATE_KEY'];
+    if (!pk) return 0;
+    const keypair = parseSolanaKeypair(pk.trim());
+
+    const connection = new Connection(SOL_RPC, 'confirmed');
+
+    // Get ALL token accounts for this wallet (both SPL programs)
+    const allTokenAccounts = [];
+    for (const progIdStr of [TOKEN_PROGRAM_ID_STR, TOKEN_2022_ID_STR]) {
+      try {
+        const { value } = await connection.getParsedTokenAccountsByOwner(
+          keypair.publicKey,
+          { programId: new PublicKey(progIdStr) }
+        );
+        allTokenAccounts.push(...value);
+      } catch(e) {
+        console.warn(`[ORPHAN] Token program ${progIdStr.slice(0,8)} query failed: ${e.message}`);
+      }
+    }
+    if (!allTokenAccounts.length) return 0;
+
+    // Get currently tracked open positions
+    const openPositions = await getOpenPositions();
+    const trackedAddresses = new Set(openPositions.map(p => (p.address || '').toLowerCase()));
+
+    // Get recently closed positions (last 24 h) — don't re-open these
+    const { history, positions } = await getCollections();
+    const yesterday = Date.now() - 86400000;
+    let recentlyClosed = new Set();
+    try {
+      const rcSnap = await db.collection(history).where('closedAt', '>=', yesterday).get();
+      rcSnap.docs.forEach(d => {
+        const addr = (d.data().address || '').toLowerCase();
+        if (addr) recentlyClosed.add(addr);
+      });
+    } catch(e) {
+      console.warn('[ORPHAN] Could not read recent history:', e.message);
+    }
+
+    // Find orphan token accounts
+    const orphans = [];
+    for (const acct of allTokenAccounts) {
+      const info = acct.account?.data?.parsed?.info;
+      if (!info) continue;
+      const mintAddress = info.mint;
+      const rawBalance  = BigInt(info.tokenAmount?.amount || '0');
+      if (rawBalance === BigInt(0)) continue;
+      if (mintAddress === SOL_MINT) continue;
+      if (trackedAddresses.has(mintAddress.toLowerCase())) continue;
+      if (recentlyClosed.has(mintAddress.toLowerCase())) continue;
+      orphans.push({
+        mintAddress,
+        rawBalance,
+        decimals: info.tokenAmount?.decimals ?? 6,
+      });
+    }
+    if (!orphans.length) return 0;
+
+    // For each orphan: fetch price, verify USD value, create recovery position
+    let recovered = 0;
+    for (const orphan of orphans) {
+      try {
+        const r = await httpGet('api.dexscreener.com', `/latest/dex/tokens/${orphan.mintAddress}`);
+        const d = JSON.parse(r.body);
+        const pairs = (d.pairs || []).filter(p => p.chainId === 'solana');
+        if (!pairs.length) {
+          console.log(`[ORPHAN] No DexScreener pairs for ${orphan.mintAddress} — skipping`);
+          continue;
+        }
+        pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+        const best  = pairs[0];
+        const price = parseFloat(best.priceUsd || '0');
+        if (!price) continue;
+
+        const humanBalance = Number(orphan.rawBalance) / (10 ** orphan.decimals);
+        const usdValue = humanBalance * price;
+        if (usdValue < ORPHAN_MIN_USD) {
+          console.log(`[ORPHAN] ${best.baseToken?.symbol || orphan.mintAddress.slice(0,8)} dust ($${usdValue.toFixed(4)}) — skipping`);
+          continue;
+        }
+
+        const symbol  = best.baseToken?.symbol || orphan.mintAddress.slice(0, 8);
+        const dexUrl  = best.url || `https://dexscreener.com/solana/${orphan.mintAddress}`;
+        const liq     = best.liquidity?.usd   || 0;
+        const mcap    = parseFloat(best.marketCap || best.fdv || 0);
+
+        // Create recovery position — entry = current price, SL = 50% below current
+        const ref = db.collection(positions).doc();
+        const recoveryPos = {
+          symbol,
+          address:           orphan.mintAddress,
+          chain:             'solana',
+          entryPrice:        price,
+          currentSL:         price * 0.50,
+          peakPrice:         price,
+          size:              usdValue,
+          remaining:         1.0,
+          pnl:               0,
+          status:            'open',
+          tradingMode:       'real',
+          walletId:          wallet.id,
+          walletLabel:       wallet.label   || 'Wallet 1',
+          walletAddress:     wallet.address || null,
+          walletChain:       'solana',
+          enteredAt:         Date.now(),
+          dexUrl,
+          isOrphanRecovery:  true,
+          orphanRecoveredAt: Date.now(),
+          realTokenAmount:   orphan.rawBalance.toString(),
+          capitalWithdrawn:  false,
+          strategyId:        -1,
+          strategyLabel:     '♻️ Recovered',
+          liquidityAtEntry:  liq,
+          mcap,
+        };
+
+        await ref.set(recoveryPos);
+        if (_posCache) _posCache.push({ id: ref.id, ...recoveryPos });
+        recovered++;
+
+        await sendTelegram(
+          `♻️ *ORPHAN TOKEN RECOVERED*\n\n` +
+          `*${symbol}* found in wallet with no position record.\n\n` +
+          `💵 Est. value: *$${usdValue.toFixed(2)}*\n` +
+          `📈 Current price: $${fmtPrice(price)}\n` +
+          `🛑 SL set at: $${fmtPrice(price * 0.50)} (50% below current)\n\n` +
+          `Bot is now monitoring with standard SL/TP rules.\n` +
+          `Entry = current price. SL trails up as price rises.\n` +
+          `🔗 [Chart](${dexUrl})`
+        ).catch(() => {});
+        console.log(`[ORPHAN] ♻️ Recovered ${symbol} ($${usdValue.toFixed(2)}) price $${fmtPrice(price)} SL $${fmtPrice(price * 0.50)}`);
+
+        await sleep(500); // pace DexScreener calls
+      } catch(orphanErr) {
+        console.warn(`[ORPHAN] Failed to recover ${orphan.mintAddress.slice(0,8)}: ${orphanErr.message}`);
+      }
+    }
+    return recovered;
+  } catch(e) {
+    console.error('[ORPHAN] detectAndRecoverOrphans error:', e.message);
+    return 0;
+  }
+}
+
 async function monitorPositions() {
   if (!(await isBotRunning())) return;
 
@@ -4861,6 +5079,9 @@ async function monitorPositions() {
   await checkTradingPeriod();
   const cfg = await getTradingConfig();
   await checkAddFunds(cfg);
+
+  // Auto-detect wallet tokens with no position record (rate-limited to once/min)
+  await detectAndRecoverOrphans().catch(e => console.warn('[ORPHAN]', e.message));
 
   const positions = await getOpenPositions();
   if (!positions.length) return;
