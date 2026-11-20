@@ -2662,11 +2662,32 @@ async function realPartialSell(pos, sellFrac, exitPrice) {
   if (!result?.txHash) {
     const error = result?.error || 'Partial sell failed';
     console.error(`[REAL] ⛔ PARTIAL SELL failed for ${pos.symbol}: ${error} — Firestore NOT updated`);
+
+    // ── Zero-balance = tokens gone from wallet (sold externally / on-chain) ──
+    // Alert ONCE and write off the position immediately — no retry makes sense.
+    if (error === 'Zero token balance — already sold?') {
+      const lastPrice = exitPrice || pos.entryPrice;
+      const pnl = (lastPrice - pos.entryPrice) / pos.entryPrice * 100;
+      await sendTelegram(
+        `⚠️ *POSITION WRITTEN OFF* — ${pos.symbol}\n\n` +
+        `Zero token balance detected — tokens no longer in wallet.\n` +
+        `Position closed in records. Last known price: $${lastPrice.toFixed(6)}\n\n` +
+        `_If this was an unintended external sale, check your wallet manually._`
+      ).catch(() => {});
+      await closePosition(pos.id, {
+        exitPrice:  lastPrice,
+        exitReason: 'zero-balance-writeoff',
+        pnl,
+      }).catch(e => console.error(`[REAL] closePosition write-off failed for ${pos.symbol}:`, e.message));
+      return { ok: false, error, zeroClosed: true };
+    }
+
+    // ── Other failures (RPC, slippage, etc.) — alert every trigger until resolved ──
     await sendTelegram(
       `⛔ *REAL PARTIAL SELL FAILED*\n\n` +
       `*${pos.symbol}* — partial exit skipped\n` +
       `Reason: ${error}\n\n` +
-      `_Position size unchanged. Bot will try again on next trigger._`
+      `_Position size unchanged. Bot will try again on next trigger.\nSend /close ${pos.symbol} to force-close manually._`
     ).catch(() => {});
     return { ok: false, error };
   }
