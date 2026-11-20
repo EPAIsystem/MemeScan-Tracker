@@ -1021,6 +1021,11 @@ function detectStrategy(pair, openStrategies) {
 const enteredToday       = new Set();
 const alertCooldown      = new Map(); // set only on actual entry — guards the 30-min re-entry window
 const pausedAlertCooldown = new Map(); // set on pause-mode signals — separate so it never blocks auto-entry
+// Manual-mode alert windows: addr → { count, windowStart, coin, s, skipped }
+// Up to 3 alerts per 5-min window; re-opens after window expires.
+const manualAlertState  = new Map();
+const MANUAL_WINDOW_MS  = 5 * 60 * 1000;   // 5-min window per token
+const MANUAL_MAX_ALERTS = 3;               // max alerts within that window
 // Block re-entry for 6h after SL or rug — prevents the triple-entry bug
 // (address → timestamp of SL/rug close)
 const recentSLCoins = new Map();
@@ -3510,6 +3515,62 @@ async function pollTelegramCommands() {
         await answerCallbackQuery(cbq.id);
 
         const data = cbq.data || '';
+        // ── MANUAL ENTRY: user tapped "Enter Trade" on a signal alert ────────────
+        if (data.startsWith('manual_enter:')) {
+          const addr = data.slice('manual_enter:'.length);
+          const ms   = manualAlertState.get(addr);
+
+          if (!ms) {
+            await sendTelegram(`⏰ Opportunity expired — the alert window for this coin has closed.`);
+          } else if (enteredToday.has(addr)) {
+            await sendTelegram(`ℹ️ *${ms.coin.symbol}* was already entered this session.`);
+            manualAlertState.delete(addr);
+          } else {
+            manualAlertState.delete(addr); // consume immediately — prevent double-tap
+            enteredToday.add(addr);
+            await sendTelegram(`⏳ Entering *${ms.coin.symbol}*...`);
+            try {
+              const pos = await enterPosition(ms.coin);
+              if (!pos) {
+                enteredToday.delete(addr);
+                await sendTelegram(`❌ *ENTRY FAILED — ${ms.coin.symbol}*\nNo matching wallet for chain ${ms.coin.chain}.`);
+              } else {
+                alertCooldown.set(addr, Date.now());
+                positions.push(pos);
+                slotCount[ms.coin.strategy.id]++;
+                const modeHdr = pos.tradingMode === 'real' ? `💰 *ENTERED — REAL TRADE*` : `✅ *ENTERED — PAPER TRADE*`;
+                await sendTelegram(
+                  `${modeHdr}\n\n` +
+                  `*${ms.coin.symbol}* — ${ms.coin.name}\n` +
+                  `${ms.s.label} · Score: *${ms.coin.score}/100*\n\n` +
+                  `📥 Entry: $${fmtPrice(ms.coin.price)}\n` +
+                  `💰 Position: ${pos.sizeNote || '$' + pos.size}${pos.walletLabel ? ` · ${pos.walletLabel}` : ''}\n` +
+                  `🛑 SL: $${fmtPrice(pos.currentSL || pos.sl)} (−30%)\n` +
+                  `🔗 [Chart](${ms.coin.dexUrl})`
+                );
+              }
+            } catch (enterErr) {
+              enteredToday.delete(addr);
+              await sendTelegram(`❌ *ENTRY ERROR — ${ms.coin.symbol}*\n${enterErr.message}`);
+            }
+          }
+          continue;
+        }
+
+        // ── MANUAL SKIP: user tapped "Skip" on a signal alert ─────────────────
+        if (data.startsWith('manual_skip:')) {
+          const addr = data.slice('manual_skip:'.length);
+          const ms   = manualAlertState.get(addr);
+          if (ms && !ms.skipped) {
+            ms.skipped = true;
+            manualAlertState.set(addr, ms);
+            await sendTelegram(`👋 *${ms.coin.symbol}* skipped — alerts for this coin will pause until the next window (~${Math.ceil(MANUAL_WINDOW_MS/60000)} min).`);
+          } else {
+            await sendTelegram(`ℹ️ This alert has already expired or been acted on.`);
+          }
+          continue;
+        }
+
         if (data.startsWith('bg_view:')) {
           // User tapped a hidden coin row — show its full status
           const posId   = data.slice('bg_view:'.length);
@@ -6798,9 +6859,15 @@ async function scanForEntries() {
     // Entry cooldown: only blocks when NOT paused (paused path uses its own cooldown)
     const last = alertCooldown.get(coin.addr) || 0;
     if (!autoEntryPaused && Date.now() - last < 30 * 60 * 1000) continue;
-    // Pause-alert cooldown: suppress repeat signals while paused (separate from entry cooldown)
-    const lastPaused = pausedAlertCooldown.get(coin.addr) || 0;
-    if (autoEntryPaused && Date.now() - lastPaused < 30 * 60 * 1000) continue;
+    // Manual-mode window gate: max MANUAL_MAX_ALERTS per MANUAL_WINDOW_MS; resets after window expires
+    if (autoEntryPaused) {
+      const ms = manualAlertState.get(coin.addr);
+      if (ms) {
+        const windowAge = Date.now() - ms.windowStart;
+        if (windowAge < MANUAL_WINDOW_MS && (ms.count >= MANUAL_MAX_ALERTS || ms.skipped)) continue;
+        if (windowAge >= MANUAL_WINDOW_MS) manualAlertState.delete(coin.addr); // new window
+      }
+    }
     // Check slot still available (may have been filled earlier in this loop) — bypassed in diagnostic mode
     if (!diagnosticMode && slotCount[coin.strategy.id] >= coin.strategy.maxSlots) continue;
 
@@ -6895,13 +6962,29 @@ async function scanForEntries() {
       ? `📐 TA boost: +${coin._taBonus}pts (RSI/EMA/BB/Volume)\n`
       : '';
 
-    // ── If auto-entry is paused: send full signal alert but skip entering ─────────
+    // ── MANUAL MODE: send signal with inline Enter / Skip buttons ────────────────
     // Diagnostic mode bypasses the pause — research trial must enter positions freely.
     if (autoEntryPaused && !diagnosticMode) {
-      pausedAlertCooldown.set(coin.addr, Date.now()); // pause-only cooldown — never touches entry cooldown
       usedThisScan.add(coin.addr);
-      await sendTelegram(
-        `⏸ *SIGNAL — AUTO-ENTRY PAUSED*\n\n` +
+
+      // Update (or create) the 5-min window state for this coin
+      const existing  = manualAlertState.get(coin.addr);
+      const alertState = existing || { count: 0, windowStart: Date.now(), coin, s, skipped: false };
+      alertState.count++;
+      alertState.coin = coin;   // freshen coin data each alert
+      alertState.s    = s;
+      manualAlertState.set(coin.addr, alertState);
+
+      const alertN    = alertState.count;
+      const msLeft    = Math.max(1, Math.ceil((MANUAL_WINDOW_MS - (Date.now() - alertState.windowStart)) / 60000));
+      const header    = alertN === 1
+        ? `🎯 *MANUAL SIGNAL — tap to enter*`
+        : `🔔 *SIGNAL (${alertN}/${MANUAL_MAX_ALERTS}) — still qualifying*`;
+
+      const posSize = calcDynamicPositionSize(coin.liq || 0, coin.mcap || 0, _entryCeiling);
+
+      await sendTelegramWithButtons(
+        `${header}\n\n` +
         `*${coin.symbol}* — ${coin.name}\n` +
         `${s.label} · Score: *${coin.score}/100*\n` +
         `${pumpBadge}` +
@@ -6911,15 +6994,20 @@ async function scanForEntries() {
         `${rangeReentryBadge}` +
         `${taBadge}` +
         `💡 ${s.desc}\n\n` +
-        `💵 Price now: $${fmtPrice(coin.price)}\n` +
+        `💵 Price: $${fmtPrice(coin.price)}\n` +
+        `💰 Est. size: $${posSize.toFixed(0)}\n` +
         `📊 Buy%: ${coin.buyPct.toFixed(0)}% | Liq: $${(coin.liq/1000).toFixed(0)}k\n` +
         `📈 Age: ${ageLabel} | m5: ${coin.m5Ch>0?'+':''}${coin.m5Ch.toFixed(1)}% | h1: ${coin.ch1!=null?(coin.ch1>0?'+':'')+coin.ch1.toFixed(1)+'%':'<1h'}\n\n` +
-        tpInfo +
-        `\`${coin.addr}\`\n🔗 [Chart](${coin.dexUrl})\n\n` +
-        `_Enter manually: /enter ${coin.addr}_\n` +
-        `_Resume auto-entry: /pauseentry off_`
+        `🔗 [Chart](${coin.dexUrl})\n` +
+        `⏳ _Window: ~${msLeft}min left_`,
+        [
+          [
+            { text: `✅ Enter Trade ($${posSize.toFixed(0)})`, callback_data: `manual_enter:${coin.addr}` },
+            { text: `❌ Skip`,                                  callback_data: `manual_skip:${coin.addr}`  },
+          ]
+        ]
       );
-      console.log(`[BOT] ENTRY PAUSED — signal fired for ${coin.symbol} (${s.label}) but auto-entry is off`);
+      console.log(`[MANUAL] ${coin.symbol} alert ${alertN}/${MANUAL_MAX_ALERTS} (${msLeft}min left in window)`);
       continue;
     }
 
