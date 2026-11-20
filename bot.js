@@ -1053,6 +1053,7 @@ let globalGatesBypass   = false; // /skipgates toggle — bypasses all global fi
 let tierGateBypass      = false; // /skiptiers toggle — bypasses tiered entry gates only (default ON)
 let lpLockBypass        = false; // /skiplp toggle  — bypasses filterByLpLock() for diagnostics
 let autoEntryPaused     = false; // /pauseentry toggle — signals alert but bot skips auto-entry
+let slTrailMode         = '30';  // /slbase toggle — SL trail base: '30' = tight 6-phase | '50' = wide phase
 let telegramOffset      = 0; // for Telegram command polling
 
 // ─── TRADING PERIODS ──────────────────────────────────────────────────────────
@@ -1209,6 +1210,7 @@ async function saveBypassFlags() {
       autoEntryPaused:  autoEntryPaused,
       diagnosticMode:   diagnosticMode,
       diagTradeCount:   diagnosticTradeCount,
+      slTrailMode:      slTrailMode,
     }, { merge: true });
   } catch(e) {
     console.warn('[BOT] Could not persist bypass flags:', e.message);
@@ -2022,7 +2024,7 @@ async function enterPosition(coin, overrides = {}) {
   } else if (overrides.sl == null) {
     const swingResult = await analyzeSwingData(coin.pairAddress, coin.ageMinutes, effectiveEntry, isGroupA);
     skipEntry = swingResult.skipEntry;                   // Nov-19: keep range gate — skip if at top of range
-    swingSL   = effectiveEntry * 0.70;                  // Nov-20: 30% gap from entry for all modes
+    swingSL   = effectiveEntry * (slTrailMode === '50' ? 0.50 : 0.70); // Nov-20: gap per trail mode
   }
 
   if (skipEntry) {
@@ -2069,7 +2071,8 @@ async function enterPosition(coin, overrides = {}) {
     // Age at entry — reference only
     coinAgeDays: coin.ageDays || 0,
     // Universal progressive trail state — gap % of ATH gain given back (Phase 3)
-    trailPct:    30,     // current gap % × 100 (30 → 25 → 20 → 15 → 10 → 5 floor)
+    slTrailMode: slTrailMode,            // locked at entry — never changes after ('30' or '50')
+    trailPct:    slTrailMode === '50' ? 50 : 30,  // current gap integer % (50→5 or 30→5)
     tightenBase: null,   // ATH at last tighten event
     // Progressive withdrawal tracking (Nov-12)
     originalPositionSize: posSize,  // dollar amount at entry — used for $20 withdrawal calc
@@ -4352,6 +4355,37 @@ async function pollTelegramCommands() {
         continue;
       }
 
+      // ── /slbase [30|50] — toggle SL trail mode ──────────────────────────────────
+      // '30' = tight 6-phase (30%→5%), '50' = wide phase (50%→5% after recovery)
+      // Existing positions keep whatever mode they were entered in.
+      if (text === '/slbase' || text === '/slbase 30' || text === '/slbase 50') {
+        if (text === '/slbase 30')      slTrailMode = '30';
+        else if (text === '/slbase 50') slTrailMode = '50';
+        else slTrailMode = slTrailMode === '30' ? '50' : '30'; // toggle
+        await saveBypassFlags();
+        if (slTrailMode === '30') {
+          await sendTelegram(
+            `📐 *SL TRAIL: TIGHT MODE (30%)*\n\n` +
+            `New entries will use the 6-phase tight trail:\n` +
+            `• Entry SL: −30% from entry price\n` +
+            `• Tightens: 30%→25%→20%→15%→10%→5% (per +30% ATH gain)\n\n` +
+            `_Existing positions keep their original trail mode._\n` +
+            `Send /slbase to switch to wide 50% mode.`
+          );
+        } else {
+          await sendTelegram(
+            `📐 *SL TRAIL: WIDE MODE (50%)*\n\n` +
+            `New entries will use the wide trail:\n` +
+            `• Entry SL: −50% from entry price\n` +
+            `• Flat 50% gap until +50% ATH gain (capital recovery)\n` +
+            `• Then tightens: −5% per +20% ATH gain, floor at 5%\n\n` +
+            `_Existing positions keep their original trail mode._\n` +
+            `Send /slbase to switch to tight 30% mode.`
+          );
+        }
+        continue;
+      }
+
       // ── /hidden — show backgrounded positions with inline detail buttons ────────
       if (text === '/hidden') {
         const allPos    = await getOpenPositions();
@@ -5185,7 +5219,7 @@ async function detectAndRecoverOrphans(force = false) {
           address:           orphan.mintAddress,
           chain:             'solana',
           entryPrice:        price,
-          currentSL:         price * 0.70,
+          currentSL:         price * (slTrailMode === '50' ? 0.50 : 0.70),
           peakPrice:         price,
           size:              usdValue,
           remaining:         1.0,
@@ -5206,6 +5240,8 @@ async function detectAndRecoverOrphans(force = false) {
           strategyLabel:     '♻️ Recovered',
           liquidityAtEntry:  liq,
           mcap,
+          slTrailMode:       slTrailMode,
+          trailPct:          slTrailMode === '50' ? 50 : 30,
         };
 
         await ref.set(recoveryPos);
@@ -6107,24 +6143,37 @@ async function monitorPositions() {
         newSL = currentPeak * 0.80;
 
       } else {
-        // ── 6-PHASE SL TRAIL (Nov-20) ────────────────────────────────────
-        // gap = 30% − 5% × floor(ATHGainPct / 30), floor at 5%
-        // SL = ATH × (1 − gap). Only moves UP (ratchet via Math.max).
+        // ── SL TRAIL — integer arithmetic (float-safe, Nov-20) ──────────
+        // pos.slTrailMode = '30' (default): 30%→25%→20%→15%→10%→5% per 30% ATH gain
+        // pos.slTrailMode = '50': flat 50% until +50% ATH gain, then −5% per +20% gain
+        // SL = ATH × (1 − gapPct/100). Only moves UP (ratchet via Math.max).
+        // Integer comparisons prevent JS float drift (0.30−0.05−0.05 ≠ 0.20 exactly).
         const ATH        = currentPeak;
         const ATHGainPct = (ATH - pos.entryPrice) / pos.entryPrice * 100;
-        const gap        = Math.max(0.05, 0.30 - Math.floor(ATHGainPct / 30) * 0.05);
+        const posMode    = pos.slTrailMode || '30';
+
+        // Work in integer percentages — no floating-point drift
+        let gapPct;
+        if (posMode === '50') {
+          // Wide system: flat 50% until capital recovered (+50%), then −5% per +20% ATH gain
+          gapPct = Math.max(5, 50 - Math.max(0, Math.floor((ATHGainPct - 50) / 20)) * 5);
+        } else {
+          // Tight system: −5% per +30% ATH gain, starting at 30%
+          gapPct = Math.max(5, 30 - Math.floor(ATHGainPct / 30) * 5);
+        }
+        const gap = gapPct / 100;
 
         newSL = Math.max(pos.currentSL ?? 0, ATH * (1 - gap));
 
-        // Persist trail state; notify on tighten
-        const prevGap = pos.trailPct != null ? pos.trailPct / 100 : 0.30;
-        if (gap < prevGap) {
-          updates.trailPct    = gap * 100;
+        // Persist trail state; notify on tighten — integer comparison, no float drift
+        const prevGapPct = pos.trailPct != null ? Math.round(pos.trailPct) : (posMode === '50' ? 50 : 30);
+        if (gapPct < prevGapPct) {
+          updates.trailPct    = gapPct;
           updates.tightenBase = ATH;
-          pos.trailPct        = gap * 100;
+          pos.trailPct        = gapPct;
           pos.tightenBase     = ATH;
           sendTelegram(`📐 *SL TIGHTENED — ${pos.symbol}*\n` +
-            `Gap: ${(prevGap*100).toFixed(0)}% → *${(gap*100).toFixed(0)}%* | Floor: 5%\n` +
+            `Gap: ${prevGapPct}% → *${gapPct}%* | Floor: 5%\n` +
             `ATH: $${fmtPrice(ATH)} | Gain: +${ATHGainPct.toFixed(1)}%\n🔗 [Chart](${pos.dexUrl})`
           ).catch(() => {});
         }
@@ -7176,6 +7225,7 @@ async function main() {
   lpLockBypass          = !!startCfg.lpOpen;
   strategyFiltersActive = !(startCfg.stratsSkipped ?? true); // Nov-19: default OFF — only age/mcap guards active
   autoEntryPaused          = !!startCfg.autoEntryPaused;
+  slTrailMode              = startCfg.slTrailMode || '30';
   diagnosticMode           = !!startCfg.diagnosticMode;
   diagnosticTradeCount     = startCfg.diagTradeCount || 0;
   lastAnnouncedPeriodKey   = startCfg.currentPeriod?.key || null; // don't re-announce on restart
