@@ -3695,28 +3695,49 @@ async function pollTelegramCommands() {
         }
       }
 
-      // ── /close SYMBOL — sell one specific position by symbol ─────────────────
+      // ── /close SYMBOL|ADDRESS — sell one specific position ───────────────────
+      // /close ONI          → closes by symbol (if unique)
+      // /close <CA>         → closes by full token address (always precise)
+      // If symbol matches multiple positions, bot lists them with short addresses
+      // so the user can re-send with the full CA to pick the right one.
       if (text.startsWith('/close ')) {
-        const targetSymbol = text.slice('/close '.length).trim().toUpperCase();
-        if (!targetSymbol) {
-          await sendTelegram('❌ Usage: `/close ONI` — provide the token symbol.');
+        const closeArg = rawText.slice('/close '.length).trim(); // preserve case for CA
+        if (!closeArg) {
+          await sendTelegram('❌ Usage:\n`/close ONI` — close by symbol\n`/close <token address>` — close by contract address (precise)');
         } else {
           const allPos = await getOpenPositions();
-          const matches = allPos.filter(p => (p.symbol || '').toUpperCase() === targetSymbol);
+          // Try exact address match first (CA provided)
+          let matches = allPos.filter(p => (p.address || '').toLowerCase() === closeArg.toLowerCase());
+          // Fall back to symbol match
           if (!matches.length) {
-            await sendTelegram(`❌ No open position found for *${targetSymbol}*.\nCheck spelling or use /clearall to close everything.`);
+            matches = allPos.filter(p => (p.symbol || '').toUpperCase() === closeArg.toUpperCase());
+          }
+          if (!matches.length) {
+            await sendTelegram(`❌ No open position found for *${closeArg}*.\nCheck spelling or use /clearall to close everything.`);
+          } else if (matches.length > 1) {
+            // Multiple positions with same symbol — list them so user can pick by CA
+            const lines = matches.map((p, i) => {
+              const gain = p.entryPrice ? ((( p.currentPrice || p.entryPrice) - p.entryPrice) / p.entryPrice * 100).toFixed(1) : '?';
+              return `${i + 1}. *${p.symbol}* · ${gain}% · \`${p.address}\``;
+            }).join('\n');
+            await sendTelegram(
+              `⚠️ *${matches.length} positions found for ${closeArg.toUpperCase()}*\n\n` +
+              `${lines}\n\n` +
+              `Re-send with the full address to close a specific one:\n` +
+              `\`/close <address>\``
+            );
           } else {
-            for (const pos of matches) {
-              try {
-                const price   = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
-                const exitPnl = (price - pos.entryPrice) / pos.entryPrice * (pos.size || POSITION_SIZE) * (pos.remaining || 1);
-                const pnl     = (pos.pnl || 0) + exitPnl;
-                await sendTelegram(`⏳ Closing *${pos.symbol}* at $${fmtPrice(price)}…`);
-                const _result = await realClose(pos, price, 'MANUAL_CLOSE_CMD', pnl);
-                if (!_result?.ok) {
-                  await sendTelegram(`⛔ Close failed for *${pos.symbol}* — try again or use /clearall.`);
-                  continue;
-                }
+            // Exactly one match — close it
+            const pos = matches[0];
+            try {
+              const price   = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
+              const exitPnl = (price - pos.entryPrice) / pos.entryPrice * (pos.size || POSITION_SIZE) * (pos.remaining || 1);
+              const pnl     = (pos.pnl || 0) + exitPnl;
+              await sendTelegram(`⏳ Closing *${pos.symbol}* at $${fmtPrice(price)}…`);
+              const _result = await realClose(pos, price, 'MANUAL_CLOSE_CMD', pnl);
+              if (!_result?.ok) {
+                await sendTelegram(`⛔ Close failed for *${pos.symbol}* — try again or use /clearall.`);
+              } else {
                 await updateDailyStats(exitPnl, exitPnl > 0, false, calcExitFeeUsd(pos, price, price, pos.remaining || 1, _result.exitImpactPct), pos.strategyId ?? null);
                 enteredToday.delete(pos.address);
                 const pnlStr = exitPnl >= 0
@@ -3728,10 +3749,10 @@ async function pollTelegramCommands() {
                   `P&L: *${pnlStr}*\n` +
                   `${_result.txHash ? `📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
                 );
-              } catch(e) {
-                console.error(`[CLOSE CMD] Failed for ${pos.symbol}:`, e.message);
-                await sendTelegram(`⛔ Error closing *${pos.symbol}*: ${e.message}`);
               }
+            } catch(e) {
+              console.error(`[CLOSE CMD] Failed for ${pos.symbol}:`, e.message);
+              await sendTelegram(`⛔ Error closing *${pos.symbol}*: ${e.message}`);
             }
           }
         }
