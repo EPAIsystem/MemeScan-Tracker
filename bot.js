@@ -3695,6 +3695,49 @@ async function pollTelegramCommands() {
         }
       }
 
+      // ── /close SYMBOL — sell one specific position by symbol ─────────────────
+      if (text.startsWith('/close ')) {
+        const targetSymbol = text.slice('/close '.length).trim().toUpperCase();
+        if (!targetSymbol) {
+          await sendTelegram('❌ Usage: `/close ONI` — provide the token symbol.');
+        } else {
+          const allPos = await getOpenPositions();
+          const matches = allPos.filter(p => (p.symbol || '').toUpperCase() === targetSymbol);
+          if (!matches.length) {
+            await sendTelegram(`❌ No open position found for *${targetSymbol}*.\nCheck spelling or use /clearall to close everything.`);
+          } else {
+            for (const pos of matches) {
+              try {
+                const price   = await getCurrentPrice(pos.address, pos.chain) || pos.entryPrice;
+                const exitPnl = (price - pos.entryPrice) / pos.entryPrice * (pos.size || POSITION_SIZE) * (pos.remaining || 1);
+                const pnl     = (pos.pnl || 0) + exitPnl;
+                await sendTelegram(`⏳ Closing *${pos.symbol}* at $${fmtPrice(price)}…`);
+                const _result = await realClose(pos, price, 'MANUAL_CLOSE_CMD', pnl);
+                if (!_result?.ok) {
+                  await sendTelegram(`⛔ Close failed for *${pos.symbol}* — try again or use /clearall.`);
+                  continue;
+                }
+                await updateDailyStats(exitPnl, exitPnl > 0, false, calcExitFeeUsd(pos, price, price, pos.remaining || 1, _result.exitImpactPct), pos.strategyId ?? null);
+                enteredToday.delete(pos.address);
+                const pnlStr = exitPnl >= 0
+                  ? `+$${exitPnl.toFixed(2)} ✅`
+                  : `-$${Math.abs(exitPnl).toFixed(2)} ❌`;
+                await sendTelegram(
+                  `🚫 *CLOSED — ${pos.symbol}*\n\n` +
+                  `Exit price: $${fmtPrice(price)}\n` +
+                  `P&L: *${pnlStr}*\n` +
+                  `${_result.txHash ? `📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
+                );
+              } catch(e) {
+                console.error(`[CLOSE CMD] Failed for ${pos.symbol}:`, e.message);
+                await sendTelegram(`⛔ Error closing *${pos.symbol}*: ${e.message}`);
+              }
+            }
+          }
+        }
+        continue;
+      }
+
       // ── /clearall — force-close every open position ───────────────────────────
       if (text === '/clearall') {
         const allPos = await getOpenPositions();
