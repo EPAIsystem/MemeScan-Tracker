@@ -2017,7 +2017,7 @@ async function enterPosition(coin, overrides = {}) {
   } else if (overrides.sl == null) {
     const swingResult = await analyzeSwingData(coin.pairAddress, coin.ageMinutes, effectiveEntry, isGroupA);
     skipEntry = swingResult.skipEntry;                   // Nov-19: keep range gate — skip if at top of range
-    swingSL   = effectiveEntry * 0.50;                  // Nov-19: 3-phase SL — 50% trail from entry for all modes
+    swingSL   = effectiveEntry * 0.70;                  // Nov-20: 30% gap from entry for all modes
   }
 
   if (skipEntry) {
@@ -2064,7 +2064,7 @@ async function enterPosition(coin, overrides = {}) {
     // Age at entry — reference only
     coinAgeDays: coin.ageDays || 0,
     // Universal progressive trail state — gap % of ATH gain given back (Phase 3)
-    trailPct:    null,   // current gap % × 100 (50 → 45 → 40 → 35 … → 10)
+    trailPct:    30,     // current gap % × 100 (30 → 25 → 20 → 15 → 10 → 5 floor)
     tightenBase: null,   // ATH at last tighten event
     // Progressive withdrawal tracking (Nov-12)
     originalPositionSize: posSize,  // dollar amount at entry — used for $20 withdrawal calc
@@ -5124,7 +5124,7 @@ async function detectAndRecoverOrphans(force = false) {
           address:           orphan.mintAddress,
           chain:             'solana',
           entryPrice:        price,
-          currentSL:         price * 0.50,
+          currentSL:         price * 0.70,
           peakPrice:         price,
           size:              usdValue,
           remaining:         1.0,
@@ -5809,11 +5809,11 @@ async function monitorPositions() {
             await updatePosition(pos.id, capUpdates);
             await updateDailyStats(partPnL, true, isManual, calcExitFeeUsd(pos, price, exitFillPrice, capitalFrac, _cSell.exitImpactPct), pos.strategyId ?? null);
             Object.assign(pos, capUpdates);
-            alertMsg = `🛡️ *CAPITAL RECOVERED*\n\n` +
+            alertMsg = `🛡️ *CAPITAL RECOVERED — TP1*\n\n` +
               `*${pos.symbol}* ${pos.strategyLabel}\n` +
-              `📥 Entry: $${fmtPrice(pos.entryPrice)} | Trigger: +50% (house money)\n` +
+              `📥 Entry: $${fmtPrice(pos.entryPrice)} | Trigger: +50%\n` +
               `💰 Sold ${(capitalFrac * 100).toFixed(1)}% → recovered $${newRecovered.toFixed(2)}\n` +
-              `🎯 ${(newRemaining * 100).toFixed(1)}% remains — SL tightens 5%/+20% → 5% floor\n` +
+              `🎯 ${(newRemaining * 100).toFixed(1)}% remains — TP2 at ${fmtPrice(pos.entryPrice * 3)} (3×) · then SL trail only\n` +
               `🔗 [Chart](${pos.dexUrl})` +
               `${_cSell.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_cSell.txHash})` : ''}`;
           }
@@ -5890,6 +5890,40 @@ async function monitorPositions() {
             console.log(`[BOT] PROFIT_WITHDRAWAL ${newCount}/5 ${pos.symbol}: +${gainPct.toFixed(1)}%, sold ${(closeRatio*100).toFixed(1)}%, locked $${partPnL.toFixed(2)}`);
           }
         }
+      }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ── TP2: remaining doubles from TP1 (price = entry × 3.0) ───────────
+    // After capital recovery (+50%), when price reaches 3× entry the remaining
+    // stake (≈33% of original) has doubled in value. Sell 50% of what's left
+    // → lock that gain. Only SL trail kills the final piece after this.
+    // ══════════════════════════════════════════════════════════════════════
+    if (pos.capitalWithdrawn && !pos.tp2Hit && price >= pos.entryPrice * 3.0 && pos.remaining > 0.01) {
+      const tp2Frac      = pos.remaining * 0.50;   // 50% of what's left (of original position)
+      const tp2FillPrice = pos.tradingMode === 'paper'
+        ? simulateFillPrice(price, pos.size * tp2Frac, pos.liquidityAtEntry || 0, false)
+        : exitFillPrice;
+      const tp2Gain      = (tp2FillPrice - pos.entryPrice) / pos.entryPrice;
+      const tp2PnL       = tp2Gain * pos.size * tp2Frac;
+      const newRemaining = +(pos.remaining - tp2Frac).toFixed(6);
+      const tp2Updates   = {
+        tp2Hit:    true,
+        remaining: newRemaining,
+        pnl:       (pos.pnl || 0) + tp2PnL,
+      };
+      const _tp2Sell = await realPartialSell(pos, tp2Frac, tp2FillPrice);
+      if (_tp2Sell.ok) {
+        await updatePosition(pos.id, tp2Updates);
+        await updateDailyStats(tp2PnL, true, isManual, calcExitFeeUsd(pos, price, tp2FillPrice, tp2Frac, _tp2Sell.exitImpactPct), pos.strategyId ?? null);
+        Object.assign(pos, tp2Updates);
+        alertMsg = `💰 *PROFIT SECURED — TP2*\n\n` +
+          `*${pos.symbol}* ${pos.strategyLabel}\n` +
+          `📥 Entry: $${fmtPrice(pos.entryPrice)} | Now: +${gainPct.toFixed(1)}%\n` +
+          `💸 Sold ${(tp2Frac * 100).toFixed(1)}% → locked *$${tp2PnL.toFixed(2)}*\n` +
+          `🎯 ${(newRemaining * 100).toFixed(1)}% remains — SL trail only from here\n` +
+          `🔗 [Chart](${pos.dexUrl})` +
+          `${_tp2Sell.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_tp2Sell.txHash})` : ''}`;
       }
     }
 
@@ -5974,12 +6008,14 @@ async function monitorPositions() {
     // ─────────────────────────────────────────────────────────────────────────
 
     // ══════════════════════════════════════════════════════════════════════
-    // ── SL TRAIL — 3-phase system (Nov-19) ───────────────────────────────
-    // Phase 1 (before capital recovery):   SL = ATH × 0.50 flat trail
-    // Phase 2 (at +50% gain):              capital recovered, flag set
-    // Phase 3 (after capital recovery):    SL = ATH × (1 − trailPct)
-    //   trailPct starts 50%, tightens 5% per +20% ATH gain, floor 5%
-    //   +50%→50%, +70%→45%, +90%→40%, +110%→35% … +230%→5%
+    // ── SL TRAIL — 6-phase tightening (Nov-20) ───────────────────────────
+    // ATH gain:  0–30%  → gap 30%  SL = ATH × 0.70
+    //           30–60%  → gap 25%  SL = ATH × 0.75
+    //           60–90%  → gap 20%  SL = ATH × 0.80
+    //          90–120%  → gap 15%  SL = ATH × 0.85
+    //         120–150%  → gap 10%  SL = ATH × 0.90
+    //            150%+  → gap  5%  SL = ATH × 0.95  ← floor
+    // SL only ever moves UP (ratchet). No separate phase for capital recovery.
     // Diagnostic: Phase 1 (ATHGain<30%) = ATH×0.50; Phase 2 = 60% gap trail
     // Moon bag: flat 20% below ATH — SL = ATH × 0.80. Never comes down.
     // ══════════════════════════════════════════════════════════════════════
@@ -6010,43 +6046,26 @@ async function monitorPositions() {
         newSL = currentPeak * 0.80;
 
       } else {
-        // ── 3-PHASE SL SYSTEM (Nov-19) ────────────────────────────────────
-        // Phase 1 (before capital recovery): SL = ATH × 0.50 flat trail
-        // Phase 3 (after capital recovery):  tighten 5% per +20% ATH gain, floor 5%
-        //   +50%→50%, +70%→45%, +90%→40%, +110%→35% … +230%→5%
-        // Nov-19 fix: Phase 3 activates by ATH PRICE LEVEL (≥+50%), not sell success.
-        // Nov-19 fix: Rising break-even floor — once ATH ≥ +20%, SL never drops below entry.
+        // ── 6-PHASE SL TRAIL (Nov-20) ────────────────────────────────────
+        // gap = 30% − 5% × floor(ATHGainPct / 30), floor at 5%
+        // SL = ATH × (1 − gap). Only moves UP (ratchet via Math.max).
         const ATH        = currentPeak;
         const ATHGainPct = (ATH - pos.entryPrice) / pos.entryPrice * 100;
-        let trailPct;
-        // Phase 3 triggers at ATH ≥ +50% regardless of whether capital sell succeeded
-        const capitalPhase = pos.capitalWithdrawn || ATHGainPct >= 50;
-        if (capitalPhase) {
-          const steps = Math.max(0, Math.floor((ATHGainPct - 50) / 20));
-          trailPct = Math.max(0.05, 0.50 - steps * 0.05);
-        } else {
-          trailPct = 0.50;
-        }
-        newSL = ATH * (1 - trailPct);
-        // Rising floor: once ATH confirms a real move (≥+20%), SL can never go below entry
-        const risingFloor = ATHGainPct >= 20
-          ? Math.max(slFloor, pos.entryPrice)
-          : slFloor;
-        newSL = Math.max(risingFloor, newSL);
+        const gap        = Math.max(0.05, 0.30 - Math.floor(ATHGainPct / 30) * 0.05);
+
+        newSL = Math.max(pos.currentSL ?? 0, ATH * (1 - gap));
 
         // Persist trail state; notify on tighten
-        const prevGap = pos.trailPct != null ? pos.trailPct / 100 : 0.50;
-        if (trailPct !== prevGap) {
-          updates.trailPct    = trailPct * 100;
+        const prevGap = pos.trailPct != null ? pos.trailPct / 100 : 0.30;
+        if (gap < prevGap) {
+          updates.trailPct    = gap * 100;
           updates.tightenBase = ATH;
-          pos.trailPct        = trailPct * 100;
+          pos.trailPct        = gap * 100;
           pos.tightenBase     = ATH;
-          if (trailPct < prevGap) {
-            sendTelegram(`📐 *SL TIGHTENED — ${pos.symbol}*\n` +
-              `Gap: ${(prevGap*100).toFixed(0)}% → *${(trailPct*100).toFixed(0)}%* | Floor: 5%\n` +
-              `ATH: $${fmtPrice(ATH)} | Gain: +${ATHGainPct.toFixed(1)}%\n🔗 [Chart](${pos.dexUrl})`
-            ).catch(() => {});
-          }
+          sendTelegram(`📐 *SL TIGHTENED — ${pos.symbol}*\n` +
+            `Gap: ${(prevGap*100).toFixed(0)}% → *${(gap*100).toFixed(0)}%* | Floor: 5%\n` +
+            `ATH: $${fmtPrice(ATH)} | Gain: +${ATHGainPct.toFixed(1)}%\n🔗 [Chart](${pos.dexUrl})`
+          ).catch(() => {});
         }
       }
 
