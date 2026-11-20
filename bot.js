@@ -3533,7 +3533,7 @@ async function pollTelegramCommands() {
               const pos = await enterPosition(ms.coin);
               if (!pos) {
                 enteredToday.delete(addr);
-                await sendTelegram(`❌ *ENTRY FAILED — ${ms.coin.symbol}*\nNo matching wallet for chain ${ms.coin.chain}.`);
+                // enterPosition already sent its own error message — don't add a duplicate
               } else {
                 alertCooldown.set(addr, Date.now());
                 positions.push(pos);
