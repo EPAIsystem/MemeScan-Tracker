@@ -1045,6 +1045,7 @@ let scanCount = 0;
 // Daily loss limit state — set true when limit hit, cleared on /restart
 let dayHaltedToday      = false;
 let globalGatesBypass   = false; // /skipgates toggle — bypasses all global filters for diagnostics
+let tierGateBypass      = false; // /skiptiers toggle — bypasses tiered entry gates only (default ON)
 let lpLockBypass        = false; // /skiplp toggle  — bypasses filterByLpLock() for diagnostics
 let autoEntryPaused     = false; // /pauseentry toggle — signals alert but bot skips auto-entry
 let telegramOffset      = 0; // for Telegram command polling
@@ -1197,6 +1198,7 @@ async function saveBypassFlags() {
     _tradingCfg = null; // bust config cache so next read picks up fresh values
     await db.collection('paper_config').doc('control').set({
       gatesOpen:        globalGatesBypass,
+      tierGateOpen:     tierGateBypass,
       lpOpen:           lpLockBypass,
       stratsSkipped:    !strategyFiltersActive,
       autoEntryPaused:  autoEntryPaused,
@@ -4078,6 +4080,25 @@ async function pollTelegramCommands() {
         continue;
       }
 
+      // ── /skiptiers — toggle tiered entry-gate bypass ────────────────────────────
+      if (text === '/skiptiers') {
+        tierGateBypass = !tierGateBypass;
+        await saveBypassFlags();
+        const state = tierGateBypass ? 'OFF 🚫' : 'ON ✅';
+        const icon  = tierGateBypass ? '⚠️' : '✅';
+        await sendTelegram(
+          `${icon} *TIER GATES: ${state}*\n\n` +
+          (tierGateBypass
+            ? `Tiered entry gates are now *bypassed* (saved — survives restarts).\n\n` +
+              `Bypassed: age and buy/sell minimums per position-size tier ($1–$4, $5–$9, $10–$19, $20–$49, $50+).\n\n` +
+              `⚠️ _Send /skiptiers again to restore._`
+            : `Tiered entry gates *restored* (saved — survives restarts).\n\n` +
+              `Coins now must meet age/activity requirements for their position-size tier before entry.`
+          )
+        );
+        continue;
+      }
+
       // ── /skipstrats — toggle per-strategy filter bypass ─────────────────────────
       if (text === '/skipstrats') {
         strategyFiltersActive = !strategyFiltersActive;
@@ -6576,6 +6597,7 @@ async function scanForEntries() {
     const g = gateStats;
     const bypassNote = [
       globalGatesBypass      ? 'GLOBAL BYPASSED' : '',
+      tierGateBypass         ? 'TIERS BYPASSED'  : '',
       !strategyFiltersActive ? 'STRATS BYPASSED' : '',
       lpLockBypass           ? 'LP BYPASSED'     : '',
     ].filter(Boolean).join(' + ');
@@ -6695,9 +6717,10 @@ async function scanForEntries() {
       `${nearMissCount} near-misses (score ${MIN_SCORE - 8}-${scoreThreshold - 1})` +
       gateSection +
       simSection +
-      (globalGatesBypass || lpLockBypass || !strategyFiltersActive
+      (globalGatesBypass || tierGateBypass || lpLockBypass || !strategyFiltersActive
         ? `\n\n🔓 *OPEN MODE ACTIVE*` +
           (globalGatesBypass      ? `\n⚠️ Global gates: BYPASSED (/skipgates to restore)`  : '') +
+          (tierGateBypass         ? `\n⚠️ Tier gates: BYPASSED (/skiptiers to restore)`    : '') +
           (lpLockBypass           ? `\n⚠️ LP/RugCheck: BYPASSED (/skiplp to restore)`       : '') +
           (!strategyFiltersActive ? `\n⚠️ Strategy filters: OFF (/skipstrats to restore)`   : '') +
           `\n_/openmode to restore all at once_`
@@ -6790,7 +6813,7 @@ async function scanForEntries() {
         if (_age < 20) _tierBlock = `age ${_age.toFixed(1)}min < 20 (tier $50+)`;
       }
 
-      if (_tierBlock && !diagnosticMode && !globalGatesBypass) { // Nov-19: bypassed when gates open
+      if (_tierBlock && !diagnosticMode && !globalGatesBypass && !tierGateBypass) {
         console.log(`[TIER-GATE] BLOCKED ${coin.symbol} — ${_tierBlock} (dynSize=$${_sz.toFixed(2)} ceiling=$${_entryCeiling})`);
         usedThisScan.add(coin.addr);
         continue;
@@ -7041,7 +7064,8 @@ async function main() {
 
   // ── Restore persisted bypass flags (Nov-12) ────────────────────────────────
   // Flags are now saved to Firestore so they survive restarts.
-  globalGatesBypass     = startCfg.gatesOpen ?? true;  // Nov-19: default open — diagnostic-style run
+  globalGatesBypass     = startCfg.gatesOpen ?? false;
+  tierGateBypass        = startCfg.tierGateOpen ?? false; // default false = tier gate ON
   lpLockBypass          = !!startCfg.lpOpen;
   strategyFiltersActive = !(startCfg.stratsSkipped ?? true); // Nov-19: default OFF — only age/mcap guards active
   autoEntryPaused          = !!startCfg.autoEntryPaused;
