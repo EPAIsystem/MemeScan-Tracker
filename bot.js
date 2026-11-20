@@ -1704,28 +1704,47 @@ async function executeRealSell(pos, wallet, sellFrac, exitPrice) {
       console.log(`[REAL] SELL ${pos.symbol} | fallback stored: ${tokensToSell}`);
     }
 
-    const quote = await jupiterQuote(pos.address, SOL_MINT, tokensToSell.toString(), 200); // 2% slippage
-    if (!quote) return { txHash: null, executedPrice: exitPrice, error: 'Jupiter quote failed' };
+    // ── Step 1: probe quote at min slippage to read priceImpactPct ──
+    const probeQuote = await jupiterQuote(pos.address, SOL_MINT, tokensToSell.toString(), 200);
+    if (!probeQuote) return { txHash: null, executedPrice: exitPrice, error: 'Jupiter quote failed' };
 
-    // ── PRICE IMPACT GUARD — warn if selling into thin liquidity ──
-    const MAX_SELL_IMPACT = 0.02; // 2% — warn but always proceed (position must close)
-    const impactSell = parseFloat(quote.priceImpactPct || 0);
-    if (impactSell > MAX_SELL_IMPACT) {
-      const impactStr = (impactSell * 100).toFixed(2);
-      console.warn(`[REAL] ⚠️  High sell impact ${impactStr}% for ${pos.symbol} — proceeding`);
+    // ── Step 2: dynamic slippage — 2× impact, min 2%, max 50% ──
+    const impactSell = parseFloat(probeQuote.priceImpactPct || 0);
+    const dynamicSlippageBps = Math.max(200, Math.min(5000, Math.ceil(impactSell * 20000)));
+    const impactStr = (impactSell * 100).toFixed(2);
+
+    let finalQuote = probeQuote;
+    if (dynamicSlippageBps > 200) {
+      console.log(`[REAL] 🔄 Dynamic slippage for ${pos.symbol}: impact ${impactStr}% → ${dynamicSlippageBps} bps`);
       await sendTelegram(
-        `⚠️ *HIGH IMPACT SELL — ${pos.symbol}*\n\n` +
-        `Selling into thin liquidity — price impact *${impactStr}%*\n` +
-        `Proceeding anyway.`
-      );
+        `⚠️ *Thin liquidity — ${pos.symbol}*\n\n` +
+        `Price impact *${impactStr}%* — adjusting slippage to *${(dynamicSlippageBps / 100).toFixed(1)}%* for sell.`
+      ).catch(() => {});
+      const reqote = await jupiterQuote(pos.address, SOL_MINT, tokensToSell.toString(), dynamicSlippageBps);
+      if (reqote) finalQuote = reqote;
     }
 
-    const swapTx = await jupiterGetSwapTx(quote, keypair.publicKey.toBase58());
+    // ── Step 3: build and send swap TX ──
+    const swapTx = await jupiterGetSwapTx(finalQuote, keypair.publicKey.toBase58());
     if (!swapTx) return { txHash: null, executedPrice: exitPrice, error: 'Jupiter swap TX failed' };
 
-    const sig = await sendViaRpc(swapTx, keypair);
+    let sig;
+    try {
+      sig = await sendViaRpc(swapTx, keypair);
+    } catch (txErr) {
+      // ── Step 4: one retry at 1.5× slippage (block height expired / RPC glitch) ──
+      const retryBps = Math.min(5000, Math.ceil(dynamicSlippageBps * 1.5));
+      console.warn(`[REAL] ⚠️ Sell TX failed for ${pos.symbol} (${txErr.message}) — retrying at ${retryBps} bps`);
+      const retryQuote = await jupiterQuote(pos.address, SOL_MINT, tokensToSell.toString(), retryBps);
+      if (!retryQuote) throw txErr;
+      const retryTx = await jupiterGetSwapTx(retryQuote, keypair.publicKey.toBase58());
+      if (!retryTx) throw txErr;
+      sig = await sendViaRpc(retryTx, keypair);
+      console.log(`[REAL] ✅ Retry SELL TX succeeded at ${retryBps} bps`);
+    }
+
     console.log(`[REAL] ✅ SELL TX confirmed: https://solscan.io/tx/${sig}`);
-    const exitImpactPct = parseFloat(quote.priceImpactPct || 0) * 100;
+    const exitImpactPct = impactSell * 100;
     return { txHash: sig, executedPrice: exitPrice, exitImpactPct, jitoTipUsd: 0 };
   } catch(e) {
     console.error(`[REAL] SELL failed for ${pos.symbol}:`, e.message);
