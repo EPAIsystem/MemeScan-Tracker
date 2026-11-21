@@ -1056,6 +1056,13 @@ let autoEntryPaused     = false; // /pauseentry toggle — signals alert but bot
 let slTrailMode         = '30';  // /slbase toggle — SL trail base: '30' = tight 6-phase | '50' = wide phase
 let telegramOffset      = 0; // for Telegram command polling
 
+// ─── TREND-CONFIRMED ADDRESSES (partial-auto mode) ───────────────────────────
+// Coins that have been in a position (any exit — TP or SL) are added here.
+// In manual mode, these coins bypass the manual gate and auto-enter if they
+// re-qualify through normal scan filters ("partial auto" behaviour).
+// Populated from today's history on startup; updated live on every close.
+const trendConfirmedAddrs = new Set();
+
 // ─── TRADING PERIODS ──────────────────────────────────────────────────────────
 // 4 non-overlapping UTC windows. autoMode=true → bot switches to AUTO at boundary.
 // autoMode=false → bot switches to MANUAL. User can override within a period;
@@ -2358,6 +2365,12 @@ async function updatePosition(id, data) {
 async function closePosition(id, data) {
   const { positions, history } = await getCollections();
   const closeData = { ...data, status: 'closed', closedAt: Date.now() };
+  // Track address for partial-auto (trend-confirmed re-entry in manual mode)
+  if (_posCache) {
+    const closing = _posCache.find(p => p.id === id);
+    const addr = ((closing?.address || data?.address) || '').toLowerCase();
+    if (addr) trendConfirmedAddrs.add(addr);
+  }
   // Remove from cache BEFORE the async Firestore write so a concurrent monitor
   // tick that starts during the await doesn't see this position as still open
   // and fire a second close / duplicate notification.
@@ -7013,51 +7026,62 @@ async function scanForEntries() {
 
     // ── MANUAL MODE: send signal with inline Enter / Skip buttons ────────────────
     // Diagnostic mode bypasses the pause — research trial must enter positions freely.
+    // PARTIAL-AUTO: trend-confirmed coins (previously in a position today) bypass the
+    // manual gate and auto-enter even in manual mode — they've already proven themselves.
     if (autoEntryPaused && !diagnosticMode) {
-      usedThisScan.add(coin.addr);
+      const isTrendConfirmed = trendConfirmedAddrs.has((coin.addr || '').toLowerCase());
 
-      // Update (or create) the 5-min window state for this coin
-      const existing  = manualAlertState.get(coin.addr);
-      const alertState = existing || { count: 0, windowStart: Date.now(), coin, s, skipped: false };
-      alertState.count++;
-      alertState.coin = coin;   // freshen coin data each alert
-      alertState.s    = s;
-      manualAlertState.set(coin.addr, alertState);
+      if (!isTrendConfirmed) {
+        // ── Unknown coin in manual mode → show Enter / Skip buttons ────────────
+        usedThisScan.add(coin.addr);
 
-      const alertN    = alertState.count;
-      const msLeft    = Math.max(1, Math.ceil((MANUAL_WINDOW_MS - (Date.now() - alertState.windowStart)) / 60000));
-      const header    = alertN === 1
-        ? `🎯 *MANUAL SIGNAL — tap to enter*`
-        : `🔔 *SIGNAL (${alertN}/${MANUAL_MAX_ALERTS}) — still qualifying*`;
+        // Update (or create) the 5-min window state for this coin
+        const existing   = manualAlertState.get(coin.addr);
+        const alertState = existing || { count: 0, windowStart: Date.now(), coin, s, skipped: false };
+        alertState.count++;
+        alertState.coin = coin;   // freshen coin data each alert
+        alertState.s    = s;
+        manualAlertState.set(coin.addr, alertState);
 
-      const posSize = calcDynamicPositionSize(coin.liq || 0, coin.mcap || 0, _entryCeiling);
+        const alertN  = alertState.count;
+        const msLeft  = Math.max(1, Math.ceil((MANUAL_WINDOW_MS - (Date.now() - alertState.windowStart)) / 60000));
+        const header  = alertN === 1
+          ? `🎯 *MANUAL SIGNAL — tap to enter*`
+          : `🔔 *SIGNAL (${alertN}/${MANUAL_MAX_ALERTS}) — still qualifying*`;
 
-      await sendTelegramWithButtons(
-        `${header}\n\n` +
-        `*${coin.symbol}* — ${coin.name}\n` +
-        `${s.label} · Score: *${coin.score}/100*\n` +
-        `${pumpBadge}` +
-        `${trendBadge}` +
-        `${pullbackBadge}` +
-        `${explosiveBadge}` +
-        `${rangeReentryBadge}` +
-        `${taBadge}` +
-        `💡 ${s.desc}\n\n` +
-        `💵 Price: $${fmtPrice(coin.price)}\n` +
-        `💰 Est. size: $${posSize.toFixed(0)}\n` +
-        `📊 Buy%: ${coin.buyPct.toFixed(0)}% | Liq: $${(coin.liq/1000).toFixed(0)}k\n` +
-        `📈 Age: ${ageLabel} | m5: ${coin.m5Ch>0?'+':''}${coin.m5Ch.toFixed(1)}% | h1: ${coin.ch1!=null?(coin.ch1>0?'+':'')+coin.ch1.toFixed(1)+'%':'<1h'}\n\n` +
-        `🔗 [Chart](${coin.dexUrl})\n` +
-        `⏳ _Window: ~${msLeft}min left_`,
-        [
+        const posSize = calcDynamicPositionSize(coin.liq || 0, coin.mcap || 0, _entryCeiling);
+
+        await sendTelegramWithButtons(
+          `${header}\n\n` +
+          `*${coin.symbol}* — ${coin.name}\n` +
+          `${s.label} · Score: *${coin.score}/100*\n` +
+          `${pumpBadge}` +
+          `${trendBadge}` +
+          `${pullbackBadge}` +
+          `${explosiveBadge}` +
+          `${rangeReentryBadge}` +
+          `${taBadge}` +
+          `💡 ${s.desc}\n\n` +
+          `💵 Price: $${fmtPrice(coin.price)}\n` +
+          `💰 Est. size: $${posSize.toFixed(0)}\n` +
+          `📊 Buy%: ${coin.buyPct.toFixed(0)}% | Liq: $${(coin.liq/1000).toFixed(0)}k\n` +
+          `📈 Age: ${ageLabel} | m5: ${coin.m5Ch>0?'+':''}${coin.m5Ch.toFixed(1)}% | h1: ${coin.ch1!=null?(coin.ch1>0?'+':'')+coin.ch1.toFixed(1)+'%':'<1h'}\n\n` +
+          `🔗 [Chart](${coin.dexUrl})\n` +
+          `⏳ _Window: ~${msLeft}min left_`,
           [
-            { text: `✅ Enter Trade ($${posSize.toFixed(0)})`, callback_data: `manual_enter:${coin.addr}` },
-            { text: `❌ Skip`,                                  callback_data: `manual_skip:${coin.addr}`  },
+            [
+              { text: `✅ Enter Trade ($${posSize.toFixed(0)})`, callback_data: `manual_enter:${coin.addr}` },
+              { text: `❌ Skip`,                                  callback_data: `manual_skip:${coin.addr}`  },
+            ]
           ]
-        ]
-      );
-      console.log(`[MANUAL] ${coin.symbol} alert ${alertN}/${MANUAL_MAX_ALERTS} (${msLeft}min left in window)`);
-      continue;
+        );
+        console.log(`[MANUAL] ${coin.symbol} alert ${alertN}/${MANUAL_MAX_ALERTS} (${msLeft}min left in window)`);
+        continue;
+      }
+
+      // ── Trend-confirmed in manual mode → auto-enter (partial auto) ─────────
+      coin._trendReentry = true;
+      console.log(`[PARTIAL-AUTO] ${coin.symbol} — trend confirmed, auto-entering in manual mode`);
     }
 
     // Reserve coin BEFORE the async enterPosition call — a concurrent scan tick
@@ -7075,9 +7099,13 @@ async function scanForEntries() {
     slotCount[coin.strategy.id]++;
     if (coin._rangeReentry) rangeReentryWatchlist.delete(coin.addr); // watchlist fulfilled
 
-    const modeHeader = pos.tradingMode === 'real'
-      ? `💰 *BOT ENTERED — REAL TRADE*`
-      : `✅ *BOT ENTERED — PAPER TRADE*`;
+    const modeHeader = coin._trendReentry
+      ? (pos.tradingMode === 'real'
+          ? `⚡ *AUTO RE-ENTRY — REAL (trend confirmed)*`
+          : `⚡ *AUTO RE-ENTRY — PAPER (trend confirmed)*`)
+      : (pos.tradingMode === 'real'
+          ? `💰 *BOT ENTERED — REAL TRADE*`
+          : `✅ *BOT ENTERED — PAPER TRADE*`);
     // Note: "BOT ENTERED" = the bot has already bought this position.
     //       This is NOT a suggestion or monitoring alert.
     //       Compare with "👀 MONITORING" messages which are NOT entered.
@@ -7230,6 +7258,23 @@ async function main() {
   diagnosticTradeCount     = startCfg.diagTradeCount || 0;
   lastAnnouncedPeriodKey   = startCfg.currentPeriod?.key || null; // don't re-announce on restart
   if (startCfg.sessionFilters) sessionFilters = { ...sessionFilters, ...startCfg.sessionFilters };
+
+  // ── Restore trend-confirmed addresses from today's history (Nov-21) ────────
+  // Coins that exited today are eligible for auto re-entry even in manual mode.
+  try {
+    const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
+    const { history } = await getCollections();
+    const todaySnap  = await db.collection(history).where('closedAt', '>=', todayStart.getTime()).get();
+    todaySnap.docs.forEach(d => {
+      const addr = (d.data().address || '').toLowerCase();
+      if (addr) trendConfirmedAddrs.add(addr);
+    });
+    if (trendConfirmedAddrs.size > 0)
+      console.log(`[BOT] Partial-auto: restored ${trendConfirmedAddrs.size} trend-confirmed addr(s) from today's history`);
+  } catch(e) {
+    console.warn('[BOT] Could not restore trend-confirmed addrs:', e.message);
+  }
+
   if (globalGatesBypass || lpLockBypass || !strategyFiltersActive) {
     const active = [
       globalGatesBypass      ? '⚠️ Global gates: BYPASSED' : null,
