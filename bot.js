@@ -49,6 +49,7 @@ const posLastLiq      = new Map(); // pos.id → liquidity seen on the previous 
 // logs every closed trade to Firestore 'diagnostic_trades'. Auto-disables +
 // sends full analysis report after DIAGNOSTIC_TARGET trades.
 let diagnosticMode       = false;
+let diagnosticReal       = false;  // Nov-23: true = diagnostic mode uses real funds
 let diagnosticTradeCount = 0;
 const DIAGNOSTIC_TARGET  = 1000;
 const DIAG_MIN_LIQ       = 8000;
@@ -1216,6 +1217,7 @@ async function saveBypassFlags() {
       stratsSkipped:    !strategyFiltersActive,
       autoEntryPaused:  autoEntryPaused,
       diagnosticMode:   diagnosticMode,
+      diagnosticReal:   diagnosticReal,
       diagTradeCount:   diagnosticTradeCount,
       slTrailMode:      slTrailMode,
     }, { merge: true });
@@ -1952,7 +1954,9 @@ async function enterPosition(coin, overrides = {}) {
   }
   // Surge momentum disabled — surge exit + reinvest removed; capital floor handles profit protection
   const isSurge = false;
-  const tradingMode = cfg.tradingMode || 'paper';
+  // Nov-23: diagnostic real mode — override cfg tradingMode to 'real' so the bot
+  // executes live Jupiter swaps under the simplified diagnostic filter.
+  const tradingMode = (diagnosticMode && diagnosticReal) ? 'real' : (cfg.tradingMode || 'paper');
   const coinChain  = normaliseChain(coin.chain);
   const wallet     = await selectWalletForChain(coinChain, cfg);
 
@@ -2511,6 +2515,7 @@ async function logDiagnosticTrade(pos, exitPrice, exitReason, pnl) {
     if (diagnosticTradeCount >= DIAGNOSTIC_TARGET) {
       console.log('[DIAG] Target reached — generating report and disabling diagnostic mode');
       diagnosticMode = false;
+      diagnosticReal = false;
       await saveBypassFlags().catch(() => {});
       await generateDiagnosticReport();
     }
@@ -2976,7 +2981,11 @@ async function processPullbackWatchlist(positions, slotCount, usedThisScan) {
             `🎯 TP2: $${fmtPrice(coin.price * s.tp2x)} (+${((s.tp2x-1)*100).toFixed(0)}%) → 30%\n` +
             `🎯 TP3: $${fmtPrice(coin.price * s.tp3x)} (+${((s.tp3x-1)*100).toFixed(0)}%) → 20%\n`
           : `🎯 SL: 50% trail · capital out +50% · tightens 5%/+20% → 5% floor\n`;
-      const modeHeader = pos.tradingMode === 'real'
+      const modeHeader = (pos.isDiagnostic && pos.tradingMode === 'real')
+        ? `🔴 *DIAGNOSTIC REAL — LIVE FUNDS*`
+        : (pos.isDiagnostic && pos.tradingMode === 'paper')
+        ? `🔬 *DIAGNOSTIC PAPER — TEST MODE*`
+        : pos.tradingMode === 'real'
         ? `💰 *BOT ENTERED — REAL TRADE*`
         : `✅ *BOT ENTERED — PAPER TRADE*`;
       await sendTelegram(
@@ -4260,33 +4269,45 @@ async function pollTelegramCommands() {
         continue;
       }
 
-      // ── /diagnostic on|off|status — research data-collection mode ───────────────
-      // Bypasses ALL filters (keeps liq ≥ $8k), raises slot cap to 100,
-      // uses 50%-from-ATH SL trail, logs every trade to Firestore 'diagnostic_trades'.
-      // Auto-disables + sends full report after 1,000 trades.
-      if (text === '/diagnostic on' || text === '/diagnostic off' ||
-          text === '/diagnostic status' || text === '/diagnostic') {
-        if (text === '/diagnostic status' || text === '/diagnostic') {
-          const statusLine = diagnosticMode
-            ? `🔬 *DIAGNOSTIC MODE — ACTIVE*\n\n` +
-              `Trades logged: *${diagnosticTradeCount}/${DIAGNOSTIC_TARGET}*\n` +
-              `All filters bypassed (liq ≥ $${(DIAG_MIN_LIQ/1000).toFixed(0)}k only)\n` +
-              `Slot cap: ${DIAG_MAX_POSITIONS} · SL: 50% from ATH\n\n` +
-              `Send /diagnostic off to stop, /diagreport for current analysis.`
-            : `🔬 *DIAGNOSTIC MODE — OFF*\n\n` +
-              `Trades logged so far: *${diagnosticTradeCount}/${DIAGNOSTIC_TARGET}*\n\n` +
-              `Send /diagnostic on to start data collection.`;
-          await sendTelegram(statusLine);
-        } else if (text === '/diagnostic on') {
+      // ── /diagnostic paper|real|off|status ─────────────────────────────────────
+      // Bypasses ALL filters (keeps liq ≥ $8k), raises slot cap to DIAG_MAX_POSITIONS.
+      //   paper → diagnostic filter, paper trades (safe — no real funds)
+      //   real  → diagnostic filter, REAL Jupiter swaps (live test with real SOL)
+      //   off   → restore all filters and gates
+      //   (no arg / status) → show current state
+      // Also accepts legacy /diagnostic on → treated as /diagnostic paper
+      if (text === '/diagnostic' || text === '/diagnostic status' ||
+          text === '/diagnostic paper' || text === '/diagnostic real' ||
+          text === '/diagnostic off' || text === '/diagnostic on') {
+
+        const diagArg = text.split(' ')[1] || '';
+
+        if (!diagArg || diagArg === 'status') {
+          // ── Status ──────────────────────────────────────────────────────────
+          const diagLabel = !diagnosticMode
+            ? 'OFF'
+            : diagnosticReal ? '🔴 REAL (live funds)' : '🔬 PAPER (safe)';
+          await sendTelegram(
+            `🔬 *DIAGNOSTIC MODE — ${diagnosticMode ? 'ACTIVE' : 'OFF'}*\n\n` +
+            `Mode: *${diagLabel}*\n` +
+            `Trades logged: *${diagnosticTradeCount}/${DIAGNOSTIC_TARGET}*\n` +
+            (diagnosticMode
+              ? `All filters bypassed (liq ≥ $${(DIAG_MIN_LIQ/1000).toFixed(0)}k only)\n` +
+                `Slot cap: ${DIAG_MAX_POSITIONS}\n\n` +
+                `Send /diagnostic off to stop. /diagreport for snapshot.`
+              : `\nSend /diagnostic paper → safe test\nSend /diagnostic real → live funds test`)
+          );
+
+        } else if (diagArg === 'paper' || diagArg === 'on') {
+          // ── Enable diagnostic PAPER ─────────────────────────────────────────
           diagnosticMode        = true;
+          diagnosticReal        = false;
           globalGatesBypass     = true;
           lpLockBypass          = true;
           strategyFiltersActive = false;
-          autoEntryPaused       = false;  // override any manual-only mode
-          dayHaltedToday        = false;  // clear any daily-loss halt
-          diagnosticTradeCount  = 0;      // fresh start every time /diagnostic on is used
-          // Clear all previous diagnostic_trades — old data may have been skewed by
-          // filters that were still active; wipe and start clean.
+          autoEntryPaused       = false;
+          dayHaltedToday        = false;
+          diagnosticTradeCount  = 0;
           let _clearedCount = 0;
           try {
             const _oldSnap = await db.collection('diagnostic_trades').get();
@@ -4295,38 +4316,65 @@ async function pollTelegramCommands() {
               _oldSnap.docs.forEach(d => _delBatch.delete(d.ref));
               await _delBatch.commit();
               _clearedCount = _oldSnap.size;
-              console.log(`[DIAG] Cleared ${_clearedCount} old diagnostic_trades documents — fresh start`);
             }
-          } catch(_e) {
-            console.warn('[DIAG] Could not clear diagnostic_trades:', _e.message);
-          }
+          } catch(_e) { console.warn('[DIAG] Could not clear diagnostic_trades:', _e.message); }
           await saveBypassFlags();
           await sendTelegram(
-            `🔬 *DIAGNOSTIC MODE — ON (FRESH START)*\n\n` +
-            `The bot is now in research/data-collection mode.\n` +
-            (_clearedCount > 0 ? `🗑 Previous data cleared (${_clearedCount} trades wiped — fresh baseline)\n\n` : `\n`) +
-            `✅ All filters bypassed\n` +
-            `✅ Liq gate: ≥ $${(DIAG_MIN_LIQ/1000).toFixed(0)}k only\n` +
-            `✅ Daily loss limit: *bypassed*\n` +
-            `✅ Daily halt: *bypassed*\n` +
-            `✅ Manual-only mode: *cleared*\n` +
-            `✅ Slot cap: ${DIAG_MAX_POSITIONS} positions\n` +
-            `✅ SL: 50% from any ATH (Phase 2: 60% tightening at +30%)\n` +
+            `🔬 *DIAGNOSTIC PAPER — ON (FRESH START)*\n\n` +
+            (_clearedCount > 0 ? `🗑 Previous data cleared (${_clearedCount} trades wiped)\n\n` : ``) +
+            `✅ All filters bypassed · Liq ≥ $${(DIAG_MIN_LIQ/1000).toFixed(0)}k only\n` +
+            `✅ Slot cap: ${DIAG_MAX_POSITIONS} · Manual mode: cleared\n` +
+            `✅ Daily loss limit: bypassed\n` +
             `✅ Every closed trade logged to Firestore\n\n` +
-            `Auto-disables + sends report after ${DIAGNOSTIC_TARGET} trades.\n` +
-            `Trade count: *0/${DIAGNOSTIC_TARGET}* — starting fresh\n\n` +
-            `⚠️ _Paper mode data collection — no real capital at risk._\n` +
-            `Send /diagnostic off to stop. Send /diagreport at any time for a snapshot.`
+            `⚠️ _Paper trades only — no real funds at risk._\n` +
+            `Send /diagnostic real to switch to live-fund test.\n` +
+            `Send /diagnostic off to stop. /diagreport for snapshot.`
           );
+
+        } else if (diagArg === 'real') {
+          // ── Enable diagnostic REAL ──────────────────────────────────────────
+          diagnosticMode        = true;
+          diagnosticReal        = true;
+          globalGatesBypass     = true;
+          lpLockBypass          = true;
+          strategyFiltersActive = false;
+          autoEntryPaused       = false;
+          dayHaltedToday        = false;
+          diagnosticTradeCount  = 0;
+          let _clearedCount2 = 0;
+          try {
+            const _oldSnap2 = await db.collection('diagnostic_trades').get();
+            if (!_oldSnap2.empty) {
+              const _delBatch2 = db.batch();
+              _oldSnap2.docs.forEach(d => _delBatch2.delete(d.ref));
+              await _delBatch2.commit();
+              _clearedCount2 = _oldSnap2.size;
+            }
+          } catch(_e2) { console.warn('[DIAG] Could not clear diagnostic_trades:', _e2.message); }
+          await saveBypassFlags();
+          await sendTelegram(
+            `🔴 *DIAGNOSTIC REAL — ON (LIVE FUNDS)*\n\n` +
+            (_clearedCount2 > 0 ? `🗑 Previous data cleared (${_clearedCount2} trades wiped)\n\n` : ``) +
+            `⚠️ *REAL SOL WILL BE USED FOR ENTRIES*\n\n` +
+            `✅ All strategy filters bypassed · Liq ≥ $${(DIAG_MIN_LIQ/1000).toFixed(0)}k only\n` +
+            `✅ Slot cap: ${DIAG_MAX_POSITIONS} · Manual mode: cleared\n` +
+            `✅ Daily loss limit: bypassed\n` +
+            `✅ Every closed trade logged to Firestore\n\n` +
+            `Purpose: test the diagnostic 8k-liq signal with real capital.\n` +
+            `Send /diagnostic off to stop at any time. /diagreport for snapshot.`
+          );
+
         } else {
+          // ── Off ─────────────────────────────────────────────────────────────
           diagnosticMode        = false;
+          diagnosticReal        = false;
           globalGatesBypass     = false;
           lpLockBypass          = false;
           strategyFiltersActive = true;
           await saveBypassFlags();
           await sendTelegram(
             `🔬 *DIAGNOSTIC MODE — OFF*\n\n` +
-            `All filters restored to normal.\n` +
+            `All filters and gates restored to normal.\n` +
             `Trades logged: *${diagnosticTradeCount}/${DIAGNOSTIC_TARGET}*\n\n` +
             `Send /diagreport to view the data collected so far.`
           );
@@ -4443,7 +4491,7 @@ async function pollTelegramCommands() {
           `/restart — reset daily loss counter\n` +
           `/queue <CA> — evaluate a contract address now\n\n` +
           `🔬 *Research Mode*\n` +
-          `/diagnostic on|off|status — bypass filters, log 1k trades for analysis\n` +
+          `/diagnostic paper|real|off — bypass filters, test signal (paper=safe, real=live SOL)\n` +
           `/diagreport — generate trade analysis report now\n\n` +
           `🔓 *Filter Controls* _(saved — survive restarts)_\n` +
           `/openmode — open ALL filters at once (master toggle)\n` +
@@ -7255,6 +7303,7 @@ async function main() {
   autoEntryPaused          = !!startCfg.autoEntryPaused;
   slTrailMode              = startCfg.slTrailMode || '30';
   diagnosticMode           = !!startCfg.diagnosticMode;
+  diagnosticReal           = !!startCfg.diagnosticReal;
   diagnosticTradeCount     = startCfg.diagTradeCount || 0;
   lastAnnouncedPeriodKey   = startCfg.currentPeriod?.key || null; // don't re-announce on restart
   if (startCfg.sessionFilters) sessionFilters = { ...sessionFilters, ...startCfg.sessionFilters };
