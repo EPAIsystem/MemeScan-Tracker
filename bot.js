@@ -58,7 +58,7 @@ const DIAG_MAX_POSITIONS = 100;
 // ─── SESSION FILTERS ─────────────────────────────────────────────────────────
 // User-set restrictions on what coins the bot auto-enters this session.
 // All fields null = no restriction on that dimension.
-let sessionFilters = { minAgeDays: null, maxAgeDays: null, minMcap: null, maxMcap: null, minVol: null, maxVol: null };
+let sessionFilters = { minAgeDays: null, maxAgeDays: null, minMcap: null, maxMcap: null, minVol: null, maxVol: null, minLiq: null, maxLiq: null };
 
 function parseFilterAmount(str) {
   if (!str) return null;
@@ -118,6 +118,11 @@ function fmtSessionFilters() {
     const hi = f.maxVol != null ? '$'+fmtAmt(f.maxVol) : '∞';
     lines.push(`📊 Vol24h: ${lo} – ${hi}`);
   }
+  if (f.minLiq !== null || f.maxLiq !== null) {
+    const lo = f.minLiq != null ? '$'+fmtAmt(f.minLiq) : '$0';
+    const hi = f.maxLiq != null ? '$'+fmtAmt(f.maxLiq) : '∞';
+    lines.push(`💧 Liq: ${lo} – ${hi}`);
+  }
   return lines.length ? lines.join('\n') : 'None active';
 }
 function applySessionFilters(coins) {
@@ -130,6 +135,8 @@ function applySessionFilters(coins) {
     if (f.maxMcap    !== null && (coin.mcap    || 0) > f.maxMcap)    return false;
     if (f.minVol     !== null && (coin.vol24   || 0) < f.minVol)     return false;
     if (f.maxVol     !== null && (coin.vol24   || 0) > f.maxVol)     return false;
+    if (f.minLiq     !== null && (coin.liq     || 0) < f.minLiq)     return false;
+    if (f.maxLiq     !== null && (coin.liq     || 0) > f.maxLiq)     return false;
     return true;
   });
 }
@@ -3936,7 +3943,7 @@ async function pollTelegramCommands() {
       if (text.startsWith('/filter')) {
         const args = text.slice(7).trim();
         if (!args || args === 'clear' || args === 'off') {
-          sessionFilters = { minAgeDays: null, maxAgeDays: null, minMcap: null, maxMcap: null, minVol: null, maxVol: null };
+          sessionFilters = { minAgeDays: null, maxAgeDays: null, minMcap: null, maxMcap: null, minVol: null, maxVol: null, minLiq: null, maxLiq: null };
           await saveSessionFilters();
           await sendTelegram(`✅ *SESSION FILTERS CLEARED*\n\nBot will scan all coins matching its normal strategies.`);
           continue;
@@ -3961,15 +3968,19 @@ async function pollTelegramCommands() {
           } else if (k === 'vol') {
             const r = parseFilterRange(v, false);
             newFilters.minVol = r.min; newFilters.maxVol = r.max;
+          } else if (k === 'liq' || k === 'liquidity') {
+            const r = parseFilterRange(v, false);
+            newFilters.minLiq = r.min; newFilters.maxLiq = r.max;
           } else {
-            errors.push(`Unknown filter: ${k} (use age, mcap, vol)`);
+            errors.push(`Unknown filter: ${k} (use age, mcap, vol, liq)`);
           }
         }
         if (errors.length) {
           await sendTelegram(
             `⚠️ *FILTER ERROR*\n\n${errors.join('\n')}\n\n` +
-            `*Usage:* /filter age=1-15d mcap=500k-5m vol=50k+\n` +
-            `Examples:\n· /filter age=7d+ (coins 7+ days old)\n· /filter age=1-15d mcap=1m+ vol=50k+\n· /filter clear`
+            `*Usage:* /filter age=18m-4h mcap=10k-100k liq=8k-100k\n` +
+            `Examples:\n· /filter liq=8k-100k (liquidity range)\n· /filter age=30m-2h liq=10k+ (young coins with liq)\n· /filter age=1-15d mcap=1m+ vol=50k+\n· /filter clear\n\n` +
+            `_Age units: m/min (minutes), h/hr (hours), d (days), mo (months)_`
           );
           continue;
         }
