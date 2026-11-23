@@ -2508,6 +2508,7 @@ async function logDiagnosticTrade(pos, exitPrice, exitReason, pnl) {
       ageMinutes:   de.ageMinutes ?? null,
       enteredAt:    pos.enteredAt || Date.now(),
       closedAt:     Date.now(),
+      tradingMode:  pos.tradingMode || 'paper', // Nov-23: track paper vs real for hourly report filter
     };
     await db.collection('diagnostic_trades').add(record);
     diagnosticTradeCount++;
@@ -2811,7 +2812,7 @@ async function getDailyStats() {
 // strategyId: 0=BB, 1=AM, 2=SC, 3=OR, 4=PS  (null = unknown/legacy)
 const STRATEGY_KEYS = ['bb', 'am', 'sc', 'or', 'ps'];
 async function updateDailyStats(pnl, isWin, isManual = false, exitFeeUsd = 0, strategyId = null) {
-  if (diagnosticMode) return; // Nov-19: diag results go to diagnostic_trades only — skip daily stats writes
+  if (diagnosticMode && !diagnosticReal) return; // Nov-23: paper diag skips daily stats; real diag flows through
   const today = new Date().toISOString().slice(0,10);
   const { stats } = await getCollections();
   const base = {
@@ -2845,7 +2846,7 @@ async function updateDailyStats(pnl, isWin, isManual = false, exitFeeUsd = 0, st
 }
 
 async function updateDailyStatsEntry(posSize, entryFeeUsd) {
-  if (diagnosticMode) return; // Nov-19: skip stats entry write in diag mode
+  if (diagnosticMode && !diagnosticReal) return; // Nov-23: paper diag skips; real diag tracks capital
   const today = new Date().toISOString().slice(0,10);
   const { stats } = await getCollections();
   await db.collection(stats).doc(today).set({
@@ -7237,6 +7238,38 @@ async function sendHourlySummary() {
 
   const tierBreakdown = buildTierBreakdown(stats);
 
+  // Nov-23: Build diagnostic PAPER section — real diag trades already in main P&L above
+  let diagSection = '';
+  try {
+    const oneHourAgo = Date.now() - 3600000;
+    const diagSnap = await db.collection('diagnostic_trades').get();
+    const diagPaperTrades = diagSnap.docs
+      .map(d => d.data())
+      .filter(t => (t.tradingMode === 'paper' || !t.tradingMode) && (t.closedAt || 0) >= oneHourAgo);
+    if (diagPaperTrades.length > 0) {
+      const dWins    = diagPaperTrades.filter(t => t.pnl > 0).length;
+      const dLosses  = diagPaperTrades.filter(t => t.pnl <= 0).length;
+      const dPnl     = diagPaperTrades.reduce((s, t) => s + (t.pnl || 0), 0);
+      const dWinRate = diagPaperTrades.length > 0 ? Math.round(dWins / diagPaperTrades.length * 100) : 0;
+      const dSign    = dPnl >= 0 ? '+' : '';
+      // Count open diagnostic positions
+      const openDiag = positions.filter(p => p.isDiagnostic && p.tradingMode !== 'real').length;
+      diagSection =
+        `\n─────────────────────\n` +
+        `🔬 *DIAGNOSTIC PAPER (last 1h)*\n` +
+        `Closed: ${diagPaperTrades.length} trades · Open: ${openDiag}\n` +
+        `P&L: ${dSign}$${dPnl.toFixed(2)} · Win rate: ${dWinRate}% (${dWins}W/${dLosses}L)`;
+    } else if (diagnosticMode && !diagnosticReal) {
+      // Diagnostic paper is active but no trades closed this hour — show open count
+      const openDiag = positions.filter(p => p.isDiagnostic).length;
+      if (openDiag > 0) {
+        diagSection = `\n─────────────────────\n🔬 *DIAGNOSTIC PAPER* — ${openDiag} open, no closes this hour`;
+      }
+    }
+  } catch (e) {
+    console.warn('[HOURLY] diag section error:', e.message);
+  }
+
   await sendTelegram(
     `📊 *MEMESCAN — HOURLY*\n\n` +
     `✅ Gross profit:  +$${grossProfit.toFixed(2)}\n` +
@@ -7248,7 +7281,8 @@ async function sendHourlySummary() {
     `📈 Win rate: ${winRate}% (${stats.wins}W/${stats.losses}L)\n` +
     `🔓 Positions: ${positions.length}/${MAX_POSITIONS}\n\n` +
     `*Tier P&L (best → worst):*\n${tierBreakdown}\n\n` +
-    `*Slots:*\n${slotLines}`
+    `*Slots:*\n${slotLines}` +
+    diagSection
   );
 }
 
