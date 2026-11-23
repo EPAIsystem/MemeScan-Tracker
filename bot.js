@@ -4331,13 +4331,17 @@ async function pollTelegramCommands() {
             }
           } catch(_e) { console.warn('[DIAG] Could not clear diagnostic_trades:', _e.message); }
           await saveBypassFlags();
+          const _sfLine = fmtSessionFilters() !== 'None active'
+            ? `🔍 Session filters active:\n${fmtSessionFilters()}\n\n`
+            : `🔍 No session filters set — use /filter to narrow entries\n\n`;
           await sendTelegram(
             `🔬 *DIAGNOSTIC PAPER — ON (FRESH START)*\n\n` +
             (_clearedCount > 0 ? `🗑 Previous data cleared (${_clearedCount} trades wiped)\n\n` : ``) +
-            `✅ All filters bypassed · Liq ≥ $${(DIAG_MIN_LIQ/1000).toFixed(0)}k only\n` +
+            `✅ Strategy filters bypassed · Liq ≥ $${(DIAG_MIN_LIQ/1000).toFixed(0)}k floor\n` +
             `✅ Slot cap: ${DIAG_MAX_POSITIONS} · Manual mode: cleared\n` +
             `✅ Daily loss limit: bypassed\n` +
             `✅ Every closed trade logged to Firestore\n\n` +
+            _sfLine +
             `⚠️ _Paper trades only — no real funds at risk._\n` +
             `Send /diagnostic real to switch to live-fund test.\n` +
             `Send /diagnostic off to stop. /diagreport for snapshot.`
@@ -6969,9 +6973,12 @@ async function scanForEntries() {
   const _entryCfg = await getTradingConfig().catch(() => ({}));
   const _entryCeiling = parseFloat(_entryCfg.positionSize) || POSITION_SIZE;
 
-  // Apply session filters (age/mcap/vol restrictions set by user via /filter)
-  const filteredMatches = diagnosticMode ? qualityMatches : applySessionFilters(qualityMatches);
-  if (!diagnosticMode && filteredMatches.length < qualityMatches.length) {
+  // Apply session filters (age/mcap/vol/liq restrictions set by user via /filter)
+  // Nov-23: diagnostic mode now respects session filters too — previously bypassed them,
+  // making /filter commands have zero effect on diagnostic results. The 8k liq floor
+  // is enforced separately in detectStrategy(), so it is preserved regardless.
+  const filteredMatches = applySessionFilters(qualityMatches);
+  if (filteredMatches.length < qualityMatches.length) {
     console.log(`[SESSION-FILTER] ${qualityMatches.length - filteredMatches.length}/${qualityMatches.length} matches dropped by session filters (${fmtSessionFilters().replace(/\n/g,' | ')})`);
   }
 
