@@ -5470,10 +5470,13 @@ async function monitorPositions() {
           const _expiresAt = _now + 4 * 60 * 1000;
           graduationGrace.set(pos.id, _expiresAt);
           console.log(`[GRAD] ${pos.symbol}: liq collapsed $${_prevLiq.toFixed(0)}→$${currentLiq < 1 ? '<1' : currentLiq.toFixed(0)} — 4-min grace started`);
+          const _suspGainPct = ((price - pos.entryPrice) / pos.entryPrice * 100).toFixed(1);
+          const _suspSign    = parseFloat(_suspGainPct) >= 0 ? '+' : '';
           await sendTelegram(
             `⏳ *GRADUATION SUSPECTED — ${pos.symbol}*\n\n` +
             `💧 Liq collapsed to $${currentLiq < 1 ? '<1' : currentLiq.toFixed(0)} — PumpSwap→Raydium migration possible\n` +
-            `⏱️ Holding 4-min grace window before emergency exit\n` +
+            `📊 Position now: *${_suspSign}${_suspGainPct}%*\n` +
+            `⏱️ Holding 4-min grace window\n` +
             `🔗 [Chart](${pos.dexUrl})`
           ).catch(() => {});
           // Fall through — normal SL/TP processing continues during grace
@@ -5538,10 +5541,41 @@ async function monitorPositions() {
         continue;
       }
     }
-    // Clear graduation grace if liq has recovered; track liq for next tick's grace check
+    // Nov-24: Graduation confirmed when liq recovers during grace window.
+    // Exit at the new Raydium price with GRADUATED label (Option 1 — don't follow to Raydium).
     if (graduationGrace.has(pos.id) && currentLiq !== null && currentLiq >= 2500) {
       graduationGrace.delete(pos.id);
-      console.log(`[GRAD] ${pos.symbol}: liq recovered to $${currentLiq.toFixed(0)} — migration complete, grace cleared`);
+      console.log(`[GRAD] ${pos.symbol}: liq recovered to $${currentLiq.toFixed(0)} — graduation confirmed, closing`);
+      if (!closingNow.has(pos.id)) {
+        closingNow.add(pos.id);
+        try {
+          const gradFill = pos.tradingMode === 'paper'
+            ? simulateFillPrice(price, pos.size * pos.remaining, currentLiq, false)
+            : price;
+          const gradPnl  = (gradFill - pos.entryPrice) / pos.entryPrice * pos.size * pos.remaining;
+          const pnl      = (pos.pnl || 0) + gradPnl;
+          const _result  = await realClose(pos, gradFill, 'GRADUATED', pnl);
+          if (_result?.ok) {
+            await updateDailyStats(gradPnl, gradPnl > 0, false, calcExitFeeUsd(pos, price, gradFill, pos.remaining, _result.exitImpactPct), pos.strategyId ?? null);
+            const gradGainPct = ((gradFill - pos.entryPrice) / pos.entryPrice * 100).toFixed(1);
+            const gradSign    = parseFloat(gradGainPct) >= 0 ? '+' : '';
+            await sendTelegram(
+              `🎓 *GRADUATED — POSITION CLOSED*\n\n` +
+              `*${pos.symbol}* ${pos.strategyLabel}\n` +
+              `✅ Bonding curve complete — migrated to Raydium\n` +
+              `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(gradFill)}\n` +
+              `💰 P&L: *${gradSign}${gradGainPct}%*\n` +
+              `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})` +
+              `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
+            );
+            enteredToday.delete(pos.address);
+          }
+        } catch(e) {
+          console.error(`[GRAD] Exit failed for ${pos.symbol}:`, e);
+          closingNow.delete(pos.id);
+        }
+        continue;
+      }
     }
     if (currentLiq !== null) posLastLiq.set(pos.id, currentLiq);
 
@@ -5847,8 +5881,11 @@ async function monitorPositions() {
 
     // ── RUG DETECTION — EMERGENCY EXIT ────────────────────────────────────
     // If price crashes >40% from peak in a single 5s tick AND we were profitable,
-    // exit immediately before it goes to near-zero
-    if (currentPeak > pos.entryPrice * 1.15 && price < currentPeak * 0.60) {
+    // exit immediately before it goes to near-zero.
+    // Nov-24: Skip during graduation grace — pump.fun price collapses on PumpSwap→Raydium
+    // migration (looks like a rug but isn't). Grace window handles the outcome: liq recovery
+    // → GRADUATED exit, grace expiry → LIQ_DRAINED exit.
+    if (!graduationGrace.has(pos.id) && currentPeak > pos.entryPrice * 1.15 && price < currentPeak * 0.60) {
       // Guard against concurrent monitor ticks closing the same position twice
       if (closingNow.has(pos.id)) continue;
       closingNow.add(pos.id);
