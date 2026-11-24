@@ -2707,9 +2707,30 @@ async function generateDiagnosticReport() {
       ? `📊 *DIAGNOSTIC REPORT — ${total} Total* _(${totalClosed} closed + ${totalOpen} open/unrealized)_`
       : `📊 *DIAGNOSTIC REPORT — ${total} Trades*`;
 
+    // ── Dollar P&L summary (closed trades only — slippage baked into fill prices) ──
+    const cfg_diag     = await getTradingConfig().catch(() => ({}));
+    const diagPosSize  = parseFloat(cfg_diag.positionSize) || POSITION_SIZE;
+    const closedWithPnl = closed.filter(t => typeof t.pnl === 'number');
+    const diagGrossP   = closedWithPnl.filter(t => t.pnl > 0).reduce((s, t) => s + t.pnl, 0);
+    const diagGrossL   = Math.abs(closedWithPnl.filter(t => t.pnl < 0).reduce((s, t) => s + t.pnl, 0));
+    const diagNetPnl   = diagGrossP - diagGrossL;
+    const diagAvgPnl   = closedWithPnl.length > 0 ? diagNetPnl / closedWithPnl.length : 0;
+    const diagNetStr   = diagNetPnl >= 0 ? `+$${diagNetPnl.toFixed(2)}` : `-$${Math.abs(diagNetPnl).toFixed(2)}`;
+    const diagAvgStr   = diagAvgPnl >= 0 ? `+$${diagAvgPnl.toFixed(3)}` : `-$${Math.abs(diagAvgPnl).toFixed(3)}`;
+    const pnlSection   = [
+      `💰 *P&L SUMMARY* (pos size: $${diagPosSize.toFixed(2)})`,
+      `  Gross profit: *+$${diagGrossP.toFixed(2)}*  (${closedWithPnl.filter(t=>t.pnl>0).length} wins)`,
+      `  Gross loss:   *-$${diagGrossL.toFixed(2)}*  (${closedWithPnl.filter(t=>t.pnl<0).length} losses)`,
+      `  ─────────────────────`,
+      `  Net P&L: *${diagNetStr}*  |  Avg/trade: *${diagAvgStr}*`,
+      `  _(entry & exit slippage included in all figures)_`,
+    ].join('\n');
+
     const msg = [
       headerLine,
       `Win Rate (>+5%): *${pct(profitableTotal,total)}* | Avg Gain: *${avg(allGains)}%*`,
+      ``,
+      pnlSection,
       ``,
       `📌 *Outcome Breakdown*`,
       outcomeSection,
@@ -3691,6 +3712,25 @@ async function pollTelegramCommands() {
           ? `\n⏸ _Auto-entry PAUSED — signals alert only. /pauseentry off to resume._`
           : '';
 
+        // Nov-24: Show diagnostic P&L when diagnostic mode is active
+        let diagStatusLine = '';
+        if (diagnosticMode) {
+          try {
+            const dSnap   = await db.collection('diagnostic_trades').get();
+            const dTrades = dSnap.docs.map(d => d.data());
+            const dNet    = dTrades.reduce((s, t) => s + (t.pnl || 0), 0);
+            const dWins   = dTrades.filter(t => (t.pnl || 0) > 0).length;
+            const dWinPct = dTrades.length > 0 ? Math.round(dWins / dTrades.length * 100) : 0;
+            const dSign   = dNet >= 0 ? '+' : '-';
+            const dMode   = diagnosticReal ? 'REAL' : 'PAPER';
+            diagStatusLine = `\n─────────────────────\n` +
+              `🔬 *Diagnostic (${dMode})*: ${dTrades.length} closed\n` +
+              `Net P&L: *${dSign}$${Math.abs(dNet).toFixed(2)}* | Win rate: ${dWinPct}%`;
+          } catch(e) {
+            console.warn('[STATUS] diag P&L fetch error:', e.message);
+          }
+        }
+
         await sendTelegram(
           `📊 *STATUS*\n\n` +
           `${state} · *${mode} mode*\n\n` +
@@ -3702,7 +3742,7 @@ async function pollTelegramCommands() {
           `🏆 Net P&L: *${netStr}*\n` +
           `💸 Fees (in P&L):  $${fees.toFixed(2)}\n\n` +
           `Position size: *$${posSize.toFixed(2)}* · Limit: ${(DAILY_LOSS_LIMIT * 100).toFixed(0)}%\n` +
-          `Scan #: ${scanCount}${pausedNote}${entryNote}\n\n` +
+          `Scan #: ${scanCount}${pausedNote}${entryNote}${diagStatusLine}\n\n` +
           `_/stats · /ping · /setsize · /mode paper|real · /wallets_`
         );
       }
