@@ -539,6 +539,53 @@ function getMoonBagSL(gainFromEntry) {
   return MOON_BAG_INITIAL_SL;
 }
 
+// ── TIER CONFIGURATION ─────────────────────────────────────────────────────
+// Three tiers determined by dynamic position size at entry.
+//   Tier 1 (Micro, $20–50):   10k–25k liq — volatile, wide SL, quick TP
+//   Tier 2 (Small, $50–200):  25k–75k liq — moderate, balanced SL/TP
+//   Tier 3 (Medium, $200+):   75k+ liq    — stable, tight SL, patient TP
+//
+// Milestones: each entry locks a floor at (gainPct × posSize × (1−trailPct)).
+// notionalGain = gain × posSize ($ gain on FULL position from entry — used as
+// the reference even after partial sells so milestones stay consistent).
+// TP1 = capital recovery at tp1GainPct. TP2 = gain share at tp2GainPct.
+// ─────────────────────────────────────────────────────────────────────────────
+function getTierConfig(tier) {
+  const cfgs = {
+    1: { // Micro: $20–$50
+      entrySLPct: 50, tp1GainPct: 50, tp2GainPct: 200,
+      milestones: [
+        { gainPct: 0.50, trailPct: 0.30 }, // TP1 trigger  → floor = 35% of posSize
+        { gainPct: 0.80, trailPct: 0.25 }, //              → floor = 60% of posSize
+        { gainPct: 1.10, trailPct: 0.20 }, //              → floor = 88% of posSize
+        { gainPct: 1.40, trailPct: 0.15 }, //              → floor = 119% of posSize
+        { gainPct: 1.70, trailPct: 0.10 }, //              → floor = 153% of posSize
+      ],
+    },
+    2: { // Small: $50–$200
+      entrySLPct: 40, tp1GainPct: 40, tp2GainPct: 150,
+      milestones: [
+        { gainPct: 0.40, trailPct: 0.30 }, // TP1 trigger  → floor = 28% of posSize
+        { gainPct: 0.65, trailPct: 0.25 }, //              → floor = 48.75% of posSize
+        { gainPct: 0.90, trailPct: 0.20 }, //              → floor = 72% of posSize
+        { gainPct: 1.15, trailPct: 0.15 }, //              → floor = 97.75% of posSize
+        { gainPct: 1.40, trailPct: 0.10 }, //              → floor = 126% of posSize
+      ],
+    },
+    3: { // Medium: $200+
+      entrySLPct: 30, tp1GainPct: 30, tp2GainPct: 100,
+      milestones: [
+        { gainPct: 0.30, trailPct: 0.30 }, // TP1 trigger  → floor = 21% of posSize
+        { gainPct: 0.50, trailPct: 0.25 }, //              → floor = 37.5% of posSize
+        { gainPct: 0.70, trailPct: 0.20 }, //              → floor = 56% of posSize
+        { gainPct: 0.90, trailPct: 0.15 }, //              → floor = 76.5% of posSize
+        { gainPct: 1.15, trailPct: 0.10 }, //              → floor = 103.5% of posSize
+      ],
+    },
+  };
+  return cfgs[tier] || cfgs[1];
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // ─── STRATEGY DETECTOR ───────────────────────────────────────────────────────
 // Returns { strategy, score, ...coin data } or null
@@ -2039,10 +2086,16 @@ async function enterPosition(coin, overrides = {}) {
   const isGroupA       = [1, 2, 4].includes(s.id);   // AM, SC, PS
   const fixedFloor     = isGroupA ? effectiveEntry * 0.97 : effectiveEntry * 0.99;
 
+  // ── Tier assignment ──────────────────────────────────────────────────────────
+  // Tier is determined by dynamic position size; governs SL, TP1, TP2 thresholds.
+  const tier        = posSize < 50 ? 1 : posSize < 200 ? 2 : 3;
+  const tierCfg     = getTierConfig(tier);
+  const entrySLPct  = tierCfg.entrySLPct;  // 50/40/30 for Tier 1/2/3
+
   let swingSL = null, skipEntry = false;
   if (diagnosticMode) {
-    // Diagnostic mode: 50% SL floor from entry — allows coin to drop up to 50% before cutting
-    swingSL = effectiveEntry * 0.50;
+    // Diagnostic mode: SL from entry based on tier (50/40/30%)
+    swingSL = effectiveEntry * (1 - entrySLPct / 100);
   } else if (overrides.sl == null) {
     const swingResult = await analyzeSwingData(coin.pairAddress, coin.ageMinutes, effectiveEntry, isGroupA);
     skipEntry = swingResult.skipEntry;                   // Nov-19: keep range gate — skip if at top of range
@@ -2109,6 +2162,20 @@ async function enterPosition(coin, overrides = {}) {
     // Moon bag: funded from surge reinvestment — uses graduated SL, no TP exits
     isMoonBag: overrides.isMoonBag || false,
     isReinvest: overrides.isReinvest || false,
+    // ── Tier-based SL/TP engine (Nov-25) ────────────────────────────────────
+    // Tier 1=Micro ($<50), Tier 2=Small ($50–200), Tier 3=Medium ($200+)
+    tier,                                           // 1 | 2 | 3
+    tp1GainPct: tierCfg.tp1GainPct,                // TP1 trigger: 50/40/30%
+    tp2GainPct: tierCfg.tp2GainPct,                // TP2 trigger: 200/150/100%
+    entrySLPct,                                     // initial SL %: 50/40/30%
+    // Progressive floor lock state
+    floorMilestoneIdx: -1,     // index into getTierConfig milestones (-1 = none yet)
+    activeFloor:       null,   // dollar gain floor (null until first milestone reached)
+    // Moon bag trail — set when isMoonBag flips true via TP2
+    moonBagTrailPct:   null,   // 0.10 (10%) → 0.05 (5%) on exhaustion
+    moonBagEnteredAt:  null,   // timestamp when moon bag mode started
+    moonBagPeakGain:   null,   // gainPct at the time moon bag was entered
+    // ────────────────────────────────────────────────────────────────────────
     status: 'open',
     enteredAt: Date.now(),
     dexUrl: coin.dexUrl,
@@ -6053,12 +6120,89 @@ async function monitorPositions() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // ── CAPITAL WITHDRAWAL (+100% gain — universal all strategies) ─────────
+    // ── PROGRESSIVE FLOOR SYSTEM — Milestone Floor Lock (Nov-25) ─────────
+    // notionalGain: dollar gain on FULL original position (as if we still held
+    // everything). Used as the universal milestone reference even after partial
+    // sells — milestones advance as coin climbs and lock floors behind it.
+    //
+    // Floor fires when notionalGain drops below the locked floor level:
+    //   Pre-TP1  → full exit (pos.remaining ≈ 1.0)
+    //   Post-TP1 → partial exit (pos.remaining ≈ 0.33)
+    // ══════════════════════════════════════════════════════════════════════
+    {
+      const tcfg         = getTierConfig(pos.tier || 1);
+      const notionalGain = gain * pos.size;  // $ gain on full position from entry
+      let floorIdx       = (pos.floorMilestoneIdx != null) ? pos.floorMilestoneIdx : -1;
+      let activeFloor    = (pos.activeFloor   != null) ? pos.activeFloor   : null;
+      let milestoneChanged = false;
+
+      // Advance milestones in ascending order as coin climbs
+      for (let i = floorIdx + 1; i < tcfg.milestones.length; i++) {
+        const ms        = tcfg.milestones[i];
+        const msGainDlr = ms.gainPct * pos.size;  // milestone threshold in dollars
+        if (notionalGain >= msGainDlr) {
+          const newFloor = msGainDlr * (1 - ms.trailPct);  // floor below this milestone
+          if (newFloor > (activeFloor || 0)) {
+            activeFloor   = newFloor;
+            floorIdx      = i;
+            milestoneChanged = true;
+          }
+        } else {
+          break;  // milestones are ordered; stop at first unmet
+        }
+      }
+
+      // Persist new milestone state
+      if (milestoneChanged) {
+        updates.activeFloor       = activeFloor;
+        updates.floorMilestoneIdx = floorIdx;
+        pos.activeFloor           = activeFloor;
+        pos.floorMilestoneIdx     = floorIdx;
+        const ms = tcfg.milestones[floorIdx];
+        sendTelegram(
+          `🔒 *FLOOR LOCKED — ${pos.symbol}*\n` +
+          `Milestone: +${(ms.gainPct * 100).toFixed(0)}% | Floor: *$${activeFloor.toFixed(2)}* gain protected\n` +
+          `📊 Tier ${pos.tier || 1} | ${pos.strategyLabel}\n🔗 [Chart](${pos.dexUrl})`
+        ).catch(() => {});
+        console.log(`[FLOOR] ${pos.symbol} milestone ${floorIdx+1} locked — floor $${activeFloor.toFixed(2)} (notionalGain $${notionalGain.toFixed(2)})`);
+      }
+
+      // Floor exit: notionalGain dropped below locked floor → sell remaining
+      if (activeFloor !== null && notionalGain < activeFloor && !closingNow.has(pos.id)) {
+        closingNow.add(pos.id);
+        try {
+          const exitPnl = fillGain * pos.size * pos.remaining;
+          const pnl     = (pos.pnl || 0) + exitPnl;
+          const preTP1  = !pos.capitalWithdrawn;
+          const reason  = preTP1 ? 'FLOOR_PRE_TP1' : 'FLOOR_POST_TP1';
+          const _result = await realClose(pos, exitFillPrice, reason, pnl);
+          if (!_result?.ok) { closingNow.delete(pos.id); continue; }
+          await updateDailyStats(exitPnl, exitPnl > 0, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _result.exitImpactPct), pos.strategyId ?? null);
+          enteredToday.delete(pos.address);
+          await sendTelegram(
+            `🔒 *FLOOR EXIT — ${pos.symbol}*\n\n` +
+            `*${pos.strategyLabel}*\n` +
+            `📉 Gain dropped below floor *$${activeFloor.toFixed(2)}*\n` +
+            `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
+            `${preTP1 ? '⚡ Pre-TP1 reversal — full exit' : '🏁 Post-TP1 — remaining sold'}\n` +
+            `${fmtTradeResult(pos.size, pnl)}\n🔗 [Chart](${pos.dexUrl})` +
+            `${_result.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_result.txHash})` : ''}`
+          );
+          console.log(`[FLOOR_EXIT] ${pos.symbol} — notional $${notionalGain.toFixed(2)} < floor $${activeFloor.toFixed(2)} | ${reason} | pnl $${pnl.toFixed(2)}`);
+        } finally {
+          closingNow.delete(pos.id);
+        }
+        continue;
+      }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ── CAPITAL WITHDRAWAL (TP1 — tier-based gain threshold) ─────────────
     // Sell the minimum fraction needed to recover original capital ($pos.size).
-    // Triggers at +100% for all coins. After this, trailing SL rides the profit.
+    // Tier 1: +50% | Tier 2: +40% | Tier 3: +30%
     // ══════════════════════════════════════════════════════════════════════
     if (!pos.capitalWithdrawn) {
-      const capThreshold = 0.50; // +50% gain — recover original capital at first profit milestone
+      const capThreshold = (pos.tp1GainPct || 50) / 100; // tier-based TP1 gain %
       if (gain >= capThreshold && pos.remaining > 0.01) {
         const totalRecovered = pos.recoveredAmount || 0;
         const stillNeeded    = pos.size - totalRecovered; // capital still at risk
@@ -6087,9 +6231,9 @@ async function monitorPositions() {
             Object.assign(pos, capUpdates);
             alertMsg = `🛡️ *CAPITAL RECOVERED — TP1*\n\n` +
               `*${pos.symbol}* ${pos.strategyLabel}\n` +
-              `📥 Entry: $${fmtPrice(pos.entryPrice)} | Trigger: +50%\n` +
+              `📥 Entry: $${fmtPrice(pos.entryPrice)} | Trigger: +${((pos.tp1GainPct||50)).toFixed(0)}% (Tier ${pos.tier||1})\n` +
               `💰 Sold ${(capitalFrac * 100).toFixed(1)}% → recovered $${newRecovered.toFixed(2)}\n` +
-              `🎯 ${(newRemaining * 100).toFixed(1)}% remains — TP2 at ${fmtPrice(pos.entryPrice * 3)} (3×) · then SL trail only\n` +
+              `🎯 ${(newRemaining * 100).toFixed(1)}% remains — TP2 at +${pos.tp2GainPct||200}% · then floor trail\n` +
               `🔗 [Chart](${pos.dexUrl})` +
               `${_cSell.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_cSell.txHash})` : ''}`;
           }
@@ -6170,13 +6314,13 @@ async function monitorPositions() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // ── TP2: remaining doubles from TP1 (price = entry × 3.0) ───────────
-    // After capital recovery (+50%), when price reaches 3× entry the remaining
-    // stake (≈33% of original) has doubled in value. Sell 50% of what's left
-    // → lock that gain. Only SL trail kills the final piece after this.
+    // ── TP2: take 50% of gain at tp2GainPct milestone → moon bag remainder
+    // Tier 1: +200% gain (3×) | Tier 2: +150% (2.5×) | Tier 3: +100% (2×)
+    // Sell 50% of what's left → remaining becomes moon bag at 10% trail.
     // ══════════════════════════════════════════════════════════════════════
-    if (pos.capitalWithdrawn && !pos.tp2Hit && price >= pos.entryPrice * 3.0 && pos.remaining > 0.01) {
-      const tp2Frac      = pos.remaining * 0.50;   // 50% of what's left (of original position)
+    const tp2MultRef = 1 + (pos.tp2GainPct || 200) / 100;
+    if (pos.capitalWithdrawn && !pos.tp2Hit && price >= pos.entryPrice * tp2MultRef && pos.remaining > 0.01) {
+      const tp2Frac      = pos.remaining * 0.50;   // sell 50% of what's left
       const tp2FillPrice = pos.tradingMode === 'paper'
         ? simulateFillPrice(price, pos.size * tp2Frac, pos.liquidityAtEntry || 0, false)
         : exitFillPrice;
@@ -6184,9 +6328,13 @@ async function monitorPositions() {
       const tp2PnL       = tp2Gain * pos.size * tp2Frac;
       const newRemaining = +(pos.remaining - tp2Frac).toFixed(6);
       const tp2Updates   = {
-        tp2Hit:    true,
-        remaining: newRemaining,
-        pnl:       (pos.pnl || 0) + tp2PnL,
+        tp2Hit:          true,
+        remaining:       newRemaining,
+        pnl:             (pos.pnl || 0) + tp2PnL,
+        isMoonBag:       true,          // remaining becomes moon bag
+        moonBagTrailPct: 0.10,          // 10% from ATH — tightens to 5% on exhaustion
+        moonBagEnteredAt: Date.now(),
+        moonBagPeakGain: gainPct,       // gainPct when moon bag started (exhaustion reference)
       };
       const _tp2Sell = await realPartialSell(pos, tp2Frac, tp2FillPrice);
       if (_tp2Sell.ok) {
@@ -6195,11 +6343,12 @@ async function monitorPositions() {
         Object.assign(pos, tp2Updates);
         alertMsg = `💰 *PROFIT SECURED — TP2*\n\n` +
           `*${pos.symbol}* ${pos.strategyLabel}\n` +
-          `📥 Entry: $${fmtPrice(pos.entryPrice)} | Now: +${gainPct.toFixed(1)}%\n` +
+          `📥 Entry: $${fmtPrice(pos.entryPrice)} | Now: +${gainPct.toFixed(1)}% (Tier ${pos.tier||1})\n` +
           `💸 Sold ${(tp2Frac * 100).toFixed(1)}% → locked *$${tp2PnL.toFixed(2)}*\n` +
-          `🎯 ${(newRemaining * 100).toFixed(1)}% remains — SL trail only from here\n` +
+          `🌕 ${(newRemaining * 100).toFixed(1)}% moon bag — 10% trail from ATH\n` +
           `🔗 [Chart](${pos.dexUrl})` +
           `${_tp2Sell.txHash ? `\n📡 [Tx](https://solscan.io/tx/${_tp2Sell.txHash})` : ''}`;
+        console.log(`[BOT] TP2 ${pos.symbol}: +${gainPct.toFixed(1)}%, locked $${tp2PnL.toFixed(2)}, ${(newRemaining*100).toFixed(1)}% moon bag`);
       }
     }
 
@@ -6303,23 +6452,44 @@ async function monitorPositions() {
 
       if (pos.isDiagnostic) {
         // ── DIAGNOSTIC TRAIL ─────────────────────────────────────────────
-        // Phase 1 (ATHGain < 30%): SL = ATH × 0.50 — allows 50% drop from any ATH
-        // Phase 2 (ATHGain ≥ 30%): jump to standard 60% tightening trail
+        // Phase 1 (ATHGain < 30%): SL = ATH × (1 − entrySLPct%)  [tier-based]
+        // Phase 2 (ATHGain ≥ 30%): standard 60% tightening trail
+        // Floor system handles the actual exits once milestones are reached.
         const ATHd        = currentPeak;
         const ATHGainPctD = (ATHd - pos.entryPrice) / pos.entryPrice * 100;
+        const entrySLFrac = (pos.entrySLPct || 50) / 100;
         if (ATHGainPctD >= 30) {
           const stepsD  = Math.max(0, Math.floor((ATHGainPctD - 5) / 10));
           const gapPctD = Math.max(0.05, gapStart - stepsD * 0.05);
           newSL = pos.entryPrice + (1 - gapPctD) * (ATHd - pos.entryPrice);
         } else {
-          newSL = ATHd * 0.50;
+          newSL = ATHd * (1 - entrySLFrac);  // Tier 1=50%, Tier 2=40%, Tier 3=30%
         }
         newSL = Math.max(slFloor, newSL);
 
       } else if (pos.isMoonBag) {
-        // ── MOON BAG: flat 20% trailing from ATH ─────────────────────────
-        // SL = ATH × 0.80 — rises with ATH, never comes down (ratchet).
-        newSL = currentPeak * 0.80;
+        // ── MOON BAG: 10% trailing from ATH → tighten to 5% on exhaustion ─
+        // moonBagTrailPct starts at 0.10; flips to 0.05 when coin goes dormant.
+        const mbTrail = pos.moonBagTrailPct || 0.10;
+        newSL = currentPeak * (1 - mbTrail);
+
+        // Exhaustion detection: in moon bag > 30 min + gain not extending above entry
+        if (mbTrail > 0.05 && pos.moonBagEnteredAt) {
+          const moonBagAgeMin = (Date.now() - pos.moonBagEnteredAt) / 60000;
+          const mbPeakGain    = pos.moonBagPeakGain || gainPct;
+          // Exhausted: > 30 min old AND current gain < 110% of gain when moon bag started
+          if (moonBagAgeMin > 30 && gainPct < mbPeakGain * 1.10) {
+            updates.moonBagTrailPct = 0.05;
+            pos.moonBagTrailPct     = 0.05;
+            newSL = currentPeak * 0.95;  // 5% from ATH
+            sendTelegram(
+              `🌙 *MOON BAG EXHAUSTION — ${pos.symbol}*\n` +
+              `Trail tightened: 10% → *5%* | Age: ${moonBagAgeMin.toFixed(0)}min\n` +
+              `SL now: $${fmtPrice(newSL)} | Gain: +${gainPct.toFixed(1)}%\n🔗 [Chart](${pos.dexUrl})`
+            ).catch(() => {});
+            console.log(`[MOONBAG] ${pos.symbol} exhaustion — trail 10%→5%, SL $${fmtPrice(newSL)}`);
+          }
+        }
 
       } else {
         // ── SL TRAIL — integer arithmetic (float-safe, Nov-20) ──────────
