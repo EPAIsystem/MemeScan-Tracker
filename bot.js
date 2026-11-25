@@ -673,8 +673,12 @@ function detectStrategy(pair, openStrategies) {
   }
   if ((diagnosticMode || globalGatesBypass) && liq < DIAG_MIN_LIQ) return rej('liqFloor'); // Nov-19: when gates bypassed, still enforce $8k floor
   if (price <= 0)  return rej('price');  // always keep — zero price breaks arithmetic
+  // Level 1 — Always-on honeypot guard (applies even in diagnostic/bypass mode).
+  // ≥3 sell txns required: a real tradeable token will have had multiple sellers.
+  // Stronger than the old "sells24===0 && buys24>10" — catches 1-2 sell honeypots too.
+  if (sells24 < 3) return rej('honey'); // Nov-25: upgraded from sells24===0 — always active
   if (!globalGatesBypass) {
-    if (sells24 === 0 && buys24 > 10) return rej('honey'); // honeypot guard
+    // (old sells24===0 check superseded by always-on sells24<3 above)
 
     // ── ANTI-MANIPULATION GLOBAL FILTERS ───────────────────────────────────────
     // Reject bot farms and thin-pool manipulation before wasting scoring cycles.
@@ -4355,7 +4359,7 @@ async function pollTelegramCommands() {
           diagnosticMode        = true;
           diagnosticReal        = false;
           globalGatesBypass     = true;
-          lpLockBypass          = true;
+          lpLockBypass          = false; // Nov-25: security checks ACTIVE in diagnostic — RugCheck + holder concentration run normally
           strategyFiltersActive = false;
           autoEntryPaused       = false;
           dayHaltedToday        = false;
@@ -4380,6 +4384,7 @@ async function pollTelegramCommands() {
             `✅ Strategy filters bypassed · Liq ≥ $${(DIAG_MIN_LIQ/1000).toFixed(0)}k floor\n` +
             `✅ Slot cap: ${DIAG_MAX_POSITIONS} · Manual mode: cleared\n` +
             `✅ Daily loss limit: bypassed\n` +
+            `🛡 Security: ACTIVE — honeypot (≥3 sells), LP lock, holder concentration\n` +
             `✅ Every closed trade logged to Firestore\n\n` +
             _sfLine +
             `⚠️ _Paper trades only — no real funds at risk._\n` +
@@ -4392,7 +4397,7 @@ async function pollTelegramCommands() {
           diagnosticMode        = true;
           diagnosticReal        = true;
           globalGatesBypass     = true;
-          lpLockBypass          = true;
+          lpLockBypass          = false; // Nov-25: security checks ACTIVE in diagnostic — RugCheck + holder concentration run normally
           strategyFiltersActive = false;
           autoEntryPaused       = false;
           dayHaltedToday        = false;
@@ -4972,9 +4977,18 @@ async function checkRugCheck(addr, symbol) {
     const risks = d.risks || d.warnings || [];
     const hasCriticalRisk = risks.some(r => /mint|freeze|rug/i.test(r.name || r.label || ''));
 
-    const result = { lpLocked, riskScore, hasCriticalRisk, ts: Date.now() };
+    // ── Level 3: Top holder concentration ────────────────────────────────
+    // RugCheck returns topHolders array sorted descending by pct.
+    // If top wallet holds >50% of supply it can rug solo at any moment.
+    let topHolderPct = null;
+    if (Array.isArray(d.topHolders) && d.topHolders.length > 0) {
+      topHolderPct = parseFloat(d.topHolders[0].pct) || null;
+    }
+
+    const result = { lpLocked, riskScore, hasCriticalRisk, topHolderPct, ts: Date.now() };
     rugCheckCache.set(addr, result);
-    console.log(`[RUGCHECK] ${symbol} (${addr.slice(0,8)}…) — LP ${lpLocked ? 'LOCKED ✅' : 'UNLOCKED ⚠️'}, risk ${riskScore}/100`);
+    const holderStr = topHolderPct !== null ? `, top holder ${topHolderPct.toFixed(1)}%` : '';
+    console.log(`[RUGCHECK] ${symbol} (${addr.slice(0,8)}…) — LP ${lpLocked ? 'LOCKED ✅' : 'UNLOCKED ⚠️'}, risk ${riskScore}/100${holderStr}`);
     return result;
   } catch(e) {
     console.warn(`[RUGCHECK] ${symbol} (${addr.slice(0,8)}…) error: ${e.message} — failing open`);
@@ -5094,9 +5108,18 @@ async function filterByLpLock(matches) {
       continue;
     }
 
-    // ── RugCheck — LP lock + risk score (Solana) ─────────────────────────
+    // ── RugCheck — LP lock + risk score + holder concentration (Solana) ───
     const rc = await checkRugCheck(coin.addr, coin.symbol);
     lpPeriodStats.checked++;
+
+    // Level 3: Holder concentration — top wallet >50% = can rug solo instantly.
+    // Not applied to pump.fun bonding curve (the curve contract inherently holds supply).
+    if (rc && !coin.isPumpFun && rc.topHolderPct !== null && rc.topHolderPct > 50) {
+      console.log(`[RUGCHECK] ❌ ${coin.symbol} — top holder ${rc.topHolderPct.toFixed(1)}% > 50%, rejected`);
+      lpPeriodStats.failRisk++;
+      lpLockCache.set(coin.addr, { locked: false, ts: Date.now() });
+      continue;
+    }
 
     if (!rc) {
       // RugCheck unavailable — apply liq+ratio only (no auto-reject, no auto-pass)
