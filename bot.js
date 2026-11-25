@@ -676,7 +676,7 @@ function detectStrategy(pair, openStrategies) {
   // Level 1 — Always-on honeypot guard (applies even in diagnostic/bypass mode).
   // ≥3 sell txns required: a real tradeable token will have had multiple sellers.
   // Stronger than the old "sells24===0 && buys24>10" — catches 1-2 sell honeypots too.
-  if (sells24 < 3) return rej('honey'); // Nov-25: upgraded from sells24===0 — always active
+  if (sells24 === 0 && buys24 > 5) return rej('honey'); // Nov-25: relaxed back — zero sells + active buys = true honeypot; RugCheck handles 1-2 sell cases
   if (!globalGatesBypass) {
     // (old sells24===0 check superseded by always-on sells24<3 above)
 
