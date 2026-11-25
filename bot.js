@@ -2529,14 +2529,14 @@ async function logDiagnosticTrade(pos, exitPrice, exitReason, pnl) {
       diagnosticMode = false;
       diagnosticReal = false;
       await saveBypassFlags().catch(() => {});
-      await generateDiagnosticReport();
+      await generateDiagnosticReport(true); // isFinalReport=true — target reached, mode off
     }
   } catch(e) {
     console.warn('[DIAG] logDiagnosticTrade error:', e.message);
   }
 }
 
-async function generateDiagnosticReport() {
+async function generateDiagnosticReport(isFinalReport = false) {
   try {
     // ── 1. Closed trades from Firestore ──────────────────────────────────────
     const snap   = await db.collection('diagnostic_trades').get();
@@ -2753,7 +2753,9 @@ async function generateDiagnosticReport() {
       exitReasonLines,
       lossSection,
       ``,
-      `_Diagnostic mode is now OFF. Review data to refine strategy filters._`,
+      isFinalReport
+        ? `_Diagnostic complete (${DIAGNOSTIC_TARGET} trades). Mode is now OFF — review data to refine strategy filters._`
+        : `_Snapshot only — diagnostic still running (${diagnosticTradeCount}/${DIAGNOSTIC_TARGET} logged). /diagreport anytime for a fresh snapshot._`,
     ].join('\n');
     await sendTelegram(msg);
   } catch(e) {
