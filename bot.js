@@ -248,6 +248,7 @@ const SURGE_AVG_TRADE_MIN   = 25;       // avg trade ≥$25 — young surging co
 const SC_RUG_DROP_PCT  = 0.30;  // 30% drop in 15s = rug signal
 const SC_RUG_WINDOW_MS = 15000; // 15-second rolling price window
 const SC_RUG_EXIT_CNT  = 2;     // 2nd signal → emergency exit all positions on coin
+const RUG_DETECT_ENABLED = false; // Nov-26: disabled — slow RPC makes rug detection ineffective; re-enable with QuickNode RPC
 
 // ─── CAPITAL FLOOR GRACE PERIOD ──────────────────────────────────────────────
 const CAPITAL_FLOOR_GRACE_MS = 2 * 60 * 1000; // 2 min before SL floors at entryPrice
@@ -421,19 +422,23 @@ const STRATEGIES = [
     minBuyPct: 52,       // Nov-11: 58→52 — marginal buyer edge is enough with RugCheck backing it
     minCh1: -2,          // Nov-11: 0→-2 — allow slight h1 dip as long as m5 is positive
     maxCh1: 35,          // Nov-18: cap — coin already up 35%+ in 1h has exhausted its move; we'd be buying the top
-    maxMcap: 500000,     // Nov-18: diagnostic data shows $500k+ mcap coins avg -14.5%; cap at $500k
-    minAgeMinutes: 5,    // Nov-18: same rug-at-birth floor as PS — no entries on coins under 5 min old
-    minLiq: 8000,        // Nov-19: lowered to match $8k absolute floor (gates bypassed; liq is the only entry gate)
-    minLiqLocked: 8000,  // Nov-19: same — LP filter uses minLiq as strict floor for unlocked LP
+    maxMcap: 120000,     // Nov-26: 500k→120k — diagnostic data; coins >120k mcap show declining returns
+    minMcap: 15000,      // Nov-26: new — floor $15k mcap; below this coins too thin/volatile
+    minAgeMinutes: 15,   // Nov-26: 5→15 — skip rug-at-birth; 15-55 min is proven best window
+    maxAgeDays: 0.0382,  // Nov-26: new — 55 min cap (55/1440); 60min+ avg -28.5% return
+    minLiq: 10000,       // Nov-26: 8k→10k — tighter liq floor per data
+    minLiqLocked: 10000, // Nov-26: 8k→10k — same update for unlocked LP strict floor
+    maxLiq: 30000,       // Nov-26: new — 30k ceiling; 10k-30k window confirmed best liquidity band
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.28, tp2x: 1.70, tp3x: 3.00,  // Nov-9: TP1 at +28% — captures the common 20–40% pop
-    slx: 0.86,           // Nov-9: –14% SL (was –20% — the single biggest loss driver)
+    slx: 0.80,           // Nov-26: 0.86→0.80 — 20% SL; tighter exit cuts loss per trade
     initialTrailPct: 12, // Nov-9: tighter trail locks in gains faster
     usePartialProfit: true,  // stage-based selling like old Alpha
   },
   {
     id: 2,
     label: '🚀 SURGE CATCH',
+    disabled: true, // Nov-26: disabled — targets 1hr+ coins; diagnostic data shows 60min+ avg -28.5% return; re-enable after further testing
     maxSlots: 20, // competes for all global slots — last 5 reserved exclusively via SURGE_RESERVED logic
     desc: '1h to 24h old — surging hard mid-flight, catch it now',
     // ── Entry criteria — use m5 as primary signal, not h1 ──
@@ -444,13 +449,15 @@ const STRATEGIES = [
     minM5Txns: 10,       // Nov-11: 20→10 — allow thinner activity in pump ecosystem
     minCh1: 0,           // h1 not negative (newly graduated coins may lack h1 history)
     minBuyPct: 55,       // Nov-11: 62→55 — align with pump.fun ecosystem reality
-    maxMcap: 500000,     // Nov-18: diagnostic data shows $500k+ mcap coins avg -14.5%; cap at $500k
-    minLiq: 8000,        // Nov-19: lowered to match $8k absolute floor
-    minLiqLocked: 8000,  // Nov-19: same — LP filter strict floor for unlocked LP
+    maxMcap: 120000,     // Nov-26: 500k→120k — aligned with active strategies
+    minMcap: 15000,      // Nov-26: new — floor $15k mcap
+    minLiq: 10000,       // Nov-26: 8k→10k — aligned with active strategies
+    minLiqLocked: 10000, // Nov-26: 8k→10k — same update
+    maxLiq: 30000,       // Nov-26: new — 30k ceiling
     maxAgeDays: 1,       // Nov-9: SC is for young graduated coins only; AM handles 1–3 days
     // ── TP / SL (quick first profit, trail the rest) ──
     tp1x: 1.30, tp2x: 2.00, tp3x: 4.00,  // Nov-9: genuine surges can run far
-    slx: 0.85,           // Nov-9: –15% SL for young coin volatility room
+    slx: 0.80,           // Nov-26: 0.85→0.80 — 20% SL
     initialTrailPct: 18,
     usePartialProfit: true,  // take bits on the way up
   },
@@ -480,10 +487,13 @@ const STRATEGIES = [
     maxSlots: 20, // Nov-11: removed per-strategy cap — all strategies compete freely for the global 20 slots
     desc: 'pump.fun / PumpSwap < 1 hour old — speculative pullback entry',
     // ── Entry criteria ──
-    maxAgeDays: 0.042,  // Nov-12: < 1 hour — strictly new coins; anything older routes to SC/AM
-    minAgeMinutes: 5,    // Nov-18: skip coins under 5 min old — rug-at-birth profile (avg 2min, $23k mcap in losses)
-    minLiq: 8000,        // Nov-13: 6k→8k — tighter LP liq floor; compensates for looser rug risk
-    minLiqLocked: 6000,  // Nov-13: 5k→6k — higher bar for LP-locked
+    maxAgeDays: 0.0382, // Nov-26: 0.042→0.0382 — 55 min cap (55/1440); 60min+ coins avg -28.5%
+    minAgeMinutes: 15,   // Nov-26: 5→15 — skip rug-at-birth coins; proven best entry window starts at 15 min
+    minLiq: 10000,       // Nov-26: 8k→10k — tighter liq floor; 10k-30k window confirmed best
+    minLiqLocked: 10000, // Nov-26: 6k→10k — same update for unlocked LP strict floor
+    maxLiq: 30000,       // Nov-26: new — 30k ceiling; 10k-30k window confirmed best liquidity band
+    minMcap: 15000,      // Nov-26: new — floor $15k mcap; below this coins too thin/volatile
+    maxMcap: 120000,     // Nov-26: new — 120k ceiling; above this coins show declining returns
     minH1Ch: 2,          // Nov-11: 5→2 — h1 just needs to show positive trend, not strongly up
     minM5Ch: -5,         // allow pullback entry — not chasing the top
     maxM5Ch: 4,          // Nov-11: 2→4 — wider pullback window; allows more entry points
@@ -493,7 +503,7 @@ const STRATEGIES = [
     maxMcLiqRatio: 60,   // more lenient ratio for thin pump pools
     rugCheckMaxRisk: 65, // Nov-13: 50→65 — +25% from prior 50; still below standard 75 (pump.fun is higher risk)
     // ── SL / TP (custom schedule — handled in monitor loop for id=4) ──
-    slx: 0.60,           // initial SL = entry − 40%
+    slx: 0.80,           // Nov-26: 0.60→0.80 — 20% SL
     // Nov-12: removed maxPositionSize:50 — now respects /setsize ceiling like all other strategies
     // SL phases (see monitorPositions Strategy 5 block):
     //   0–19%:   flat −40% from entry
@@ -553,7 +563,7 @@ function getMoonBagSL(gainFromEntry) {
 function getTierConfig(tier) {
   const cfgs = {
     1: { // Micro: $20–$50
-      entrySLPct: 50, tp1GainPct: 50, tp2GainPct: 200,
+      entrySLPct: 20, tp1GainPct: 50, tp2GainPct: 200,  // Nov-26: 50→20% SL
       milestones: [
         { gainPct: 0.50, trailPct: 0.30 }, // TP1 trigger  → floor = 35% of posSize
         { gainPct: 0.80, trailPct: 0.25 }, //              → floor = 60% of posSize
@@ -563,7 +573,7 @@ function getTierConfig(tier) {
       ],
     },
     2: { // Small: $50–$200
-      entrySLPct: 40, tp1GainPct: 40, tp2GainPct: 150,
+      entrySLPct: 20, tp1GainPct: 40, tp2GainPct: 150,  // Nov-26: 40→20% SL
       milestones: [
         { gainPct: 0.40, trailPct: 0.30 }, // TP1 trigger  → floor = 28% of posSize
         { gainPct: 0.65, trailPct: 0.25 }, //              → floor = 48.75% of posSize
@@ -573,7 +583,7 @@ function getTierConfig(tier) {
       ],
     },
     3: { // Medium: $200+
-      entrySLPct: 30, tp1GainPct: 30, tp2GainPct: 100,
+      entrySLPct: 20, tp1GainPct: 30, tp2GainPct: 100,  // Nov-26: 30→20% SL
       milestones: [
         { gainPct: 0.30, trailPct: 0.30 }, // TP1 trigger  → floor = 21% of posSize
         { gainPct: 0.50, trailPct: 0.25 }, //              → floor = 37.5% of posSize
@@ -924,6 +934,8 @@ function detectStrategy(pair, openStrategies) {
         if (s.maxCh1 != null && ch1 > s.maxCh1) { match = false; } // already ran too hard — buying the top
         if (buyPct < s.minBuyPct)  { match = false; }
         if (liq < s.minLiqLocked)  { match = false; } // relaxed floor — strict floor enforced in filterByLpLock for unlocked LP
+        if (s.maxLiq != null && liq > s.maxLiq) { match = false; } // Nov-26: 30k liq ceiling
+        if (s.minMcap != null && mcap < s.minMcap) { match = false; } // Nov-26: $15k mcap floor
         // Anti-manipulation: require meaningful avg trade size (from strategy definition)
         if (s.minAvgTrade != null && avgTrade !== null && avgTrade < s.minAvgTrade) { match = false; }
       }
@@ -1044,6 +1056,9 @@ function detectStrategy(pair, openStrategies) {
           if (buyPct < s.minBuyPct)                          { match = false; }
           if (m5Txns < s.minM5Txns)                          { match = false; }
           if (liq < s.minLiq)                                { match = false; }
+          if (s.maxLiq != null && liq > s.maxLiq)           { match = false; } // Nov-26: 30k liq ceiling
+          if (s.minMcap != null && mcap < s.minMcap)        { match = false; } // Nov-26: $15k mcap floor
+          if (s.maxMcap != null && mcap > s.maxMcap)        { match = false; } // Nov-26: $120k mcap cap
           if (mcLiqRatio > s.maxMcLiqRatio)                  { match = false; }
         }
       } // end else (isPumpFun || isPumpSwap)
@@ -5317,6 +5332,12 @@ async function filterByLpLock(matches) {
     }
 
     // ── RugCheck — LP lock + risk score + holder concentration (Solana) ───
+    // Nov-26: disabled — slow RPC makes rug detection fire after major damage; re-enable with QuickNode
+    if (!RUG_DETECT_ENABLED) {
+      lpLockCache.set(coin.addr, { locked: true, ts: Date.now() });
+      passed.add(coin.addr);
+      continue;
+    }
     const rc = await checkRugCheck(coin.addr, coin.symbol);
     lpPeriodStats.checked++;
 
@@ -5855,7 +5876,8 @@ async function monitorPositions() {
     // 30%+ drop in 15s = rug signal.
     //   1st signal → capital protection + tighten SL
     //   2nd+ signal → exit ALL positions on this coin immediately
-    if (pos.strategyId === 2 && !pos.isMoonBag && !closingNow.has(pos.id)) {
+    // Nov-26: disabled via RUG_DETECT_ENABLED — slow RPC fires after damage; re-enable with QuickNode
+    if (RUG_DETECT_ENABLED && pos.strategyId === 2 && !pos.isMoonBag && !closingNow.has(pos.id)) {
       const addr = pos.address;
       const now  = Date.now();
 
