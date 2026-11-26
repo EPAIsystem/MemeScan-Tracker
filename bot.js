@@ -4625,6 +4625,38 @@ async function pollTelegramCommands() {
         continue;
       }
 
+      // ── /diagclear — wipe all diagnostic_trades records and reset counter ────────
+      // Use this to start a fresh measurement period without restarting diagnostic mode.
+      if (text === '/diagclear') {
+        if (!diagnosticMode) {
+          await sendTelegram(`⚠️ Diagnostic mode is not active.\nSend /diagnostic paper or /diagnostic real first.`);
+          continue;
+        }
+        let cleared = 0;
+        try {
+          const snap = await db.collection('diagnostic_trades').get();
+          if (!snap.empty) {
+            const batch = db.batch();
+            snap.docs.forEach(d => batch.delete(d.ref));
+            await batch.commit();
+            cleared = snap.size;
+          }
+        } catch(e) {
+          await sendTelegram(`❌ Error clearing diagnostic data: ${e.message}`);
+          continue;
+        }
+        diagnosticTradeCount = 0;
+        await sendTelegram(
+          `🗑 *DIAGNOSTIC DATA CLEARED*\n\n` +
+          `${cleared} trade record${cleared !== 1 ? 's' : ''} wiped.\n` +
+          `Counter reset to 0/${DIAGNOSTIC_TARGET}.\n\n` +
+          `Diagnostic mode is still *${diagnosticReal ? '🔴 REAL' : '🔬 PAPER'}* — bot continues running.\n` +
+          `New trades will build a fresh dataset from this point.\n\n` +
+          `Send /diagreport anytime for a snapshot.`
+        );
+        continue;
+      }
+
       // ── /manual | /auto | /pauseentry [on|off] — toggle manual-only mode ───────
       // Manual-only: bot fires alerts but skips enterPosition; manual queue still works.
       // /manual = manual-only on; /auto = back to full auto. Persists across restarts.
@@ -4728,7 +4760,8 @@ async function pollTelegramCommands() {
           `/queue <CA> — evaluate a contract address now\n\n` +
           `🔬 *Research Mode*\n` +
           `/diagnostic paper|real|off — bypass filters, test signal (paper=safe, real=live SOL)\n` +
-          `/diagreport — generate trade analysis report now\n\n` +
+          `/diagreport — generate trade analysis report now\n` +
+          `/diagclear — wipe diagnostic trade history (fresh start, mode stays on)\n\n` +
           `🔓 *Filter Controls* _(saved — survive restarts)_\n` +
           `/openmode — open ALL filters at once (master toggle)\n` +
           `/pauseentry — pause auto-entry (signals still alert; enter manually)\n` +
