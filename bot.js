@@ -1924,7 +1924,7 @@ function calcExitFeeUsd(pos, rawPrice, fillPrice, fraction, realImpactPct) {
 // On any error → { swingSL: null, skipEntry: false } — fail open (use fixed SL, allow entry)
 async function analyzeSwingData(pairAddress, ageMinutes, entryPrice, isGroupA) {
   try {
-    if (!pairAddress) return { swingSL: null, skipEntry: false };
+    if (!pairAddress) return { swingSL: null, skipEntry: false, lowerLow: false };
     const windowMinutes = Math.min(30, Math.max(1, Math.floor(ageMinutes * 0.15)));
     const limit = Math.max(2, windowMinutes);
 
@@ -1944,22 +1944,39 @@ async function analyzeSwingData(pairAddress, ageMinutes, entryPrice, isGroupA) {
       req.end();
     });
 
-    if (result.status !== 200) return { swingSL: null, skipEntry: false };
+    if (result.status !== 200) return { swingSL: null, skipEntry: false, lowerLow: false };
     const data = JSON.parse(result.body);
     const candles = data?.data?.attributes?.ohlcv_list;
-    if (!Array.isArray(candles) || candles.length < 2) return { swingSL: null, skipEntry: false };
+    if (!Array.isArray(candles) || candles.length < 2) return { swingSL: null, skipEntry: false, lowerLow: false };
 
     // ohlcv_list format: [timestamp, open, high, low, close, volume]
     const swingHigh  = Math.max(...candles.map(c => c[2]));
     const swingLow   = Math.min(...candles.map(c => c[3]));
     const swingRange = swingHigh - swingLow;
-    if (swingRange <= 0 || swingLow <= 0) return { swingSL: null, skipEntry: false };
+    if (swingRange <= 0 || swingLow <= 0) return { swingSL: null, skipEntry: false, lowerLow: false };
+
+    // ── Swing structure check: detect lower-low (downtrend = reject entry) ────
+    // Convert to candle objects for detectSwingPoints
+    const ohlcvCandles = candles.map(c => ({ ts: c[0], open: c[1], high: c[2], low: c[3], close: c[4] }));
+    let lowerLow = false;
+    if (ohlcvCandles.length >= 5) {
+      const { lows } = detectSwingPoints(ohlcvCandles, 2);
+      if (lows.length >= 2) {
+        // Compare last two swing lows: if the most recent is lower, downtrend is forming
+        const lastLow = lows[lows.length - 1].price;
+        const prevLow = lows[lows.length - 2].price;
+        if (lastLow < prevLow) {
+          lowerLow = true;
+          console.log(`[SWING-GATE] ${pairAddress.slice(0,8)}… lower-low detected: prevLow=${prevLow.toExponential(3)} > lastLow=${lastLow.toExponential(3)} — block entry`);
+        }
+      }
+    }
 
     // ── Gate 1: Range position — skip entry if price is in top 30% of range ──
     const rangePosition = (entryPrice - swingLow) / swingRange;
     if (rangePosition > 0.70) {
       console.log(`[RANGE-GATE] ${pairAddress.slice(0,8)}… rangePos=${(rangePosition*100).toFixed(0)}% (top 30%) — skip entry | window=${limit}min low=${swingLow.toExponential(3)} high=${swingHigh.toExponential(3)}`);
-      return { swingSL: null, skipEntry: true };
+      return { swingSL: null, skipEntry: true, lowerLow };
     }
 
     // ── Gate 2: Swing SL — data-driven floor ──────────────────────────────────
@@ -1970,13 +1987,13 @@ async function analyzeSwingData(pairAddress, ageMinutes, entryPrice, isGroupA) {
     if (candidateSL < maxWidthSL) {
       // Swing is too wide to use — fall back to fixed floor
       console.log(`[SWING-SL] ${pairAddress.slice(0,8)}… rangePos=${(rangePosition*100).toFixed(0)}% | swing too wide (${((1-candidateSL/entryPrice)*100).toFixed(1)}%) — using fixed floor`);
-      return { swingSL: null, skipEntry: false };
+      return { swingSL: null, skipEntry: false, lowerLow };
     }
     const finalSL = Math.max(groupFloor, candidateSL);  // never tighter than group floor
     console.log(`[SWING-SL] ${pairAddress.slice(0,8)}… rangePos=${(rangePosition*100).toFixed(0)}% window=${limit}min | low=${swingLow.toExponential(3)} high=${swingHigh.toExponential(3)} | finalSL=${finalSL.toExponential(3)}`);
-    return { swingSL: finalSL, skipEntry: false };
+    return { swingSL: finalSL, skipEntry: false, lowerLow };
   } catch (e) {
-    return { swingSL: null, skipEntry: false }; // any error → fail open
+    return { swingSL: null, skipEntry: false, lowerLow: false }; // any error → fail open
   }
 }
 
@@ -2092,18 +2109,23 @@ async function enterPosition(coin, overrides = {}) {
   const tierCfg     = getTierConfig(tier);
   const entrySLPct  = tierCfg.entrySLPct;  // 50/40/30 for Tier 1/2/3
 
-  let swingSL = null, skipEntry = false;
+  let swingSL = null, skipEntry = false, lowerLowDetected = false;
   if (diagnosticMode) {
     // Diagnostic mode: SL from entry based on tier (50/40/30%)
     swingSL = effectiveEntry * (1 - entrySLPct / 100);
   } else if (overrides.sl == null) {
     const swingResult = await analyzeSwingData(coin.pairAddress, coin.ageMinutes, effectiveEntry, isGroupA);
-    skipEntry = swingResult.skipEntry;                   // Nov-19: keep range gate — skip if at top of range
-    swingSL   = effectiveEntry * (slTrailMode === '50' ? 0.50 : 0.70); // Nov-20: gap per trail mode
+    skipEntry        = swingResult.skipEntry;      // skip if price at top of recent range
+    lowerLowDetected = swingResult.lowerLow;       // skip if downtrend (lower-low detected)
+    swingSL          = effectiveEntry * (slTrailMode === '50' ? 0.50 : 0.70);
   }
 
   if (skipEntry) {
     console.log(`[SKIP-ENTRY] ${coin.symbol} (${s.label}) — price at top of recent range, not entering`);
+    return null;
+  }
+  if (lowerLowDetected) {
+    console.log(`[SKIP-ENTRY] ${coin.symbol} (${s.label}) — lower-low swing detected (downtrend), not entering`);
     return null;
   }
 
@@ -3187,8 +3209,9 @@ async function processMomentumReentry(positions) {
     } catch(e) { continue; }
     if (!price || price <= 0) continue;
 
-    // ── Track post-exit low (the dip after the SL close) ─────────────────────
-    if (price < entry.postExitLow) entry.postExitLow = price;
+    // ── Track post-exit extremes (the dip/bounce after the SL close) ──────────
+    if (price < entry.postExitLow)  entry.postExitLow  = price;
+    if (price > entry.postExitHigh) entry.postExitHigh = price;
 
     // ── Higher-low check ─────────────────────────────────────────────────────
     // The dip after exit must hold ABOVE the structural low recorded at exit time.
@@ -3204,6 +3227,26 @@ async function processMomentumReentry(positions) {
 
     // ── Momentum filter: m5 must be positive (curve actively reversing) ───────
     if (m5Ch <= 0) continue;
+
+    // ── Condition 4: Lower-high gate (AM/SC/PS only, within 30-min window) ────
+    // If the bounce never cleared the pre-SL peak (snapshotHigh), momentum is
+    // fading.  We wait until price breaks ABOVE that old high before re-entering
+    // to avoid chasing a dead-cat bounce.
+    // Case A: bounce reached/exceeded snapshotHigh → healthy pullback, enter now.
+    // Case B: bounce still below snapshotHigh      → price must exceed it first.
+    if (!entry.isPatient && isFinite(entry.expiry)) {
+      // isPatient=false means AM/SC/PS; isFinite(expiry) rules out legacy entries
+      if (entry.postExitHigh < entry.snapshotHigh) {
+        // Case B — lower high detected; wait for price to clear the old peak
+        if (price < entry.snapshotHigh) {
+          console.log(`[MREENTRY] ${entry.symbol} — lower-high gate: postExitHigh $${fmtPrice(entry.postExitHigh)} < snapshotHigh $${fmtPrice(entry.snapshotHigh)}, price $${fmtPrice(price)} must clear $${fmtPrice(entry.snapshotHigh)}`);
+          continue;
+        }
+        // price just cleared snapshotHigh — gate passed
+        console.log(`[MREENTRY] ${entry.symbol} — lower-high gate CLEARED: price $${fmtPrice(price)} > snapshotHigh $${fmtPrice(entry.snapshotHigh)}`);
+      }
+      // Case A: postExitHigh >= snapshotHigh — healthy pullback, no extra gate
+    }
 
     // ── All conditions met — enter ────────────────────────────────────────────
     const bouncePct = ((price / entry.postExitLow - 1) * 100).toFixed(1);
@@ -3309,6 +3352,35 @@ function buildVirtualCandles(addr, resolution) {
     });
   }
   return candles;
+}
+
+/**
+ * Detect swing highs and swing lows in a candle array (oldest-first).
+ * lookback = how many candles on each side must be lower/higher for a point
+ * to be considered a local extreme.
+ *
+ * Returns:
+ *   lows  — [{price, idx, ts}] oldest-first confirmed swing lows
+ *   highs — [{price, idx, ts}] oldest-first confirmed swing highs
+ *
+ * "Confirmed" means the candle is NOT in the last `lookback` positions
+ * (trailing candles haven't had a chance to show what comes after them yet).
+ */
+function detectSwingPoints(candles, lookback = 2) {
+  const lows = [], highs = [];
+  const end = candles.length - lookback; // only consider candles that have enough future candles
+  for (let i = lookback; i < end; i++) {
+    let isLow = true, isHigh = true;
+    for (let j = i - lookback; j <= i + lookback; j++) {
+      if (j === i) continue;
+      if (candles[j].low  <= candles[i].low)  isLow  = false;
+      if (candles[j].high >= candles[i].high) isHigh = false;
+      if (!isLow && !isHigh) break;
+    }
+    if (isLow)  lows.push( { price: candles[i].low,  idx: i, ts: candles[i].ts });
+    if (isHigh) highs.push({ price: candles[i].high, idx: i, ts: candles[i].ts });
+  }
+  return { lows, highs };
 }
 
 /**
@@ -6117,11 +6189,14 @@ async function monitorPositions() {
         if (MOMENTUM_REENTRY_STRATEGIES.has(pos.strategyId)
             && pnlPct >= MOMENTUM_REENTRY_MAX_LOSS
             && !highSlippage) {
-          // Record structural low from recent price history at time of exit
+          // Record structural low/high from recent price history at time of exit
           const hist         = priceHistory.get(pos.address) || [];
           const recentPrices = hist.slice(-20).map(h => h.price).filter(p => p > 0);
           const snapshotLow  = recentPrices.length > 0
             ? Math.min(...recentPrices)
+            : pos.entryPrice;
+          const snapshotHigh = recentPrices.length > 0
+            ? Math.max(...recentPrices)
             : pos.entryPrice;
           // BB(0) and OR(3) are patient strategies — no time limit on the watch.
           // AM(1), SC(2), PS(4) are momentum plays — expire after 30 min.
@@ -6131,10 +6206,13 @@ async function monitorPositions() {
             dexUrl: pos.dexUrl, chain: pos.chain, liq: pos.liq || 0, mcap: pos.mcap || 0,
             score: pos.botScore || 60, ageMinutes: pos.ageMinutes || 60,
             snapshotLow,
-            postExitLow: exitFillPrice, // tracks lowest price seen after exit
+            snapshotHigh,                // peak price before SL (used for lower-high gate on re-entry)
+            postExitLow: exitFillPrice,  // tracks lowest price seen after exit
+            postExitHigh: exitFillPrice, // tracks highest price seen after exit (bounce peak)
             exitPrice: exitFillPrice,
             exitTime: Date.now(),
             expiry: isPatient ? Infinity : Date.now() + MOMENTUM_REENTRY_WINDOW_MS,
+            isPatient,
             pnlPct,
           });
           console.log(`[MREENTRY] ${pos.symbol} — watching for higher-low re-entry | snapshotLow:$${fmtPrice(snapshotLow)} exitPrice:$${fmtPrice(exitFillPrice)} pnl:${(pnlPct*100).toFixed(1)}%`);
@@ -6465,6 +6543,62 @@ async function monitorPositions() {
     // Capital is recovered at +100% via CAPITAL WITHDRAWAL above.
     // Everything else rides via progressive trailing SL below.
     // ─────────────────────────────────────────────────────────────────────────
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ── LOWER-HIGH TIGHTENING (swing structure guard) ────────────────────
+    // If the most recent swing high is LOWER than the previous swing high
+    // (i.e. a "lower high" pattern — classic downtrend signal), tighten SL
+    // to 5% immediately regardless of trail phase.
+    // When price subsequently sets a new high above lhPrevPeak, the tight
+    // SL is released and normal trailing resumes.
+    // ══════════════════════════════════════════════════════════════════════
+    if (!pos.isDiagnostic && !pos.backgrounded) {
+      try {
+        const lhCandles = buildVirtualCandles(pos.address, 4); // 1-min candles
+        if (lhCandles.length >= 5) {
+          const { highs: lhHighs } = detectSwingPoints(lhCandles, 2);
+
+          // ── Release tight SL if price broke above the previous peak ──────
+          if (pos.lhTightened && pos.lhPrevPeak && price > pos.lhPrevPeak) {
+            const relMsg = `📈 *SWING RECOVERY — ${pos.symbol}*\n` +
+              `Price $${fmtPrice(price)} exceeded prev peak $${fmtPrice(pos.lhPrevPeak)}\n` +
+              `Lower-high guard released — resuming normal trail\n🔗 [Chart](${pos.dexUrl})`;
+            updates.lhTightened = false;
+            updates.lhPrevPeak  = null;
+            pos.lhTightened     = false;
+            pos.lhPrevPeak      = null;
+            sendTelegram(relMsg).catch(() => {});
+            console.log(`[LH-GUARD] ${pos.symbol} — recovery above prev peak $${fmtPrice(pos.lhPrevPeak)}, releasing tight SL`);
+          }
+
+          // ── Detect lower-high pattern and tighten SL ─────────────────────
+          if (!pos.lhTightened && lhHighs.length >= 2) {
+            const lastHigh = lhHighs[lhHighs.length - 1].price;
+            const prevHigh = lhHighs[lhHighs.length - 2].price;
+            if (lastHigh < prevHigh) {
+              // Lower high confirmed — tighten SL to 5% below current price
+              const tightSL = price * 0.95;
+              if (tightSL > (updates.currentSL ?? pos.currentSL ?? 0)) {
+                updates.currentSL  = tightSL;
+                updates.lhTightened = true;
+                updates.lhPrevPeak  = prevHigh; // release when price > this
+                pos.lhTightened     = true;
+                pos.lhPrevPeak      = prevHigh;
+                const tightMsg = `⚠️ *LOWER-HIGH DETECTED — ${pos.symbol}*\n` +
+                  `Swing high: $${fmtPrice(lastHigh)} < prev: $${fmtPrice(prevHigh)}\n` +
+                  `SL tightened to 5% → $${fmtPrice(tightSL)}\n` +
+                  `Will release when price > $${fmtPrice(prevHigh)}\n🔗 [Chart](${pos.dexUrl})`;
+                sendTelegram(tightMsg).catch(() => {});
+                console.log(`[LH-GUARD] ${pos.symbol} — lower high ($${fmtPrice(lastHigh)} < $${fmtPrice(prevHigh)}), SL tightened to $${fmtPrice(tightSL)}`);
+              }
+            }
+          }
+        }
+      } catch(lhErr) {
+        // Swing detection failure is non-critical — continue with normal SL
+        console.log(`[LH-GUARD] ${pos.symbol} — swing check error: ${lhErr.message}`);
+      }
+    }
 
     // ══════════════════════════════════════════════════════════════════════
     // ── SL TRAIL — 6-phase tightening (Nov-20) ───────────────────────────
