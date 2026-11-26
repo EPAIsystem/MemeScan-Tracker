@@ -2559,6 +2559,15 @@ async function logDiagnosticTrade(pos, exitPrice, exitReason, pnl) {
   try {
     const gainPct = (exitPrice - pos.entryPrice) / pos.entryPrice * 100;
     const de      = pos.diagEntry || {};
+
+    // ── Fee tracking ─────────────────────────────────────────────────────────
+    const diagEntryFeeUsd = pos.entryFeeUsd || 0;
+    const diagLiq         = de.liq || 0;
+    const diagPosSize     = pos.size || 50;
+    // Simulate exit fill price (same slippage model as entry) to get exit cost
+    const diagExitFillPx  = simulateFillPrice(exitPrice, diagPosSize, diagLiq || diagPosSize * 100, false /*sell*/);
+    const diagExitFeeUsd  = calcExitFeeUsd({ size: diagPosSize }, exitPrice, diagExitFillPx, pos.remaining || 1);
+
     const record  = {
       symbol:       pos.symbol || '',
       address:      pos.address || '',
@@ -2587,6 +2596,9 @@ async function logDiagnosticTrade(pos, exitPrice, exitReason, pnl) {
       enteredAt:    pos.enteredAt || Date.now(),
       closedAt:     Date.now(),
       tradingMode:  pos.tradingMode || 'paper', // Nov-23: track paper vs real for hourly report filter
+      // Fee tracking (entry + exit slippage cost in USD)
+      entryFeeUsd:  +diagEntryFeeUsd.toFixed(4),
+      exitFeeUsd:   +diagExitFeeUsd.toFixed(4),
     };
     await db.collection('diagnostic_trades').add(record);
     diagnosticTradeCount++;
@@ -2788,13 +2800,35 @@ async function generateDiagnosticReport(isFinalReport = false) {
     const diagAvgPnl   = closedWithPnl.length > 0 ? diagNetPnl / closedWithPnl.length : 0;
     const diagNetStr   = diagNetPnl >= 0 ? `+$${diagNetPnl.toFixed(2)}` : `-$${Math.abs(diagNetPnl).toFixed(2)}`;
     const diagAvgStr   = diagAvgPnl >= 0 ? `+$${diagAvgPnl.toFixed(3)}` : `-$${Math.abs(diagAvgPnl).toFixed(3)}`;
+
+    // ── Fee estimation (entry + exit slippage round-trip) ────────────────────
+    // Uses stored entryFeeUsd/exitFeeUsd if the record has them (new trades),
+    // otherwise estimates from liqAtEntry using the same simulateFillPrice model.
+    const totalFees = closedWithPnl.reduce((sum, t) => {
+      if (t.entryFeeUsd != null || t.exitFeeUsd != null) {
+        return sum + (t.entryFeeUsd || 0) + (t.exitFeeUsd || 0);
+      }
+      // Legacy records: estimate both legs from liqAtEntry
+      const liq     = t.liqAtEntry || 0;
+      const pSz     = diagPosSize;
+      const DEX_FEE = 0.003, MAX_SLIP = 0.03;
+      const ratio   = liq > 0 ? pSz / liq : 0.05;
+      let slip = ratio < 0.001 ? 0.0024 : ratio < 0.01 ? 0.012 : ratio < 0.05 ? 0.036 : 0.072;
+      slip = Math.min(slip, MAX_SLIP);
+      return sum + pSz * (DEX_FEE + slip) * 2; // entry + exit round-trip
+    }, 0);
+    const diagNetNoFees    = diagNetPnl + totalFees;
+    const diagNetNoFeesStr = diagNetNoFees >= 0 ? `+$${diagNetNoFees.toFixed(2)}` : `-$${Math.abs(diagNetNoFees).toFixed(2)}`;
+
     const pnlSection   = [
       `💰 *P&L SUMMARY* (pos size: $${diagPosSize.toFixed(2)})`,
       `  Gross profit: *+$${diagGrossP.toFixed(2)}*  (${closedWithPnl.filter(t=>t.pnl>0).length} wins)`,
       `  Gross loss:   *-$${diagGrossL.toFixed(2)}*  (${closedWithPnl.filter(t=>t.pnl<0).length} losses)`,
+      `  💸 Est. fees:  *-$${totalFees.toFixed(2)}* (entry + exit slippage, ${closedWithPnl.length} trades)`,
       `  ─────────────────────`,
       `  Net P&L: *${diagNetStr}*  |  Avg/trade: *${diagAvgStr}*`,
-      `  _(entry & exit slippage included in all figures)_`,
+      `  Excl. fees:   *${diagNetNoFeesStr}* (market performance only)`,
+      `  _(slippage already reflected in all P&L figures above)_`,
     ].join('\n');
 
     const msg = [
