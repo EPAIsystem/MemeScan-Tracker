@@ -422,13 +422,13 @@ const STRATEGIES = [
     minBuyPct: 52,       // Nov-11: 58→52 — marginal buyer edge is enough with RugCheck backing it
     minCh1: -2,          // Nov-11: 0→-2 — allow slight h1 dip as long as m5 is positive
     maxCh1: 35,          // Nov-18: cap — coin already up 35%+ in 1h has exhausted its move; we'd be buying the top
-    maxMcap: 120000,     // Nov-26: 500k→120k — diagnostic data; coins >120k mcap show declining returns
-    minMcap: 15000,      // Nov-26: new — floor $15k mcap; below this coins too thin/volatile
-    minAgeMinutes: 15,   // Nov-26: 5→15 — skip rug-at-birth; 15-55 min is proven best window
-    maxAgeDays: 0.0382,  // Nov-26: new — 55 min cap (55/1440); 60min+ avg -28.5% return
-    minLiq: 10000,       // Nov-26: 8k→10k — tighter liq floor per data
-    minLiqLocked: 10000, // Nov-26: 8k→10k — same update for unlocked LP strict floor
-    maxLiq: 30000,       // Nov-26: new — 30k ceiling; 10k-30k window confirmed best liquidity band
+    maxMcap: 500000,     // Nov-27: 120k→500k — diagnostic data; 100k-500k best bracket (33% win, +13.2%)
+    minMcap: 12000,      // Nov-27: 15k→12k — slight floor relaxation to widen AM pool
+    minAgeMinutes: 60,   // Nov-27: 15→60 — AM covers 1h–6h; PS covers <1h
+    maxAgeDays: 0.25,    // Nov-27: 0.0382→0.25 — 6h cap (360/1440); 1-6h is best window (50% win, +13.3%)
+    minLiq: 8000,        // Nov-27: 10k→8k — lower floor to match PS; data shows 10k-100k zone viable
+    minLiqLocked: 8000,  // Nov-27: 10k→8k — same update
+    maxLiq: 100000,      // Nov-27: 30k→100k — extend ceiling; 100k+ consistently 0% win so cap there
     // ── TP / SL (partial profit — sell in bits) ──
     tp1x: 1.28, tp2x: 1.70, tp3x: 3.00,  // Nov-9: TP1 at +28% — captures the common 20–40% pop
     slx: 0.80,           // Nov-26: 0.86→0.80 — 20% SL; tighter exit cuts loss per trade
@@ -487,13 +487,13 @@ const STRATEGIES = [
     maxSlots: 20, // Nov-11: removed per-strategy cap — all strategies compete freely for the global 20 slots
     desc: 'pump.fun / PumpSwap < 1 hour old — speculative pullback entry',
     // ── Entry criteria ──
-    maxAgeDays: 0.0382, // Nov-26: 0.042→0.0382 — 55 min cap (55/1440); 60min+ coins avg -28.5%
-    minAgeMinutes: 15,   // Nov-26: 5→15 — skip rug-at-birth coins; proven best entry window starts at 15 min
-    minLiq: 10000,       // Nov-26: 8k→10k — tighter liq floor; 10k-30k window confirmed best
-    minLiqLocked: 10000, // Nov-26: 6k→10k — same update for unlocked LP strict floor
-    maxLiq: 30000,       // Nov-26: new — 30k ceiling; 10k-30k window confirmed best liquidity band
-    minMcap: 15000,      // Nov-26: new — floor $15k mcap; below this coins too thin/volatile
-    maxMcap: 120000,     // Nov-26: new — 120k ceiling; above this coins show declining returns
+    maxAgeDays: 0.0417, // Nov-27: 0.0382→0.0417 — exactly 60 min cap (60/1440); PS covers <1h only
+    minAgeMinutes: 10,   // Nov-27: 15→10 — lower floor; 10-60 min is PS window
+    minLiq: 8000,        // Nov-27: 10k→8k — restore 8k floor; sufficient for young pump coins
+    minLiqLocked: 8000,  // Nov-27: 10k→8k — same update
+    maxLiq: 50000,       // Nov-27: 30k→50k — extend ceiling to 50k for PS
+    minMcap: 12000,      // Nov-27: 15k→12k — slight floor relaxation
+    maxMcap: 80000,      // Nov-27: 120k→80k — tighter ceiling for young pump coins
     minH1Ch: 2,          // Nov-11: 5→2 — h1 just needs to show positive trend, not strongly up
     minM5Ch: -5,         // allow pullback entry — not chasing the top
     maxM5Ch: 4,          // Nov-11: 2→4 — wider pullback window; allows more entry points
@@ -923,11 +923,11 @@ function detectStrategy(pair, openStrategies) {
       // ── ACTIVE MOMENTUM ────────────────────────────────────────────────────
       // Nov-11: pump.fun/PumpSwap coins now allowed — all strategies compete freely.
       // Nov-19: always-on guards — apply even when strategy filters bypassed
-      if (s.minAgeMinutes != null && ageMinutes < s.minAgeMinutes) { match = false; } // 5-min rug-at-birth floor
-      if (s.maxMcap       != null && mcap       > s.maxMcap)       { match = false; } // $500k mcap cap
+      if (s.minAgeMinutes != null && ageMinutes < s.minAgeMinutes) { match = false; } // 1h floor — PS covers <1h
+      if (s.maxMcap       != null && mcap       > s.maxMcap)       { match = false; } // 500k mcap cap (always-on)
       if (strategyFiltersActive) {
-        if (s.minAgeDays    != null && ageDays    < s.minAgeDays)    { match = false; } // 2h+ only — SC covers 0–24h
-        if (s.maxAgeDays    != null && ageDays    > s.maxAgeDays)    { match = false; } // age upper cap (AM has none)
+        if (s.minAgeDays    != null && ageDays    < s.minAgeDays)    { match = false; } // age lower cap
+        if (s.maxAgeDays    != null && ageDays    > s.maxAgeDays)    { match = false; } // 6h upper cap
         if (m5Txns < s.minM5Txns)  { match = false; }
         if (m5Ch < s.minM5Ch)      { match = false; } // POSITIVE direction required (was abs)
         if (ch1 < s.minCh1)        { match = false; }
@@ -4702,6 +4702,58 @@ async function pollTelegramCommands() {
               `Coins now must meet age/activity requirements for their position-size tier before entry.`
           )
         );
+        continue;
+      }
+
+      // ── /filter — set age/liq/mcap range for a specific strategy ───────────────
+      // Usage: /filter PS age 10 60   /filter AM liq 8000 100000   /filter AM mcap 12000 500000
+      // Values: age in minutes, liq/mcap in dollars (supports k suffix: 8k = 8000)
+      if (text.startsWith('/filter ')) {
+        const parseVal = v => {
+          if (!v) return null;
+          const s = String(v).toLowerCase().trim();
+          return s.endsWith('k') ? parseFloat(s) * 1000 : parseFloat(s);
+        };
+        const parts = text.trim().split(/\s+/);
+        const stratLabel = (parts[1] || '').toUpperCase();
+        const param      = (parts[2] || '').toLowerCase();
+        const minVal     = parseVal(parts[3]);
+        const maxVal     = parseVal(parts[4]);
+
+        const stratMap = { PS: 4, AM: 1, BB: 0, SC: 2, OR: 3 };
+        const stratId  = stratMap[stratLabel];
+        const strat    = STRATEGIES.find(s => s.id === stratId);
+
+        if (!strat) {
+          await sendTelegram(`❌ Unknown strategy *${stratLabel}*. Use: PS, AM, BB, SC, OR`);
+          continue;
+        }
+        if (!['age','liq','mcap'].includes(param)) {
+          await sendTelegram(`❌ Unknown param *${param}*. Use: age, liq, mcap`);
+          continue;
+        }
+        if (isNaN(minVal) || isNaN(maxVal) || minVal < 0 || maxVal <= minVal) {
+          await sendTelegram(`❌ Invalid range. Format: /filter ${stratLabel} ${param} MIN MAX`);
+          continue;
+        }
+
+        if (param === 'age') {
+          strat.minAgeMinutes = minVal;
+          strat.maxAgeDays    = maxVal / 1440;
+          await sendTelegram(
+            `✅ *${stratLabel} age updated*\n\nMin: ${minVal} min · Max: ${maxVal} min (${(maxVal/60).toFixed(1)}h)\n\n_Applies immediately — survives until bot restart._`
+          );
+        } else if (param === 'liq') {
+          strat.minLiq = minVal; strat.minLiqLocked = minVal; strat.maxLiq = maxVal;
+          await sendTelegram(
+            `✅ *${stratLabel} liquidity updated*\n\nMin: $${minVal.toLocaleString()} · Max: $${maxVal.toLocaleString()}\n\n_Applies immediately — survives until bot restart._`
+          );
+        } else if (param === 'mcap') {
+          strat.minMcap = minVal; strat.maxMcap = maxVal;
+          await sendTelegram(
+            `✅ *${stratLabel} mcap updated*\n\nMin: $${minVal.toLocaleString()} · Max: $${maxVal.toLocaleString()}\n\n_Applies immediately — survives until bot restart._`
+          );
+        }
         continue;
       }
 
