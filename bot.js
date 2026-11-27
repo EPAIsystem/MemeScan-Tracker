@@ -2585,6 +2585,16 @@ function getActivityBucket(ageMinutes) {
   if (ageMinutes < 60)                 return 'per_5min';    // 15–60min — activity per 5min
   return 'per_15min';                                        // 60min+ — activity per 15min
 }
+
+/** Human-readable age bracket for segmented reporting. */
+function getAgeBucket(ageMinutes) {
+  if (!ageMinutes || ageMinutes < 60)   return '<1h';
+  if (ageMinutes < 360)                  return '1-6h';
+  if (ageMinutes < 1440)                 return '6-24h';
+  if (ageMinutes < 10080)               return '1-7d';
+  if (ageMinutes < 43200)               return '7-30d';
+  return '30d+';
+}
 function getOutcomeBucket(gainPct) {
   if (gainPct > 50)   return 'most_profitable';   // >+50%
   if (gainPct > 20)   return 'good_profit';        // +20–50%
@@ -2653,6 +2663,101 @@ async function logDiagnosticTrade(pos, exitPrice, exitReason, pnl) {
   } catch(e) {
     console.warn('[DIAG] logDiagnosticTrade error:', e.message);
   }
+}
+
+/**
+ * Reads segment performance maps and writes a plain-language recommendation block.
+ * Needs at least MIN_SAMPLE trades per segment before drawing conclusions.
+ * Returns a multi-line Telegram-formatted string.
+ */
+function buildDiagReasoning(trades, liqG, mcG, ageG) {
+  const MIN_SAMPLE   = 4; // minimum trades per segment before drawing conclusions
+  const closedTrades = trades.filter(t => !t.isOpen);
+  if (closedTrades.length < 5) return '\n_⚠️ Too few closed trades for analysis — keep running._';
+
+  const lines = ['', '🤖 *BOT ANALYSIS & RECOMMENDATIONS*'];
+
+  // Helper: rank segments by win rate, return { best, worst } or null
+  function rankSegs(groupMap) {
+    const segs = Object.entries(groupMap)
+      .filter(([, gains]) => gains.length >= MIN_SAMPLE)
+      .map(([seg, gains]) => ({
+        seg,
+        count:   gains.length,
+        winRate: gains.filter(g => g > 5).length / gains.length * 100,
+        avgPnl:  gains.reduce((a, b) => a + b, 0) / gains.length,
+      }))
+      .sort((a, b) => b.winRate - a.winRate || b.avgPnl - a.avgPnl);
+    if (!segs.length) return null;
+    return { best: segs[0], worst: segs[segs.length - 1], all: segs };
+  }
+
+  const liqRank  = rankSegs(liqG);
+  const mcapRank = rankSegs(mcG);
+  const ageRank  = rankSegs(ageG);
+
+  if (liqRank) {
+    const { best: b, worst: w } = liqRank;
+    lines.push(`💧 *Liquidity*`);
+    lines.push(`  Best → *${b.seg}* (${b.winRate.toFixed(0)}% win, avg ${b.avgPnl >= 0 ? '+' : ''}${b.avgPnl.toFixed(1)}%, n=${b.count})`);
+    if (b.seg !== w.seg)
+      lines.push(`  Worst → *${w.seg}* (${w.winRate.toFixed(0)}% win, avg ${w.avgPnl.toFixed(1)}%, n=${w.count}) — consider excluding`);
+    if (b.winRate >= 40)
+      lines.push(`  → *Set liq floor near ${b.seg.split('–')[0].replace('<','')} to filter underperforming pools*`);
+    else if (b.winRate < 25)
+      lines.push(`  → No strong liquidity edge yet — keep running for more data`);
+  }
+
+  if (mcapRank) {
+    const { best: b, worst: w } = mcapRank;
+    lines.push(`📦 *Market Cap*`);
+    lines.push(`  Best → *${b.seg}* (${b.winRate.toFixed(0)}% win, avg ${b.avgPnl >= 0 ? '+' : ''}${b.avgPnl.toFixed(1)}%, n=${b.count})`);
+    if (b.seg !== w.seg)
+      lines.push(`  Worst → *${w.seg}* (${w.winRate.toFixed(0)}% win, avg ${w.avgPnl.toFixed(1)}%, n=${w.count}) — these coins may already be extended`);
+    if (b.winRate >= 40)
+      lines.push(`  → *Restrict to ${b.seg} mcap range for best edge*`);
+  }
+
+  if (ageRank) {
+    const { best: b, worst: w } = ageRank;
+    lines.push(`⏱ *Age / Timeframe*`);
+    lines.push(`  Best → *${b.seg}* (${b.winRate.toFixed(0)}% win, avg ${b.avgPnl >= 0 ? '+' : ''}${b.avgPnl.toFixed(1)}%, n=${b.count})`);
+    if (b.seg !== w.seg)
+      lines.push(`  Worst → *${w.seg}* (${w.winRate.toFixed(0)}% win, avg ${w.avgPnl.toFixed(1)}%, n=${w.count})`);
+    if (b.winRate >= 40)
+      lines.push(`  → *Set age filter to focus on ${b.seg} coins*`);
+  }
+
+  // Top 3 performing coins (closed, by gainPct)
+  const topCoins = closedTrades
+    .filter(t => t.gainPct > 5)
+    .sort((a, b) => b.gainPct - a.gainPct)
+    .slice(0, 3);
+  if (topCoins.length) {
+    lines.push(`🏅 *Top Performers*`);
+    topCoins.forEach((t, i) => {
+      const liq  = t.liqAtEntry  ? `$${(t.liqAtEntry/1000).toFixed(0)}k liq`   : '';
+      const mc   = t.mcapAtEntry ? `$${(t.mcapAtEntry/1000).toFixed(0)}k mcap`  : '';
+      const age  = t.ageMinutes  != null ? getAgeBucket(t.ageMinutes) : '';
+      const ctx  = [liq, mc, age].filter(Boolean).join(' · ');
+      lines.push(`  ${i + 1}. *${t.symbol || '?'}* +${t.gainPct.toFixed(1)}% via ${(t.exitReason||'').replace(/_/g,' ')}${ctx ? ' — ' + ctx : ''}`);
+    });
+  }
+
+  // Overall health verdict
+  const overallWin = closedTrades.filter(t => t.gainPct > 5).length / closedTrades.length * 100;
+  lines.push('');
+  if (closedTrades.length < 20) {
+    lines.push(`⚠️ Only ${closedTrades.length} closed trades — patterns are early signals. Need 50+ for firm conclusions.`);
+  } else if (overallWin >= 45) {
+    lines.push(`✅ Win rate ${overallWin.toFixed(0)}% — RSI/MACD gate is working. Narrow the filters to best-performing zones to maximise edge.`);
+  } else if (overallWin >= 30) {
+    lines.push(`📊 Win rate ${overallWin.toFixed(0)}% — improving. Apply the segment recommendations above and re-check after 50 more trades.`);
+  } else {
+    lines.push(`❗ Win rate ${overallWin.toFixed(0)}% — entry gate is filtering some but losses still dominate. Check if SL gaps are too wide for the dominant liquidity zone.`);
+  }
+
+  return lines.join('\n');
 }
 
 async function generateDiagnosticReport(isFinalReport = false) {
@@ -2738,12 +2843,16 @@ async function generateDiagnosticReport(isFinalReport = false) {
       .map(b => `  ${b}: ${mcG[b].length} trades | ${pct(mcG[b].filter(g=>g>5).length,mcG[b].length)} profit | avg ${avg(mcG[b])}%`)
       .join('\n') || '  no data';
 
-    // ── 7. Activity level analysis ────────────────────────────────────────────
-    const actG   = {};
-    trades.forEach(t => { const b = t.activityLevel || 'unknown'; (actG[b] = actG[b] || []).push(t.gainPct); });
-    const actOrder = [['per_minute','<15min'],['per_5min','15–60min'],['per_15min','60min+']];
-    const actLines = actOrder.filter(([b]) => actG[b]?.length)
-      .map(([b, lbl]) => `  ${lbl}: ${actG[b].length} trades | ${pct(actG[b].filter(g=>g>5).length,actG[b].length)} profit | avg ${avg(actG[b])}%`)
+    // ── 7. Age/timeframe analysis (using getAgeBucket for human-readable labels) ──
+    const ageG     = {};
+    trades.forEach(t => {
+      const ageMins = t.ageMinutes ?? null;
+      const b = ageMins !== null ? getAgeBucket(ageMins) : (t.activityLevel === 'per_minute' ? '<1h' : t.activityLevel === 'per_5min' ? '<1h' : '1-6h');
+      (ageG[b] = ageG[b] || []).push(t.gainPct);
+    });
+    const ageOrder = ['<1h','1-6h','6-24h','1-7d','7-30d','30d+'];
+    const ageLines = ageOrder.filter(b => ageG[b]?.length)
+      .map(b => `  ${b}: ${ageG[b].length} trades | ${pct(ageG[b].filter(g=>g>5).length,ageG[b].length)} profit | avg ${avg(ageG[b])}%`)
       .join('\n') || '  no data';
 
     // ── 8. Open-position snapshot section (unrealized breakdown) ─────────────
@@ -2887,12 +2996,13 @@ async function generateDiagnosticReport(isFinalReport = false) {
       `📦 *Market Cap Range Performance*`,
       mcapLines,
       ``,
-      `⚡ *Activity Level Performance*`,
-      actLines,
+      `⏱ *Age / Timeframe Performance*`,
+      ageLines,
       ``,
       `🚪 *Exit Reason Breakdown*`,
       exitReasonLines,
       lossSection,
+      buildDiagReasoning(trades, liqG, mcG, ageG),
       ``,
       isFinalReport
         ? `_Diagnostic complete (${DIAGNOSTIC_TARGET} trades). Mode is now OFF — review data to refine strategy filters._`
@@ -3602,7 +3712,7 @@ async function checkEntryGate(pairAddress, ageMinutes, addr) {
     const macd = computeMACD(candles);
     if (rsi !== null && rsi > 60) return { pass: false, reason: `RSI ${rsi.toFixed(0)} > 60` };
     if (macd !== null && macd.declining) return { pass: false, reason: 'MACD declining' };
-    return { pass: true };
+    return { pass: true, rsi: rsi !== null ? +rsi.toFixed(1) : null, macdDir: macd ? (macd.declining ? '↓' : '↑') : null };
   } catch (e) {
     return { pass: true }; // fail open — never block on API error
   }
@@ -7925,6 +8035,9 @@ async function scanForEntries() {
         console.log(`[ENTRY-GATE] ${coin.symbol} — blocked: ${gate.reason}`);
         continue;
       }
+      // Store RSI snapshot for entry Telegram message
+      coin._entryRSI     = gate.rsi;
+      coin._entryMACDDir = gate.macdDir;
     }
 
     // Reserve coin BEFORE the async enterPosition call — a concurrent scan tick
@@ -7966,7 +8079,8 @@ async function scanForEntries() {
       `💵 Entry: $${fmtPrice(coin.price)}\n` +
       `💰 Position: ${pos.sizeNote || '$'+pos.size}${pos.walletLabel ? ` · ${pos.walletLabel}` : ''}\n` +
       `📊 Buy%: ${coin.buyPct.toFixed(0)}% | Liq: $${(coin.liq/1000).toFixed(0)}k\n` +
-      `📈 Age: ${ageLabel} | m5: ${coin.m5Ch>0?'+':''}${coin.m5Ch.toFixed(1)}% | h1: ${coin.ch1!=null?(coin.ch1>0?'+':'')+coin.ch1.toFixed(1)+'%':'<1h'}\n\n` +
+      `📈 Age: ${ageLabel} | m5: ${coin.m5Ch>0?'+':''}${coin.m5Ch.toFixed(1)}% | h1: ${coin.ch1!=null?(coin.ch1>0?'+':'')+coin.ch1.toFixed(1)+'%':'<1h'}\n` +
+      `🧠 RSI@entry: ${coin._entryRSI ?? '—'} | MACD: ${coin._entryMACDDir ?? '—'} | ${getLiqBucket(coin.liq||0)} liq | ${getAgeBucket(coin.ageMinutes||0)}\n\n` +
       tpInfo +
       `🛑 SL: $${fmtPrice(coin.price * s.slx)} | Trail: ${s.initialTrailPct}% → floors at 5%\n\n` +
       `\`${coin.addr}\`\n🔗 [Chart](${coin.dexUrl})`
