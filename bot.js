@@ -388,7 +388,7 @@ const STRATEGIES = [
     label: '📉 BOTTOM BOUNCE',
     maxSlots: 20, // unlimited — competes openly for global slots with id 1 and id 3
     desc: '1h+ old token caught at the bottom going up',
-    disabled: true, // Nov-18: disabled — diagnostic data shows 60min+ coins avg -4% return; re-enable after further testing
+    // Nov-27: re-enabled — running all 5 strategies to let diagnostic data show which performs best
     // ── Entry criteria ──
     minAgeDays: 0.042,  // Nov-12: ≥ 1 hour — anything under 1h is PS territory, not BB
     maxCh24: -5,        // Nov-11: -20→-5 — open to any meaningful pullback, not just big crashes
@@ -438,7 +438,7 @@ const STRATEGIES = [
   {
     id: 2,
     label: '🚀 SURGE CATCH',
-    disabled: true, // Nov-26: disabled — targets 1hr+ coins; diagnostic data shows 60min+ avg -28.5% return; re-enable after further testing
+    // Nov-27: re-enabled — running all 5 strategies to let diagnostic data show which performs best
     maxSlots: 20, // competes for all global slots — last 5 reserved exclusively via SURGE_RESERVED logic
     desc: '1h to 24h old — surging hard mid-flight, catch it now',
     // ── Entry criteria — use m5 as primary signal, not h1 ──
@@ -466,7 +466,7 @@ const STRATEGIES = [
     label: '📈 OLD RECOVERY',
     maxSlots: 20, // unlimited — competes openly for global slots with id 0 and id 1
     desc: '1 day+ established coin recovering steadily',
-    disabled: true, // Nov-18: disabled — diagnostic data shows old high-mcap coins cause heavy losses (SL+rug); re-enable after tuning
+    // Nov-27: re-enabled — running all 5 strategies to let diagnostic data show which performs best
     // ── Entry criteria ──
     minAgeDays: 1,       // Nov-12: 3→1 — any coin ≥ 1 day old qualifies as "old recovery"
     minCh24: 0.5,        // Nov-13: 2→0.5 — catch early recovery before 24h fully green
