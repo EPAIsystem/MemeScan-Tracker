@@ -2181,7 +2181,10 @@ async function enterPosition(coin, overrides = {}) {
     // Young coin mode flag (kept for reference — no longer drives TP exits)
     youngCoin: (s.id === 1 && (coin.ageMinutes || 0) < 60),
     // Age at entry — reference only
-    coinAgeDays: coin.ageDays || 0,
+    coinAgeDays:  coin.ageDays     || 0,
+    // Pool address (for GeckoTerminal OHLCV) and age in minutes (for candle sizing)
+    pairAddress:  coin.pairAddress || '',
+    ageMinutes:   coin.ageMinutes  || 0,
     // Universal progressive trail state — gap % of ATH gain given back (Phase 3)
     slTrailMode: slTrailMode,            // locked at entry — never changes after ('30' or '50')
     trailPct:    slTrailMode === '50' ? 50 : 30,  // current gap integer % (50→5 or 30→5)
@@ -3263,6 +3266,50 @@ async function processMomentumReentry(positions) {
       // Case A: postExitHigh >= snapshotHigh — healthy pullback, no extra gate
     }
 
+    // ── Path A / Path B RSI+MACD re-entry gate ───────────────────────────────
+    // Path A (momentum continuation): RSI 50-60 + MACD rising + 2 green candles
+    //   + price above last exit price (resistance cleared)
+    // Path B (dip-and-recover): RSI dipped < 50 since exit, now recovering > 45
+    //   + MACD not declining
+    // Anti-manipulation: >20% swing in 5 candles within 10 min of exit → skip
+    {
+      const rePairAddr = entry.pairAddress || getPairAddressFromDexUrl(entry.dexUrl) || addr;
+      const reCandles  = rePairAddr
+        ? await fetchCoinCandles(rePairAddr, entry.ageMinutes || 60)
+        : [];
+      if (reCandles.length >= 5) {
+        // Anti-manipulation check
+        const recent5    = reCandles.slice(-5);
+        const high5      = Math.max(...recent5.map(c => c.high));
+        const low5       = Math.min(...recent5.map(c => c.low));
+        const manipSwing = low5 > 0 && (high5 - low5) / low5 > 0.20;
+        const cooldownOk = Date.now() >= (entry.exitTime || 0) + 10 * 60 * 1000;
+        if (manipSwing && !cooldownOk) {
+          console.log(`[MREENTRY-GATE] ${entry.symbol} — anti-manip: >20% swing within 10min of exit, skip`);
+          continue;
+        }
+        const reRSI  = computeRSI(reCandles);
+        const reMACD = computeMACD(reCandles);
+        // Track RSI low since exit (in-memory on the entry object)
+        if (reRSI !== null) {
+          entry.rsiMinSinceExit = Math.min(entry.rsiMinSinceExit ?? reRSI, reRSI);
+        }
+        if (reRSI !== null && reMACD !== null) {
+          const last2  = reCandles.slice(-2);
+          const green2 = last2.length >= 2 && last2.every(c => c.close > c.open);
+          // Path A: RSI in 50-60 + MACD not declining + 2 green + price above exit
+          const pathA  = reRSI >= 50 && reRSI <= 60 && !reMACD.declining && green2 && price > (entry.exitPrice || 0);
+          // Path B: RSI dipped below 50, now recovering above 45 + MACD not declining
+          const pathB  = (entry.rsiMinSinceExit ?? 100) < 50 && reRSI > 45 && !reMACD.declining;
+          if (!pathA && !pathB) {
+            console.log(`[MREENTRY-GATE] ${entry.symbol} — RSI ${reRSI.toFixed(0)}, pathA:${pathA} pathB:${pathB} — gate blocked`);
+            continue;
+          }
+          console.log(`[MREENTRY-GATE] ${entry.symbol} — PASS via Path ${pathA ? 'A' : 'B'} (RSI ${reRSI.toFixed(0)})`);
+        }
+      }
+    }
+
     // ── All conditions met — enter ────────────────────────────────────────────
     const bouncePct = ((price / entry.postExitLow - 1) * 100).toFixed(1);
     const prevResult = entry.pnlPct >= 0
@@ -3452,6 +3499,123 @@ function computeRSI(candles, period = 14) {
   if (avgLoss === 0) return 100;
   const rs = avgGain / avgLoss;
   return 100 - (100 / (1 + rs));
+}
+
+/**
+ * MACD — EMA(fast)−EMA(slow) line.
+ * Returns { declining, current } or null if insufficient data.
+ * declining = true when last 2 consecutive candles both fell.
+ */
+function computeMACD(candles, fast = 12, slow = 26) {
+  if (candles.length < slow + 3) return null;
+  const closes = candles.map(c => c.close);
+  function emaSeq(data, period) {
+    const k = 2 / (period + 1);
+    let val = data.slice(0, period).reduce((s, v) => s + v, 0) / period;
+    const out = [];
+    for (let i = period; i < data.length; i++) {
+      val = data[i] * k + val * (1 - k);
+      out.push(val);
+    }
+    return out;
+  }
+  const ema12    = emaSeq(closes, fast);
+  const ema26    = emaSeq(closes, slow);
+  const trim     = ema12.length - ema26.length;
+  const macdLine = ema26.map((v, i) => ema12[i + trim] - v);
+  if (macdLine.length < 3) return null;
+  const h0 = macdLine[macdLine.length - 1];
+  const h1 = macdLine[macdLine.length - 2];
+  const h2 = macdLine[macdLine.length - 3];
+  return { declining: h0 < h1 && h1 < h2, current: h0 };
+}
+
+/**
+ * Returns age-appropriate GeckoTerminal candle params for fetchOHLCV.
+ * < 1h → 1-min | 1-24h → 15-min | 1-7d → 1h | 7-30d → 4h | > 30d → daily
+ */
+function getCandleParams(ageMinutes) {
+  if (ageMinutes < 60)    return { timeframe: 'minute', aggregate: 1,  limit: 60 };
+  if (ageMinutes < 1440)  return { timeframe: 'minute', aggregate: 15, limit: 60 };
+  if (ageMinutes < 10080) return { timeframe: 'hour',   aggregate: 1,  limit: 60 };
+  if (ageMinutes < 43200) return { timeframe: 'hour',   aggregate: 4,  limit: 60 };
+  return                         { timeframe: 'day',    aggregate: 1,  limit: 60 };
+}
+
+/** 30-second candle cache — prevents GeckoTerminal hammering per monitor tick. */
+const coinCandleCache     = new Map(); // `${addr}:${tf}:${agg}` → { candles, ts }
+const COIN_CANDLE_CACHE_TTL = 30_000;
+
+/**
+ * Fetches age-appropriate candles for a pair with 30-s in-memory cache.
+ */
+async function fetchCoinCandles(pairAddress, ageMinutes) {
+  if (!pairAddress) return [];
+  const { timeframe, aggregate, limit } = getCandleParams(ageMinutes || 60);
+  const key    = `${pairAddress}:${timeframe}:${aggregate}`;
+  const cached = coinCandleCache.get(key);
+  if (cached && (Date.now() - cached.ts) < COIN_CANDLE_CACHE_TTL) return cached.candles;
+  const candles = await fetchOHLCV(pairAddress, 'solana', timeframe, aggregate, limit);
+  coinCandleCache.set(key, { candles, ts: Date.now() });
+  return candles;
+}
+
+/**
+ * Maps RSI zone to trailing SL gap (decimal). Ratchet applies — only tighten.
+ * RSI > 80 → 5%  |  70-80 → 10%  |  65-70 → 15%  |  50-65 → 27%
+ * RSI 45-50 → 10%  |  40-45 → 7%  |  < 40 → 5%
+ */
+function getRSIAdaptiveSLPct(rsi) {
+  if (rsi > 80) return 0.05;
+  if (rsi > 70) return 0.10;
+  if (rsi > 65) return 0.15;
+  if (rsi > 50) return 0.27;
+  if (rsi > 45) return 0.10;
+  if (rsi > 40) return 0.07;
+  return               0.05;
+}
+
+/** Anti-manipulation cooldown: addr → expiry timestamp (10 min if >20% swing). */
+const entryGateCooldown = new Map();
+
+/**
+ * Entry gate: RSI < 60, MACD not declining, no >20% 5-candle manipulation swing.
+ * Returns { pass: true } or { pass: false, reason }.
+ * Fails open (pass: true) on any API error — never blocks on a network issue.
+ */
+async function checkEntryGate(pairAddress, ageMinutes, addr) {
+  try {
+    if (addr && entryGateCooldown.has(addr)) {
+      if (Date.now() < entryGateCooldown.get(addr)) return { pass: false, reason: 'manip-cooldown' };
+      entryGateCooldown.delete(addr);
+    }
+    const candles = await fetchCoinCandles(pairAddress, ageMinutes);
+    if (!candles || candles.length < 5) return { pass: true };
+    const recent5 = candles.slice(-5);
+    const high5   = Math.max(...recent5.map(c => c.high));
+    const low5    = Math.min(...recent5.map(c => c.low));
+    if (low5 > 0 && (high5 - low5) / low5 > 0.20) {
+      if (addr) entryGateCooldown.set(addr, Date.now() + 10 * 60 * 1000);
+      return { pass: false, reason: 'manip >20% swing in 5 candles — 10min cooldown' };
+    }
+    const rsi  = computeRSI(candles);
+    const macd = computeMACD(candles);
+    if (rsi !== null && rsi > 60) return { pass: false, reason: `RSI ${rsi.toFixed(0)} > 60` };
+    if (macd !== null && macd.declining) return { pass: false, reason: 'MACD declining' };
+    return { pass: true };
+  } catch (e) {
+    return { pass: true }; // fail open — never block on API error
+  }
+}
+
+/**
+ * Extracts pool pair address from a DexScreener URL.
+ * URL format: https://dexscreener.com/{chain}/{pairAddress}
+ */
+function getPairAddressFromDexUrl(dexUrl) {
+  if (!dexUrl) return null;
+  const m = dexUrl.match(/dexscreener\.com\/[^/]+\/([A-Za-z0-9]+)/i);
+  return m ? m[1] : null;
 }
 
 /**
@@ -6205,6 +6369,64 @@ async function monitorPositions() {
       continue;
     }
 
+    // ── MOMENTUM EXHAUSTION EXIT ───────────────────────────────────────────────
+    // Exits early when SL gap >10% + 2-of-3 bearish signals fire simultaneously:
+    //   1. RSI > 65 and declining   2. MACD declining   3. 2 consecutive red candles
+    // Prevents sitting through a full reversal when the trade already has gains.
+    if (!closingNow.has(pos.id) && gainPct > 0) {
+      const slGapPct = pos.currentSL > 0 ? (price - pos.currentSL) / price * 100 : 0;
+      if (slGapPct > 10) {
+        try {
+          const exPairAddr = pos.pairAddress || getPairAddressFromDexUrl(pos.dexUrl);
+          const exCandles  = exPairAddr
+            ? await fetchCoinCandles(exPairAddr, pos.ageMinutes || (pos.coinAgeDays || 0) * 1440 || 60)
+            : [];
+          if (exCandles.length >= 5) {
+            const exRSI  = computeRSI(exCandles);
+            const exMACD = computeMACD(exCandles);
+            const last3  = exCandles.slice(-3);
+            const last2Red = last3.length >= 2 &&
+              last3[last3.length - 1].close < last3[last3.length - 1].open &&
+              last3[last3.length - 2].close < last3[last3.length - 2].open;
+            let signals = 0;
+            if (exRSI !== null && exRSI > 65) {
+              const prevRSI = computeRSI(exCandles.slice(0, -1));
+              if (prevRSI !== null && exRSI < prevRSI) signals++;
+            }
+            if (exMACD !== null && exMACD.declining) signals++;
+            if (last2Red) signals++;
+            if (signals >= 2) {
+              closingNow.add(pos.id);
+              try {
+                const exPnl    = fillGain * pos.size * pos.remaining;
+                const totalPnl = (pos.pnl || 0) + exPnl;
+                const _res     = await realClose(pos, exitFillPrice, 'MOMENTUM_EXHAUSTION', totalPnl);
+                if (!_res?.ok) {
+                  closingNow.delete(pos.id);
+                } else {
+                  await updateDailyStats(exPnl, totalPnl >= 0, isManual, calcExitFeeUsd(pos, price, exitFillPrice, pos.remaining, _res.exitImpactPct), pos.strategyId ?? null);
+                  await sendTelegram(
+                    `📊 *MOMENTUM EXHAUSTION EXIT*\n\n` +
+                    `*${pos.symbol}* ${pos.strategyLabel}\n` +
+                    `📥 Entry: $${fmtPrice(pos.entryPrice)} → Exit: $${fmtPrice(exitFillPrice)}\n` +
+                    `📊 RSI: ${exRSI?.toFixed(0) ?? '?'} | MACD: ${exMACD?.declining ? '↓' : '→'} | 2-Red: ${last2Red ? '✅' : '❌'}\n` +
+                    `Signals: ${signals}/3 | SL gap: ${slGapPct.toFixed(1)}%\n` +
+                    `💰 P&L: ${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)} USD`
+                  );
+                  continue;
+                }
+              } catch (exErr) {
+                closingNow.delete(pos.id);
+                console.error(`[MOMENTUM-EXIT] ${pos.symbol} close error:`, exErr.message);
+              }
+            }
+          }
+        } catch (exErr) {
+          console.error(`[MOMENTUM-EXIT] ${pos.symbol} candle error:`, exErr.message);
+        }
+      }
+    }
+
     // ── STOP LOSS ──────────────────────────────────────────────────────────
     if (price <= pos.currentSL) {
       // Guard against concurrent monitor ticks closing the same position twice
@@ -6260,6 +6482,7 @@ async function monitorPositions() {
             symbol: pos.symbol, strategyId: pos.strategyId, strategyLabel: pos.strategyLabel,
             dexUrl: pos.dexUrl, chain: pos.chain, liq: pos.liq || 0, mcap: pos.mcap || 0,
             score: pos.botScore || 60, ageMinutes: pos.ageMinutes || 60,
+            pairAddress: pos.pairAddress || getPairAddressFromDexUrl(pos.dexUrl) || '',
             snapshotLow,
             snapshotHigh,                // peak price before SL (used for lower-high gate on re-entry)
             postExitLow: exitFillPrice,  // tracks lowest price seen after exit
@@ -6758,6 +6981,53 @@ async function monitorPositions() {
           updates.currentSL      = newSL;
           updates.trailingActive = true;
         }
+      }
+    }
+
+    // ── RSI-ADAPTIVE TRAILING SL ────────────────────────────────────────────────
+    // Tightens the SL based on RSI overbought zones (ratchet — only ever tightens).
+    // Price-confirmation rule:
+    //   • RSI zone triggers AND last candle green > 1% → tighten immediately
+    //   • RSI zone triggers alone → set rsiTightenPending, tighten on next candle
+    if (!closingNow.has(pos.id) && gainPct > 0) {
+      try {
+        const raPairAddr = pos.pairAddress || getPairAddressFromDexUrl(pos.dexUrl);
+        const raCandles  = raPairAddr
+          ? await fetchCoinCandles(raPairAddr, pos.ageMinutes || (pos.coinAgeDays || 0) * 1440 || 60)
+          : [];
+        if (raCandles.length >= 15) {
+          const raRSI        = computeRSI(raCandles);
+          const currentSLNow = updates.currentSL ?? pos.currentSL;
+          if (raRSI !== null) {
+            const targetGap  = getRSIAdaptiveSLPct(raRSI);
+            const rsiBasedSL = price * (1 - targetGap);
+            if (rsiBasedSL > currentSLNow * 1.001) {
+              const lastC        = raCandles[raCandles.length - 1];
+              const priceConfirm = lastC.open > 0 && (lastC.close - lastC.open) / lastC.open > 0.01;
+              if (priceConfirm) {
+                // RSI zone + green candle → tighten immediately
+                updates.currentSL         = rsiBasedSL;
+                updates.trailingActive    = true;
+                updates.rsiTightenPending = false;
+                console.log(`[RSI-SL] ${pos.symbol} — tightened to $${fmtPrice(rsiBasedSL)} (RSI ${raRSI.toFixed(0)}, gap ${(targetGap * 100).toFixed(0)}%)`);
+              } else if (pos.rsiTightenPending) {
+                // 2nd candle — tighten even without price move
+                updates.currentSL         = rsiBasedSL;
+                updates.trailingActive    = true;
+                updates.rsiTightenPending = false;
+                console.log(`[RSI-SL] ${pos.symbol} — tightened on 2nd candle to $${fmtPrice(rsiBasedSL)} (RSI ${raRSI.toFixed(0)})`);
+              } else {
+                // 1st candle — wait for price confirmation next tick
+                updates.rsiTightenPending = true;
+              }
+            } else if (pos.rsiTightenPending) {
+              // RSI-based SL no longer better — clear pending
+              updates.rsiTightenPending = false;
+            }
+          }
+        }
+      } catch (raErr) {
+        console.error(`[RSI-SL] ${pos.symbol} error:`, raErr.message);
       }
     }
 
@@ -7644,6 +7914,17 @@ async function scanForEntries() {
       // ── Trend-confirmed in manual mode → auto-enter (partial auto) ─────────
       coin._trendReentry = true;
       console.log(`[PARTIAL-AUTO] ${coin.symbol} — trend confirmed, auto-entering in manual mode`);
+    }
+
+    // ── RSI/MACD entry gate (age-appropriate candles) ─────────────────────────
+    // Blocks entries at RSI > 60, declining MACD, or manipulation spikes.
+    // Skipped in diagnostic/bypass mode. Fails open on API errors.
+    if (!diagnosticMode && !globalGatesBypass && coin.pairAddress) {
+      const gate = await checkEntryGate(coin.pairAddress, coin.ageMinutes || 60, coin.addr);
+      if (!gate.pass) {
+        console.log(`[ENTRY-GATE] ${coin.symbol} — blocked: ${gate.reason}`);
+        continue;
+      }
     }
 
     // Reserve coin BEFORE the async enterPosition call — a concurrent scan tick
