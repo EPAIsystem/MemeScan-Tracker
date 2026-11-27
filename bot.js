@@ -8028,8 +8028,8 @@ async function scanForEntries() {
 
     // ── RSI/MACD entry gate (age-appropriate candles) ─────────────────────────
     // Blocks entries at RSI > 60, declining MACD, or manipulation spikes.
-    // Skipped in diagnostic/bypass mode. Fails open on API errors.
-    if (!diagnosticMode && !globalGatesBypass && coin.pairAddress) {
+    // Runs in both diagnostic and live mode. Skipped only if globalGatesBypass. Fails open on API errors.
+    if (!globalGatesBypass && coin.pairAddress) {
       const gate = await checkEntryGate(coin.pairAddress, coin.ageMinutes || 60, coin.addr);
       if (!gate.pass) {
         console.log(`[ENTRY-GATE] ${coin.symbol} — blocked: ${gate.reason}`);
