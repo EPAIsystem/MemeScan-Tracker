@@ -732,8 +732,10 @@ function detectStrategy(pair, openStrategies) {
   if (price <= 0)  return rej('price');  // always keep — zero price breaks arithmetic
   // Level 1 — Always-on honeypot guard (applies even in diagnostic/bypass mode).
   // ≥3 sell txns required: a real tradeable token will have had multiple sellers.
-  // Stronger than the old "sells24===0 && buys24>10" — catches 1-2 sell honeypots too.
-  if (sells24 < 3) return rej('honey'); // Nov-25: restored — <3 sells in 24h = likely honeypot; not the cause of zero-entry issue (age filter was)
+  // Exception: coins < 90 min old may not have accumulated 3 sells yet — 1 sell is enough
+  // to confirm two-sided trading on a fresh pump. PS targets 10–60 min coins; this unblocks them.
+  const honeyMinSells = ageMinutes < 90 ? 1 : 3; // Nov-27: relax for fresh coins (<90 min)
+  if (sells24 < honeyMinSells) return rej('honey');
   if (!globalGatesBypass) {
     // (old sells24===0 check superseded by always-on sells24<3 above)
 
@@ -761,9 +763,10 @@ function detectStrategy(pair, openStrategies) {
   const scIsOpen = openStrategies.some(st => st.id === 2);
   const s5OpenForYoung = isPumpFun && openStrategies.some(st => st.id === 4);
   if (!globalGatesBypass && ageDays < 1) {
-    // avgTrade gate: $20 for all strategies except SC and pump.fun→S5
-    // SC has its own $15 gate; pump.fun coins for S5 use the global floor ($8) only.
-    if (!scIsOpen && !s5OpenForYoung && avgTrade !== null && avgTrade < 12) return rej('young'); // $12 avg trade — young coin stricter gate (restored Nov-14)
+    // avgTrade gate: pump.fun/pumpswap meme coins trade at $3–$10 per swap by nature.
+    // $12 was too strict and blocked legitimate young coins. Floor lowered to $5 (Nov-27).
+    // SC has its own $15 gate; pump.fun coins for S5 use the global $8 floor only.
+    if (!scIsOpen && !s5OpenForYoung && avgTrade !== null && avgTrade < 5) return rej('young'); // Nov-27: 12→5 — meme coin micro-trades are normal
     if (s5OpenForYoung) {
       if (buyPct < 50) return rej('young');  // ≥50% buy dominance — restored Nov-14
       if (m5Txns  <  6) return rej('young'); // ≥6 txns/5min — restored Nov-14
@@ -849,9 +852,10 @@ function detectStrategy(pair, openStrategies) {
     // it can have a slightly negative m5 as the coin is stabilising. Allow m5Ch ≥ -3%.
     // Strategy 5 (Pump Spec) enters on pullbacks — allow m5Ch down to -5% when s5 is open.
     // All other strategies require m5Ch ≥ -1% (no meaningful decline allowed).
-    // MIN: -20% threshold (was -1%) — essentially disabled; raise incrementally
-    if (m5Ch !== null && m5Ch < -1) {
-      return rej('mom'); // −1% m5 floor — bot must not enter a falling coin (restored Nov-14)
+    const s5Open = openStrategies.some(st => st.id === 4);
+    const momFloor = s5Open ? -5 : -1; // Nov-27: implement PS pullback exception (was always -1%)
+    if (m5Ch !== null && m5Ch < momFloor) {
+      return rej('mom'); // PS: −5% floor; all others: −1% floor
     }
 
     const liveHist = priceHistory.get(addr) || [];
