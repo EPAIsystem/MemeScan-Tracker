@@ -4802,6 +4802,61 @@ async function pollTelegramCommands() {
         continue;
       }
 
+      // ── /skiptp <addr1> [addr2 …] — per-position TP bypass ──────────────────────
+      // Toggles tpBypassed on each named position. When bypassed:
+      //   • TP1 (capital recovery) is skipped
+      //   • TP2 (50% sell at 2×/2.5×/3×) is skipped
+      //   • Position rides on trailing SL only — full position exits when SL is hit
+      // SL and trailing SL are NEVER affected. Send again with the same address to restore TP.
+      if (text.startsWith('/skiptp ') || text === '/skiptp') {
+        const rawAddrs = text.replace('/skiptp', '').trim();
+        if (!rawAddrs) {
+          await sendTelegram(
+            `ℹ️ *Usage:* \`/skiptp <address1> [address2 …]\`\n\n` +
+            `Pass one or more coin mint addresses (space-separated).\n` +
+            `Sending the same address again restores TP.\n\n` +
+            `Example: \`/skiptp ABC123… DEF456…\``
+          );
+          continue;
+        }
+        const addrs   = rawAddrs.split(/\s+/).filter(Boolean);
+        const allPos  = await getOpenPositions();
+        const lines   = [];
+        for (const addr of addrs) {
+          const pos = allPos.find(p => p.address === addr);
+          if (!pos) {
+            lines.push(`❓ \`${addr.slice(0,8)}…\` — not found in open positions`);
+            continue;
+          }
+          const newVal = !pos.tpBypassed;
+          try {
+            await updatePosition(pos.id, { tpBypassed: newVal });
+            // also update cache so the monitor sees it immediately
+            pos.tpBypassed = newVal;
+            if (newVal) {
+              lines.push(
+                `🚫 *${pos.symbol}* — TP *bypassed*\n` +
+                `   Rides on trailing SL only. Send again to restore.\n` +
+                `   🔗 [Chart](${pos.dexUrl})`
+              );
+            } else {
+              lines.push(
+                `✅ *${pos.symbol}* — TP *restored*\n` +
+                `   TP1/TP2 active again.\n` +
+                `   🔗 [Chart](${pos.dexUrl})`
+              );
+            }
+          } catch(e) {
+            lines.push(`⚠️ \`${addr.slice(0,8)}…\` — update failed: ${e.message}`);
+          }
+        }
+        await sendTelegram(
+          `📊 *TAKE PROFIT TOGGLE*\n\n` +
+          lines.join('\n\n')
+        );
+        continue;
+      }
+
       // ── /openmode — master switch: open ALL filters at once ─────────────────────
       // Sets globalGatesBypass=true, lpLockBypass=true, strategyFiltersActive=false
       // and persists to Firestore. Toggle again to restore all filters.
@@ -5112,7 +5167,8 @@ async function pollTelegramCommands() {
           `/pauseentry — pause auto-entry (signals still alert; enter manually)\n` +
           `/skipgates — toggle global entry gates\n` +
           `/skiplp — toggle LP/RugCheck security gate\n` +
-          `/skipstrats — toggle per-strategy filters\n\n` +
+          `/skipstrats — toggle per-strategy filters\n` +
+          `/skiptp <addr> … — bypass TP1/TP2 for specific coins (SL always active)\n\n` +
           `💡 *MemeScan PRO Bridge*\n` +
           `Forward any PRO signal here → bot auto-evaluates if PRO score ≥ 80`
         );
@@ -5809,7 +5865,7 @@ const TOKEN_PROGRAM_ID_STR  = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const TOKEN_2022_ID_STR     = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 const ORPHAN_MIN_USD        = 0.50;  // ignore dust below this USD value
 let lastOrphanScan = 0;
-const ORPHAN_SCAN_INTERVAL  = 60000; // at most once per minute (auto mode)
+const ORPHAN_SCAN_INTERVAL  = 5000; // Nov-28: 60s→5s — detect orphans within 5 seconds
 
 async function detectAndRecoverOrphans(force = false) {
   const cfg = await getTradingConfig();
@@ -6756,8 +6812,9 @@ async function monitorPositions() {
     // ── CAPITAL WITHDRAWAL (TP1 — tier-based gain threshold) ─────────────
     // Sell the minimum fraction needed to recover original capital ($pos.size).
     // Tier 1: +50% | Tier 2: +40% | Tier 3: +30%
+    // Skipped when pos.tpBypassed=true (/skiptp command) — position rides on trailing SL only.
     // ══════════════════════════════════════════════════════════════════════
-    if (!pos.capitalWithdrawn) {
+    if (!pos.tpBypassed && !pos.capitalWithdrawn) {
       const capThreshold = (pos.tp1GainPct || 50) / 100; // tier-based TP1 gain %
       if (gain >= capThreshold && pos.remaining > 0.01) {
         const totalRecovered = pos.recoveredAmount || 0;
@@ -6875,7 +6932,7 @@ async function monitorPositions() {
     // Sell 50% of what's left → remaining becomes moon bag at 10% trail.
     // ══════════════════════════════════════════════════════════════════════
     const tp2MultRef = 1 + (pos.tp2GainPct || 200) / 100;
-    if (pos.capitalWithdrawn && !pos.tp2Hit && price >= pos.entryPrice * tp2MultRef && pos.remaining > 0.01) {
+    if (!pos.tpBypassed && pos.capitalWithdrawn && !pos.tp2Hit && price >= pos.entryPrice * tp2MultRef && pos.remaining > 0.01) {
       const tp2Frac      = pos.remaining * 0.50;   // sell 50% of what's left
       const tp2FillPrice = pos.tradingMode === 'paper'
         ? simulateFillPrice(price, pos.size * tp2Frac, pos.liquidityAtEntry || 0, false)
