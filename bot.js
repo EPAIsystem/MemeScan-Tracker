@@ -603,7 +603,8 @@ function getTierConfig(tier) {
 function detectStrategy(pair, openStrategies) {
   const now     = Date.now();
   const created = pair.pairCreatedAt || (now - 86400000 * 30);
-  const ageDays = (now - created) / 86400000;
+  const ageDays    = (now - created) / 86400000;
+  const ageMinutes = ageDays * 1440; // Nov-27: moved up — needed by honeyMinSells before line 750
   const liq     = pair.liquidity?.usd || 0;
   const vol24   = pair.volume?.h24 || 0;
   const m5Vol   = pair.volume?.m5  || 0;   // 5-min USD volume (anti-manipulation)
@@ -746,8 +747,7 @@ function detectStrategy(pair, openStrategies) {
     if (mcLiqRatio > ANTI_MANIP_MC_LIQ_RATIO_MAX_LOCKED) return rej('ratio');          // thin pool gate — 40× (LP lock check tightens to 30× for unlocked Solana coins)
   }
 
-  // Calculate age before the dead coin guard — needed for the young-coin exemption
-  const ageMinutes = (now - created) / 60000;
+  // ageMinutes declared at top of function (after ageDays) — needed by honeyMinSells and dead coin guard
 
   // ── YOUNG COIN STRICTER ENTRY GATE (< 1 day old) ─────────────────────────────
   // Coins under 24 hours are prime rug-pull candidates.  Require stronger proof
