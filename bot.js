@@ -6779,6 +6779,47 @@ async function monitorPositions() {
         console.log(`[FLOOR] ${pos.symbol} milestone ${floorIdx+1} locked — floor $${activeFloor.toFixed(2)} (notionalGain $${notionalGain.toFixed(2)})`);
       }
 
+      // ── PRE-TP1 GAIN-TRAIL (Nov-28) ──────────────────────────────────────────
+      // When gain crosses 80% of tp1GainPct, start trailing SL at 90% of running
+      // peak notional gain — locks in 90% of whatever the best gain seen so far is.
+      //
+      //   Tier 1 (TP1=+50%): trail engages at +40% | floor = gain × 90%
+      //   Tier 2 (TP1=+40%): trail engages at +32% | floor = gain × 90%
+      //   Tier 3 (TP1=+30%): trail engages at +24% | floor = gain × 90%
+      //
+      // "Peak" is handled by the activeFloor ratchet — it only moves up, never down,
+      // so computing 90% of CURRENT notionalGain and comparing to activeFloor gives
+      // the 90%-of-peak effect without needing a separate peak tracker.
+      //
+      // Gated pre-TP1 and when tpBypassed (tpBypassed rides to trailing SL only).
+      // After TP1 (capitalWithdrawn=true), the milestone system takes over.
+      // ─────────────────────────────────────────────────────────────────────────
+      if (!pos.capitalWithdrawn && !pos.tpBypassed) {
+        const preTrailPct       = (pos.tp1GainPct || 50) / 100 * 0.80; // 80% of TP1
+        const preTrailThreshold = preTrailPct * pos.size;               // dollar threshold
+        if (notionalGain >= preTrailThreshold) {
+          const trailFloor = notionalGain * 0.90; // 90% of current gain (ratchets via activeFloor)
+          if (trailFloor > (activeFloor || 0)) {
+            const wasInactive      = !pos.preTrailActive;
+            activeFloor            = trailFloor;
+            updates.activeFloor    = trailFloor;
+            pos.activeFloor        = trailFloor;
+            if (wasInactive) {
+              updates.preTrailActive = true;
+              pos.preTrailActive     = true;
+              sendTelegram(
+                `🔒 *PRE-TP1 TRAIL ACTIVE — ${pos.symbol}*\n\n` +
+                `Gain crossed +${(preTrailPct * 100).toFixed(0)}% — SL now trails at 90% of peak\n` +
+                `📊 Current gain: *+${gainPct.toFixed(1)}%* | Floor locked: *$${trailFloor.toFixed(2)}*\n` +
+                `🎯 Rides to TP1 at +${pos.tp1GainPct || 50}% — floor rises as coin climbs\n` +
+                `🔗 [Chart](${pos.dexUrl})`
+              ).catch(() => {});
+              console.log(`[PRE-TRAIL] ${pos.symbol} trail active: notional $${notionalGain.toFixed(2)}, floor $${trailFloor.toFixed(2)} (Tier ${pos.tier||1} TP1=${pos.tp1GainPct||50}%)`);
+            }
+          }
+        }
+      }
+
       // Floor exit: notionalGain dropped below locked floor → sell remaining
       if (activeFloor !== null && notionalGain < activeFloor && !closingNow.has(pos.id)) {
         closingNow.add(pos.id);
