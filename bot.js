@@ -563,7 +563,7 @@ function getMoonBagSL(gainFromEntry) {
 function getTierConfig(tier) {
   const cfgs = {
     1: { // Micro: $20–$50
-      entrySLPct: 20, tp1GainPct: 50, tp2GainPct: 200,  // Nov-26: 50→20% SL
+      entrySLPct: 15, tp1GainPct: 50, tp2GainPct: 200,  // Nov-26: 50→20% SL | Nov-28: 20→15% (RSI/MACD gate earns tighter SL)
       milestones: [
         { gainPct: 0.50, trailPct: 0.30 }, // TP1 trigger  → floor = 35% of posSize
         { gainPct: 0.80, trailPct: 0.25 }, //              → floor = 60% of posSize
@@ -573,7 +573,7 @@ function getTierConfig(tier) {
       ],
     },
     2: { // Small: $50–$200
-      entrySLPct: 20, tp1GainPct: 40, tp2GainPct: 150,  // Nov-26: 40→20% SL
+      entrySLPct: 15, tp1GainPct: 40, tp2GainPct: 150,  // Nov-26: 40→20% SL | Nov-28: 20→15%
       milestones: [
         { gainPct: 0.40, trailPct: 0.30 }, // TP1 trigger  → floor = 28% of posSize
         { gainPct: 0.65, trailPct: 0.25 }, //              → floor = 48.75% of posSize
@@ -583,7 +583,7 @@ function getTierConfig(tier) {
       ],
     },
     3: { // Medium: $200+
-      entrySLPct: 20, tp1GainPct: 30, tp2GainPct: 100,  // Nov-26: 30→20% SL
+      entrySLPct: 15, tp1GainPct: 30, tp2GainPct: 100,  // Nov-26: 30→20% SL | Nov-28: 20→15%
       milestones: [
         { gainPct: 0.30, trailPct: 0.30 }, // TP1 trigger  → floor = 21% of posSize
         { gainPct: 0.50, trailPct: 0.25 }, //              → floor = 37.5% of posSize
